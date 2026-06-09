@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/">
+        <file>tst_Tile.qml</file>
+        <!-- при необходимости другие тесты -->
+    </qresource>
+</RCC>

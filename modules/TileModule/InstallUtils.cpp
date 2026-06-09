@@ -1,0 +1,321 @@
+// InstallUtils.cpp
+// ─────────────────────────────────────────────────────────────────────────────
+// Реализация утилит для установки игр.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#include "InstallUtils.h"
+#include "tools/AtomicFile.h"
+
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QRegularExpression>
+#include <QTextStream>
+#include <QDebug>
+
+namespace InstallUtils {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// kSkipExePatterns
+// ─────────────────────────────────────────────────────────────────────────────
+
+const QStringList kSkipExePatterns = {
+    "unins", "uninst", "setup", "install", "redist",
+    "vcredist", "directx", "dxsetup", "vc_redist", "_commonredist"
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// parseDependencyAnalyzerOutput
+// ─────────────────────────────────────────────────────────────────────────────
+
+DepsResult parseDependencyAnalyzerOutput(const QString &output)
+{
+    static const QStringList kSectionHeaders = {
+        "System Dependencies:",
+        "Runtime Dependencies:",
+        "Virtual Dependencies (API Sets):",
+        "Other Dependencies:",
+        "Summary:"
+    };
+
+    // \s+ вместо \s{2,}: PEDependencyAnalyzer может использовать одиночный таб
+    // как разделитель между именем dll и путём. Имена dll пробелов не содержат,
+    // поэтому первый whitespace-символ всегда является разделителем.
+    static const QRegularExpression kSeparatorRe(QStringLiteral("\\s+"));
+
+    DepsResult result;
+    bool inOtherSection = false;
+    bool inSummary      = false;
+
+    const QStringList lines = output.split('\n');
+    for (const QString &rawLine : lines) {
+        const QString line = rawLine.trimmed();
+        if (line.isEmpty()) continue;
+
+        // Определяем текущую секцию.
+        bool isHeader = false;
+        for (const QString &h : kSectionHeaders) {
+            if (line.startsWith(h)) {
+                inOtherSection = (h == QLatin1String("Other Dependencies:"));
+                inSummary      = (h == QLatin1String("Summary:"));
+                isHeader = true;
+                break;
+            }
+        }
+        if (isHeader) continue;
+        if (line.startsWith("---") || line.startsWith("===")) continue;
+        if (inSummary) continue;
+
+        // Первый whitespace-разделитель делит строку на имя dll и путь.
+        const int     sepIdx     = line.indexOf(kSeparatorRe);
+        const QString dllName    = (sepIdx >= 0 ? line.left(sepIdx) : line).trimmed();
+        const QString dllPath    = (sepIdx >= 0 ? line.mid(sepIdx).trimmed() : QString());
+
+        if (dllName.isEmpty()) continue;
+
+        // Определяем тип ввода по имени dll (все секции, кроме Summary).
+        const QString dllLow = dllName.toLower();
+        if (dllLow.contains(QLatin1String("xinput")) &&
+            !result.inputTypes.contains(QLatin1String("xinput")))
+            result.inputTypes << QStringLiteral("xinput");
+        if (dllLow.contains(QLatin1String("dinput")) &&
+            !result.inputTypes.contains(QLatin1String("directinput")))
+            result.inputTypes << QStringLiteral("directinput");
+
+        // Отсутствующие зависимости — только из "Other Dependencies" без пути.
+        if (inOtherSection && dllPath.isEmpty())
+            result.missing << dllName;
+    }
+
+    // Приоритет: directinput > xinput — гарантируем порядок в списке.
+    // inputTypes уже заполняется в правильном порядке через contains-проверку,
+    // но явно сортируем на случай непредсказуемого порядка dll в выводе.
+    QStringList ordered;
+    if (result.inputTypes.contains(QLatin1String("directinput")))
+        ordered << QStringLiteral("directinput");
+    if (result.inputTypes.contains(QLatin1String("xinput")))
+        ordered << QStringLiteral("xinput");
+    result.inputTypes = ordered;
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// copyFileCancelable
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool copyFileCancelable(const QString &src,
+                        const QString &dst,
+                        const std::shared_ptr<std::atomic<bool>> &cancelFlag,
+                        qint64 chunkSize)
+{
+    QFile in(src);
+    if (!in.open(QIODevice::ReadOnly)) {
+        qWarning() << "InstallUtils::copyFileCancelable: cannot open source:" << src;
+        return false;
+    }
+    QFile out(dst);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qWarning() << "InstallUtils::copyFileCancelable: cannot open destination:" << dst;
+        return false;
+    }
+
+    QByteArray buffer;
+    buffer.resize(static_cast<int>(chunkSize));
+
+    while (!in.atEnd()) {
+        if (cancelFlag->load()) {
+            out.close();
+            QFile::remove(dst);
+            return false;
+        }
+        const qint64 bytesRead = in.read(buffer.data(), chunkSize);
+        if (bytesRead <= 0) break;
+        const qint64 written = out.write(buffer.constData(), bytesRead);
+        if (written != bytesRead) {
+            qWarning() << "InstallUtils::copyFileCancelable: write error on:" << dst;
+            out.close();
+            QFile::remove(dst);
+            return false;
+        }
+    }
+    out.flush();
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// generateUniqueFolderName
+// ─────────────────────────────────────────────────────────────────────────────
+
+QString generateUniqueFolderName(const QString &baseName, const QString &gamesDirPath)
+{
+    QString candidate = baseName;
+    int counter = 1;
+    const QDir gamesDir(gamesDirPath);
+    while (gamesDir.exists(candidate))
+        candidate = baseName + QString(" (%1)").arg(counter++);
+    return candidate;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// writeTileIdFile
+// ─────────────────────────────────────────────────────────────────────────────
+
+void writeTileIdFile(const QString &gameRootPath, const QString &tileId)
+{
+    QFile f(gameRootPath + "/tile_id.txt");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Text))
+        f.write(tileId.toUtf8());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// makeFolderGameId
+// ─────────────────────────────────────────────────────────────────────────────
+
+QString makeFolderGameId(const QString &folderPath)
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(
+            QDir::fromNativeSeparators(folderPath).toUtf8(),
+            QCryptographicHash::Md5
+        ).toHex()
+    ).left(12);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// writeGameInfoFile
+// ─────────────────────────────────────────────────────────────────────────────
+
+void writeGameInfoFile(const QString &gameRootPath,
+                       const QString &tileId,
+                       const QString &title,
+                       const QString &type,
+                       const QString &exePath,
+                       const QString &iconPath)
+{
+    const QString infoPath = gameRootPath + "/game_info.json";
+
+    QJsonObject obj;
+    obj["id"]             = makeFolderGameId(gameRootPath);
+    obj["name"]           = title;
+    obj["type"]           = type;
+    obj["executablePath"] = exePath;
+    obj["installPath"]    = QDir::toNativeSeparators(gameRootPath);
+    obj["iconPath"]       = iconPath;
+    obj["tileLocations"]  = QJsonArray{ tileId };
+    obj["archivePath"]    = "";
+    obj["installDate"]    = QDateTime::currentDateTime().toString(Qt::ISODate).left(10);
+    obj["sizeCached"]     = -1;
+    obj["legacyNoMetadata"] = false;
+    obj["inputTypes"]     = QJsonArray{};
+
+    // ── Медиа-данные (Фаза 1) ────────────────────────────────────────────────
+    const QString mediaDir = QDir::fromNativeSeparators(gameRootPath) + "/launcher/media";
+    QDir().mkpath(mediaDir);
+
+    obj["coverPath"]    = "";
+    obj["backdropPath"] = "";
+    obj["trailerPath"]  = "";
+    obj["mediaFetched"] = false;
+
+    // ── Метаданные игры (Фаза 3) ─────────────────────────────────────────────
+    obj["description"]  = "";
+    obj["genre"]        = "";
+    obj["releaseYear"]  = "";
+    obj["developer"]    = "";
+    obj["publisher"]    = "";
+    obj["rating"]       = "";
+    obj["sysreqMin"]    = "";
+    obj["sysreqRec"]    = "";
+    obj["infoFetched"]  = false;
+    obj["steamAppId"]   = "";   // заполняется GameInfoModule после поиска в Steam
+
+    if (!AtomicFile::writeJson(infoPath, QJsonDocument(obj)))
+        qWarning() << "InstallUtils::writeGameInfoFile: failed for" << gameRootPath;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// createLaunchScript
+// ─────────────────────────────────────────────────────────────────────────────
+
+QString createLaunchScript(const QString &gameRootPath,
+                           const QString &exePathOrRelative,
+                           const QString &kind)
+{
+    const QString launcherDir = gameRootPath + "/launcher";
+    QDir().mkpath(launcherDir);
+
+    const QString ps1Path = launcherDir + "/launch.ps1";
+    QFile ps1File(ps1Path);
+    if (!ps1File.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qWarning() << "InstallUtils::createLaunchScript: cannot create launch.ps1 at" << ps1Path;
+        return {};
+    }
+
+    QTextStream out(&ps1File);
+    out << "# launch.ps1 — generated by MediaCenter\r\n"
+        << "# DO NOT EDIT manually\r\n\r\n"
+        << "param(\r\n"
+        << "    [string]$PidFile     = \"\",\r\n"
+        << "    [string]$ExeOverride = \"\"\r\n"
+        << ")\r\n\r\n"
+        << "$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition\r\n"
+        << "$GameRoot  = Split-Path -Parent $ScriptDir\r\n"
+        << "$GameDir   = Join-Path $GameRoot 'game'\r\n\r\n";
+
+    if (kind == "app") {
+        QString exeRel = exePathOrRelative;
+        exeRel.replace('/', '\\');
+        out << "if ($ExeOverride -ne \"\") {\r\n"
+            << "    $ExePath = $ExeOverride\r\n"
+            << "} else {\r\n"
+            << "    $ExePath = Join-Path $GameDir '" << exeRel << "'\r\n"
+            << "}\r\n\r\n"
+            << "if (-not (Test-Path $ExePath)) {\r\n"
+            << "    if ($PidFile -ne \"\") { Set-Content -Path $PidFile -Value '0' }\r\n"
+            << "    exit 1\r\n"
+            << "}\r\n\r\n"
+            << "Set-Location $GameDir\r\n"
+            << "$proc = Start-Process -FilePath $ExePath -WorkingDirectory $GameDir -PassThru\r\n\r\n"
+            << "if ($PidFile -ne \"\") {\r\n"
+            << "    Set-Content -Path $PidFile -Value $proc.Id\r\n"
+            << "}\r\n\r\n"
+            << "exit 0\r\n";
+
+    } else if (kind == "external") {
+        QString exeAbs = exePathOrRelative;
+        exeAbs.replace('/', '\\');
+        const QString workDir = QDir::toNativeSeparators(
+            QFileInfo(exePathOrRelative).absolutePath());
+        out << "if ($ExeOverride -ne \"\") {\r\n"
+            << "    $ExePath = $ExeOverride\r\n"
+            << "} else {\r\n"
+            << "    $ExePath = '" << exeAbs << "'\r\n"
+            << "}\r\n\r\n"
+            << "if (-not (Test-Path $ExePath)) {\r\n"
+            << "    if ($PidFile -ne \"\") { Set-Content -Path $PidFile -Value '0' }\r\n"
+            << "    exit 1\r\n"
+            << "}\r\n\r\n"
+            << "$WorkDir = '" << workDir << "'\r\n"
+            << "Set-Location $WorkDir\r\n"
+            << "$proc = Start-Process -FilePath $ExePath -WorkingDirectory $WorkDir -PassThru\r\n\r\n"
+            << "if ($PidFile -ne \"\") {\r\n"
+            << "    Set-Content -Path $PidFile -Value $proc.Id\r\n"
+            << "}\r\n\r\n"
+            << "exit 0\r\n";
+    } else {
+        out << "if ($PidFile -ne \"\") { Set-Content -Path $PidFile -Value '0' }\r\n"
+            << "Write-Host 'Unsupported game kind: " << kind << "'\r\n"
+            << "exit 1\r\n";
+    }
+
+    ps1File.close();
+    return QDir::toNativeSeparators(ps1Path);
+}
+
+} // namespace InstallUtils

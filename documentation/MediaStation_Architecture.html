@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>MediaStation — Архитектура проекта (полная версия)</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f7f9;
+            color: #1e2a3a;
+        }
+        h1, h2, h3 {
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 0.3em;
+            margin-top: 1.5em;
+        }
+        h1 { font-size: 2em; text-align: center; margin-bottom: 0.2em; }
+        .subtitle { text-align: center; color: #2c3e50; margin-top: -0.5em; font-style: italic; }
+        code, pre {
+            background: #eef2f5;
+            border-radius: 6px;
+            font-family: 'Consolas', 'Fira Code', monospace;
+            font-size: 0.9em;
+        }
+        code { padding: 0.2em 0.4em; }
+        pre {
+            padding: 12px;
+            overflow-x: auto;
+            border-left: 4px solid #3b82f6;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 1em 0;
+            background: white;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        th, td {
+            border: 1px solid #cbd5e1;
+            padding: 8px 12px;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background: #e9eef3;
+            font-weight: 600;
+        }
+        ul, ol {
+            margin: 0.5em 0;
+            padding-left: 1.5em;
+        }
+        .tree {
+            font-family: monospace;
+            background: #1e2a3a;
+            color: #e2e8f0;
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+            line-height: 1.4;
+        }
+        .note {
+            background: #fef9e3;
+            border-left: 5px solid #f59e0b;
+            padding: 10px 15px;
+            margin: 1em 0;
+        }
+        hr {
+            margin: 2em 0;
+            border: 0;
+            height: 1px;
+            background: #cbd5e1;
+        }
+        footer {
+            font-size: 0.8em;
+            text-align: center;
+            margin-top: 3em;
+            color: #5b6e8c;
+        }
+    </style>
+</head>
+<body>
+
+<h1>MediaStation — Архитектура проекта</h1>
+<div class="subtitle">Структура · Ответственность · Зависимости · Влияние изменений</div>
+<div class="subtitle"><strong>Версия от 15 мая 2026 (rev 10) — полная документация</strong></div>
+
+<hr>
+
+<h2>Содержание</h2>
+<ol>
+    <li><a href="#general">Общая архитектура</a></li>
+    <li><a href="#tree">Дерево проекта</a></li>
+    <li><a href="#core">Ядро (core/)</a></li>
+    <li><a href="#utils">Утилиты (tools/) — AtomicFile, HttpClient, LlamaClient, SevenZip</a></li>
+    <li><a href="#external">Внешние зависимости (external_tools/)</a></li>
+    <li><a href="#modules">Модули C++</a>
+        <ul>
+            <li><a href="#tilemanager">TileManager</a></li>
+            <li><a href="#installmanager">InstallManager</a></li>
+            <li><a href="#networklistener">NetworkListener</a></li>
+            <li><a href="#appcontroller">AppController + GameWatcher</a></li>
+            <li><a href="#joystick">JoystickModule</a></li>
+            <li><a href="#settings">SettingsManager</a></li>
+            <li><a href="#notification">NotificationModule</a></li>
+            <li><a href="#battery">G72BatteryModule</a></li>
+            <li><a href="#gamelibrary">GameLibraryModule</a></li>
+            <li><a href="#g72keys">G72KeysModule</a></li>
+            <li><a href="#androidtv">AndroidTVModule</a></li>
+            <li><a href="#gameinfo">GameInfoModule</a></li>
+            <li><a href="#gamemedia">GameMediaModule</a></li>
+            <li><a href="#logger">LoggerModule</a></li>
+            <li><a href="#overlay">OverlayModule</a></li>
+            <li><a href="#update">UpdateManager</a></li>
+        </ul>
+    </li>
+    <li><a href="#qml">QML слой</a>
+        <ul>
+            <li><a href="#qml-screens">Экраны и основные компоненты</a></li>
+            <li><a href="#qml-base">Базовые UI компоненты</a></li>
+        </ul>
+    </li>
+    <li><a href="#main">Точка входа: main.cpp</a></li>
+    <li><a href="#deps">Карта зависимостей</a></li>
+    <li><a href="#changes">Типичные сценарии изменений</a></li>
+    <li><a href="#quick">Быстрый справочник</a></li>
+    <li><a href="#resources">Ресурсы (.qrc файлы)</a></li>
+    <li><a href="#gameinfo-json">Формат game_info.json</a></li>
+    <li><a href="#folder-structure">Структура папки игры</a></li>
+</ol>
+
+<hr>
+
+<h2 id="general">1. Общая архитектура</h2>
+<p>Проект построен по <strong>модульной архитектуре</strong>. C++ слой содержит ядро (<code>core/</code>), модули бизнес-логики, набор вспомогательных утилит (<code>tools/</code>) и использует внешние бинарные инструменты (<code>external_tools/</code>). QML слой — весь UI. Взаимодействие между C++ модулями происходит <strong>исключительно через EventBus</strong>. Модули не знают друг о друге напрямую.</p>
+
+<h3>Ключевые свойства архитектуры</h3>
+<ul>
+    <li><strong>Потокобезопасность</strong>: фоновые модули (<code>G72BatteryModule</code>, <code>InstallManager</code>, <code>GameLibraryModule</code>, <code>GameInfoModule</code>, <code>GameMediaModule</code>) используют Qt-сигналы с автоматическим <code>QueuedConnection</code> и явным флагом занятости. <code>applicationDirPath()</code> кешируется в GUI-потоке при старте.</li>
+    <li><strong>Жизненный цикл</strong>: <code>ModuleHost</code> управляет порядком инициализации и завершения. <code>shutdown()</code> у каждого модуля вызывается в порядке, обратном регистрации, до уничтожения объектов.</li>
+    <li><strong>Протокол событий</strong>: типизированные сигналы EventBus — для межмодульных событий; <code>moduleEvent()</code> — для расширения без правок <code>EventBus.h</code>. Протоколы <code>moduleEvent</code> закреплены как именованные константы в namespace соответствующего модуля.</li>
+</ul>
+
+<h3>Схема уровней</h3>
+<ul>
+    <li><strong>QML слой</strong><br>
+        Экраны: <code>Main</code>, <code>HomeScreen</code>, <code>DynamicScreen</code>, <code>GameDetailScreen</code>, <code>SettingsScreen</code>, <code>GameLibraryScreen</code>, <code>AndroidTvSettings</code> и др.<br>
+        Базовые компоненты: <code>BaseDialog</code>, <code>GlowingCard</code>, <code>StyledButton</code>, <code>Spinner</code>, <code>ToggleSwitch</code> и др.
+    </li>
+    <li><strong>Модули C++</strong><br>
+        <code>TileManager</code>, <code>InstallManager</code>, <code>NetworkListener</code>, <code>AppController</code> (+<code>GameWatcher</code>), <code>JoystickModule</code>, <code>SettingsManager</code>, <code>NotificationModule</code>, <code>G72BatteryModule</code>, <code>GameLibraryModule</code>, <code>G72KeysModule</code>, <code>AndroidTVModule</code>, <code>GameInfoModule</code>, <code>GameMediaModule</code>, <code>LoggerModule</code>, <code>OverlayModule</code>, <code>UpdateManager</code>
+    </li>
+    <li><strong>Ядро (core/)</strong><br>
+        <code>ModuleHost</code>, <code>EventBus</code>, <code>IModule</code>
+    </li>
+    <li><strong>Утилиты (tools/)</strong><br>
+        <code>AtomicFile</code> (атомарная запись), <code>HttpClient</code> (синхронный HTTP GET), <code>LlamaClient</code> (LLM инференс), <code>SevenZip</code> (архивация/разархивация через 7zr)
+    </li>
+    <li><strong>Внешние инструменты (external_tools/)</strong><br>
+        <code>7zr.exe</code>, <code>ffmpeg.exe</code>, <code>DS4WindowsCmd.exe</code>, <code>PEDependencyAnalyzer.exe</code>, <code>adb.exe</code>, <code>dnsproxy.exe</code>, <code>llama.dll</code>, <code>applications.json</code>
+    </li>
+    <li><strong>Вспомогательные классы (не IModule)</strong><br>
+        <code>GameWatcher</code>, <code>GameInfoFetcher</code>, <code>HtmlStripper</code>, <code>TitleNormalizer</code>, <code>InstallUtils</code>, <code>CoverFetcher</code>, <code>TrailerFetcher</code>, <code>SteamAppList</code>
+    </li>
+</ul>
+
+<hr>
+
+<h2 id="tree">2. Дерево проекта</h2>
+<pre class="tree">
+MediaStation/
+    core/
+        IModule.h / IModule.cpp
+        ModuleHost.h / ModuleHost.cpp
+        EventBus.h
+
+    tools/                               # наши вспомогательные классы
+        AtomicFile.h / AtomicFile.cpp
+        HttpClient.h / HttpClient.cpp
+        LlamaClient.h / LlamaClient.cpp
+        SevenZip.h / SevenZip.cpp
+
+    external_tools/                      # сторонние исполняемые файлы
+        7zr.exe
+        ffmpeg.exe
+        DS4WindowsCmd.exe
+        PEDependencyAnalyzer.exe
+        dnsproxy.exe
+        applicationslist/
+            applications.json
+        llama/
+            include/llama.h, ggml.h
+            lib/llama.lib
+        cmdline-tools/                   # Android SDK tools (adb и др.)
+        DS4-Windows/
+        dnsproxy/
+
+    modules/
+        AppModule/
+            AppController.h / .cpp
+            GameWatcher.h / .cpp
+        AirMouseModule/
+            G72BatteryModule.h / .cpp
+            G72KeysModule.h / .cpp
+        TileModule/
+            TileManager.h / .cpp
+            InstallManager.h / .cpp
+            InstallUtils.h / .cpp
+        NetworkModule/
+            NetworkListener.h / .cpp
+            NetworkServer.cpp
+            NetworkLogSender.cpp
+        JoystickModule/
+            JoystickModule.h / .cpp
+        SettingsModule/
+            SettingsManager.h / .cpp
+        NotificationModule/
+            NotificationModule.h / .cpp
+        GameLibraryModule/
+            GameLibraryModule.h / .cpp
+        GameInfoModule/
+            GameInfoModule.h / .cpp
+            GameInfoFetcher.h / .cpp
+            HtmlStripper.h / .cpp
+            TitleNormalizer.h / .cpp
+        GameMediaModule/
+            GameMediaModule.h / .cpp
+            CoverFetcher.h / .cpp
+            TrailerFetcher.h / .cpp
+            SteamAppList.h / .cpp
+        LoggerModule/
+            LoggerModule.h / .cpp
+        OverlayModule/
+            OverlayModule.h / .cpp
+        AndroidTVModule/
+            AndroidTVModule.h / .cpp
+            AndroidTVInput.cpp
+            AndroidTVLifecycle.cpp
+            AndroidTVLog.cpp
+            AndroidTVProfiles.cpp
+            AndroidTVWindow.cpp
+        UpdateManager/
+            UpdateManager.h / .cpp
+
+    main.cpp
+
+    qml/
+        Main.qml
+        Settings.qml
+        HomeScreen.qml
+        DynamicScreen.qml
+        GameDetailScreen.qml
+        SettingsScreen.qml
+        Tile.qml
+        TileContextMenu.qml
+        EditTileDialog.qml
+        DeleteConfirmDialog.qml
+        FileBrowserDialog.qml
+        InstallRequestDialog.qml
+        JoystickBar.qml
+        PowerMenu.qml
+        Notification.qml
+        G72BatteryWidget.qml
+        GameLibraryScreen.qml
+        AndroidTvSettings.qml
+        BootAnimationPlayer.qml
+        OverlayScreen.qml
+        PromptDialog.qml
+        UpdateAvailableDialog.qml
+        base/
+            BaseDialog.qml
+            GlowingCard.qml
+            SectionDivider.qml
+            SettingsRow.qml
+            SettingsTile.qml
+            Spinner.qml
+            StyledButton.qml
+            ToggleSwitch.qml
+
+    translation/
+        i18n.js
+
+    assets/
+        background.png
+        cursor/
+        icons/
+
+    fonts/
+        Montserrat-SemiBold.ttf
+
+    qml.qrc
+    assets.qrc
+    MediaStation.pro
+</pre>
+<p><strong>Примечание</strong>: <code>INCLUDEPATH</code> в <code>.pro</code> включает все подпапки <code>modules/*</code> и <code>external_tools/llama/include</code>.</p>
+
+<hr>
+
+<h2 id="core">3. Ядро (core/)</h2>
+<table>
+    <tr><th>Файл</th><th>Роль</th></tr>
+    <tr><td><code>IModule.h / IModule.cpp</code></td><td>Базовый интерфейс модуля: <code>initialize</code>, <code>shutdown</code>, <code>qmlObject</code>, <code>registerWithQml</code></td></tr>
+    <tr><td><code>ModuleHost.h / ModuleHost.cpp</code></td><td>Реестр и жизненный цикл модулей. Владеет <code>EventBus</code> и <code>SettingsManager</code>. Гарантирует однократный <code>shutdown</code> через флаг <code>m_shuttingDown</code></td></tr>
+    <tr><td><code>EventBus.h</code></td><td>Шина событий: <code>networkExtractFinished</code>, <code>settingChanged</code>, <code>moduleEvent</code></td></tr>
+</table>
+
+<h3>EventBus: два уровня событий</h3>
+<p><strong>Типизированные сигналы</strong> (добавляются редко):</p>
+<pre><code>// NetworkListener → InstallManager
+void networkExtractFinished(tileId, title, gameRootPath, exeRelPath, iconRelPath, kind);
+
+// ModuleHost → все модули
+void settingChanged(key, value);
+</code></pre>
+
+<p><strong><code>moduleEvent(module, event, data)</code></strong> — для расширения без правки <code>EventBus.h</code>:</p>
+<pre><code>// Уведомления
+emit bus->moduleEvent(Notifications::kModule, Notifications::kEventShow, ...);
+
+// GameLibraryModule ↔ TileManager
+emit bus->moduleEvent("gameLibrary", "createTile", data);
+
+// G72KeysModule → AndroidTVModule
+emit bus->moduleEvent(G72Keys::kModule, G72Keys::kEventKey, ...);
+
+// GameInfoModule → шина
+emit bus->moduleEvent("gameinfo", "fetch", data);
+emit bus->moduleEvent("gameinfo", "fetched", data);
+
+// GameMediaModule
+emit bus->moduleEvent("gamemedia", "fetch", ...);
+</code></pre>
+
+<hr>
+
+<h2 id="utils">4. Утилиты (tools/) — вспомогательные классы</h2>
+<p>Набор потокобезопасных вспомогательных классов, используемых модулями. <strong>Все утилиты блокирующие</strong> — вызывать только из фоновых потоков.</p>
+
+<h3>AtomicFile</h3>
+<p>Атомарная запись файлов через паттерн <code>.tmp</code> → rename. Гарантирует, что файл либо записан полностью, либо не тронут. Используется в <code>TileManager</code> (structure.json), <code>GameInfoModule</code> (game_info.json), <code>GameMediaModule</code> (обновление метаданных).</p>
+<pre><code>// Запись JSON
+AtomicFile::writeJson("/path/file.json", doc);
+
+// Запись произвольных байт
+AtomicFile::writeBytes("/path/image.jpg", data);
+</code></pre>
+
+<h3>HttpClient</h3>
+<p>Синхронный HTTP GET для фоновых потоков. Использует <code>QEventLoop</code> и таймауты. Поддерживает флаг отмены через <code>std::atomic&lt;bool&gt;*</code>. Применяется в <code>CoverFetcher</code>, <code>TrailerFetcher</code>, <code>GameInfoFetcher</code>.</p>
+<pre><code>QByteArray data = HttpClient::get("https://...", 30000, &m_cancelled);
+</code></pre>
+
+<h3>LlamaClient</h3>
+<p>Обёртка над <code>llama.cpp</code> для инференса LLM (Qwen2.5-7B). Управляет моделью (загрузка в GPU/CPU, контекст 12288 токенов, генерация до 2048 токенов). Поддерживает колбэк на каждый токен. Логирует через <code>EventBus → LoggerModule</code>. Используется в <code>GameInfoModule</code> для генерации описаний.</p>
+<pre><code>LlamaClient client;
+client.setBus(eventBus);
+client.initialize("/path/model.gguf");
+QString result = client.runInference(systemPrompt, userPrompt,
+    [](const QString &token){ /* потокобезопасный вывод */ });
+</code></pre>
+<p><strong>Важно:</strong> отключает CUDA Graph через <code>GGML_CUDA_NO_GRAPHS=1</code> для стабильности.</p>
+
+<h3>SevenZip</h3>
+<p>Обёртка над <code>7zr.exe</code> (или <code>7z.exe</code>) для сжатия/распаковки <code>.7z</code> с максимальным сжатием LZMA2. Предоставляет прогресс-колбэк. Используется в <code>GameLibraryModule</code> (архивация/разархивация игр).</p>
+<pre><code>SevenZip::Result r = SevenZip::compress(workDir, "game", archivePath, &cancelFlag,
+    [](int pct, const QString &file){ /* прогресс */ });
+</code></pre>
+
+<hr>
+
+<h2 id="external">5. Внешние зависимости (external_tools/)</h2>
+<p>Папка <code>external_tools/</code> содержит сторонние исполняемые файлы и библиотеки, вызываемые модулями через <code>QProcess</code> или линковкой. Все пути к ним вычисляются относительно <code>QCoreApplication::applicationDirPath()</code>.</p>
+
+<table>
+    <tr><th>Файл</th><th>Назначение</th><th>Используется в</th></tr>
+    <tr><td><code>7zr.exe</code></td><td>Архивация/разархивация .7z (лёгкая версия)</td><td><code>SevenZip</code> → <code>GameLibraryModule</code></td></tr>
+    <tr><td><code>ffmpeg.exe</code></td><td>Конвертация HLS/DASH трейлеров в MP4</td><td><code>TrailerFetcher</code> → <code>GameMediaModule</code></td></tr>
+    <tr><td><code>DS4WindowsCmd.exe</code></td><td>Управление геймпадами DualShock 4</td><td><code>JoystickModule</code></td></tr>
+    <tr><td><code>PEDependencyAnalyzer.exe</code></td><td>Анализ DLL зависимостей .exe</td><td><code>InstallManager</code> (сканирование переносимых приложений)</td></tr>
+    <tr><td><code>adb.exe</code> (из Android SDK)</td><td>Управление эмулятором Android TV</td><td><code>AndroidTVModule</code></td></tr>
+    <tr><td><code>dnsproxy.exe</code></td><td>DNS-proxy для эмулятора Android TV</td><td><code>AndroidTVModule</code></td></tr>
+    <tr><td><code>llama.dll / libllama.a</code></td><td>Библиотека инференса LLM (llama.cpp)</td><td><code>LlamaClient</code> (линкуется статически через <code>LIBS += -lllama</code>)</td></tr>
+    <tr><td><code>applications.json</code></td><td>Локальная база Steam App ID (название → Steam ID)</td><td><code>SteamAppList</code> → <code>GameInfoModule</code>, <code>GameMediaModule</code></td></tr>
+</table>
+
+<p><strong>Примечание:</strong> <code>llama/</code> содержит заголовочные файлы (<code>llama.h</code>, <code>ggml.h</code>) и библиотеку <code>lib/llama.lib</code>. Подключается через <code>INCLUDEPATH</code> и <code>LIBS</code> в <code>.pro</code> файле.</p>
+
+<hr>
+
+<h2 id="modules">6. Модули C++</h2>
+
+<h3 id="tilemanager">TileManager (<code>modules/TileModule/</code>)</h3>
+<p>Отвечает за дерево плиток и файл <code>structure.json</code>. Логика установки полностью делегирована <code>InstallManager</code>. Использует <code>AtomicFile</code> для атомарной записи структуры.</p>
+
+<h3 id="installmanager">InstallManager (<code>modules/TileModule/</code>)</h3>
+<p>Полноценный модуль, отвечающий за установку, создание ярлыков, сканирование зависимостей. Работает в фоновом потоке.</p>
+
+<h3 id="networklistener">NetworkListener (<code>modules/NetworkModule/</code>)</h3>
+<p>TCP-сервер, принимающий и распаковывающий пакеты установки. Сигнал <code>networkExtractFinished</code> потребляется напрямую <code>InstallManager</code>.</p>
+
+<h3 id="appcontroller">AppController + GameWatcher (<code>modules/AppModule/</code>)</h3>
+<p>Управление запуском приложений и игр. <code>GameWatcher</code> — внутренний класс, наблюдающий за окном запущенной игры через Win32 API.</p>
+
+<h3 id="joystick">JoystickModule (<code>modules/JoystickModule/</code>)</h3>
+<p>Управление геймпадами и DS4Windows.</p>
+
+<h3 id="settings">SettingsManager (<code>modules/SettingsModule/</code>)</h3>
+<p>Хранит настройки через <code>QSettings</code>. Изменения пробрасываются в <code>EventBus::settingChanged</code>.</p>
+
+<h3 id="notification">NotificationModule (<code>modules/NotificationModule/</code>)</h3>
+<p>Управление очередью уведомлений с приоритетами.</p>
+
+<h3 id="battery">G72BatteryModule (<code>modules/AirMouseModule/</code>)</h3>
+<p>Чтение заряда пульта G72 по BLE (WinRT) в фоновом потоке.</p>
+
+<h3 id="gamelibrary">GameLibraryModule (<code>modules/GameLibraryModule/</code>)</h3>
+<p>Библиотека игр: сканирование <code>installPath</code>, метаданные, архивирование/разархивирование через <code>SevenZip</code>.</p>
+
+<h3 id="g72keys">G72KeysModule (<code>modules/AirMouseModule/</code>)</h3>
+<p>Обрабатывает нажатия клавиш пульта G72 через Win32 хуки.</p>
+
+<h3 id="androidtv">AndroidTVModule (<code>modules/AndroidTVModule/</code>)</h3>
+<p>Управляет эмулятором Android TV (запуск, управление через ADB, DNS-proxy).</p>
+
+<h3 id="gameinfo">GameInfoModule (<code>modules/GameInfoModule/</code>)</h3>
+<p>Модуль получения метаданных об игре с использованием локальной БД, веба и LLM (<code>LlamaClient</code>). После успешного получения информации автоматически инициирует загрузку медиа через <code>GameMediaModule</code>.</p>
+
+<h3 id="gamemedia">GameMediaModule (<code>modules/GameMediaModule/</code>)</h3>
+<p>Отвечает за загрузку обложек, фонового изображения и трейлера игры со Steam CDN / API. Использует <code>HttpClient</code>, <code>CoverFetcher</code>, <code>TrailerFetcher</code> (ffmpeg для конвертации).</p>
+
+<h3 id="logger">LoggerModule (<code>modules/LoggerModule/</code>)</h3>
+<p>Принимает события логирования через <code>moduleEvent("logger", "log", ...)</code> и записывает их в файл <code>logs/app.log</code>.</p>
+
+<h3 id="overlay">OverlayModule (<code>modules/OverlayModule/</code>)</h3>
+<p>Управляет оверлейным окном (отображается поверх игр).</p>
+
+<h3 id="update">UpdateManager (<code>modules/UpdateManager/</code>)</h3>
+<p>Проверка обновлений приложения через GitHub API.</p>
+
+<hr>
+
+<h2 id="qml">7. QML слой</h2>
+
+<h3 id="qml-screens">7.1 Экраны и основные компоненты</h3>
+<p>Ключевые QML-экраны и виджеты.</p>
+<ul>
+    <li><code>Main.qml</code> — корневой экран.</li>
+    <li><code>Settings.qml</code> — синглтон-прокси для настроек, функции <code>us()</code> и <code>fs()</code>.</li>
+    <li><code>DynamicScreen.qml</code> — динамическая сетка плиток, поддержка фаз установки.</li>
+    <li><code>GameDetailScreen.qml</code> — страница игры: обложка, фон, трейлер, описание, индикатор стадий, попап выбора кандидата.</li>
+    <li><code>GameLibraryScreen.qml</code> — таблица игр.</li>
+    <li><code>Tile.qml</code> — плитка с иконкой, прогресс-бар, зона отмены, контекстное меню.</li>
+    <li><code>G72BatteryWidget.qml</code> — индикатор заряда пульта.</li>
+    <li>...</li>
+</ul>
+
+<h3 id="qml-base">7.2 Базовые UI компоненты (<code>qml/base/</code>)</h3>
+<p>Набор переиспользуемых компонентов для построения интерфейса. Все они находятся в папке <code>qml/base/</code> и используют синглтон <code>Settings</code> для масштабирования и стилизации.</p>
+
+<h4>BaseDialog</h4>
+<p>Модальное окно с затемнением фона и анимацией появления/скрытия.</p>
+<ul>
+    <li><code>dialogWidth</code>, <code>dialogHeight</code> — размеры карточки.</li>
+    <li><code>closeOnClickOutside</code> — закрытие по клику вне карточки.</li>
+    <li>Методы: <code>open()</code>, <code>close()</code>.</li>
+</ul>
+
+<h4>GlowingCard</h4>
+<p>Контейнер с тенью, градиентным фоном и акцентной рамкой.</p>
+
+<h4>SectionDivider</h4>
+<p>Горизонтальная разделительная линия.</p>
+
+<h4>SettingsRow</h4>
+<p>Строка для элементов настроек: слева метка, справа контент.</p>
+
+<h4>SettingsTile</h4>
+<p>Карточка-ссылка для экранов настроек.</p>
+
+<h4>Spinner</h4>
+<p>Индикатор загрузки в виде вращающейся дуги.</p>
+
+<h4>StyledButton</h4>
+<p>Стилизованная кнопка с ролями: <code>primary</code>, <code>danger</code>, <code>default</code>.</p>
+
+<h4>ToggleSwitch</h4>
+<p>Переключатель (аналог checkbox) с анимацией.</p>
+
+<hr>
+
+<h2 id="main">8. Точка входа: main.cpp</h2>
+<pre><code>ModuleHost host(&engine);
+host.registerModule(new InstallManager(&host));
+host.registerModule(new TileManager(&host));
+host.registerModule(new NetworkListener(&host));
+host.registerModule(new AppController(&host));
+host.registerModule(new JoystickModule(&host));
+host.registerModule(new NotificationModule(&host));
+host.registerModule(new G72BatteryModule(&host));
+host.registerModule(new GameLibraryModule(&host));
+host.registerModule(new G72KeysModule(&host));
+host.registerModule(new AndroidTVModule(&host));
+host.registerModule(new GameInfoModule(&host));
+host.registerModule(new GameMediaModule(&host));
+host.registerModule(new LoggerModule(&host));
+host.registerModule(new OverlayModule(&host));
+host.registerModule(new UpdateManager(&host));
+host.initializeAll();
+
+TileManager *tm = host.findChild&lt;TileManager *&gt;();
+InstallManager *im = host.findChild&lt;InstallManager *&gt;();
+if (tm && im) tm->setInstallManager(im);
+</code></pre>
+
+<hr>
+
+<h2 id="deps">9. Карта зависимостей (обновлённая)</h2>
+<table>
+    <tr><th>C++ модуль/утилита</th><th>Зависит от</th></tr>
+    <tr><td><code>TileManager</code></td><td><code>IModule</code>, <code>EventBus</code>, <code>InstallManager</code> (инъекция), <code>AtomicFile</code></td></tr>
+    <tr><td><code>InstallManager</code></td><td><code>IModule</code>, <code>EventBus</code>, <code>QtConcurrent</code>, <code>PEDependencyAnalyzer.exe</code>, <code>InstallUtils</code></td></tr>
+    <tr><td><code>GameLibraryModule</code></td><td><code>IModule</code>, <code>EventBus</code>, <code>SettingsManager</code>, <code>SevenZip</code></td></tr>
+    <tr><td><code>GameInfoModule</code></td><td><code>IModule</code>, <code>EventBus</code>, <code>LlamaClient</code>, <code>HttpClient</code>, <code>SteamAppList</code>, <code>GameMediaModule</code> (через <code>EventBus</code>)</td></tr>
+    <tr><td><code>GameMediaModule</code></td><td><code>IModule</code>, <code>EventBus</code>, <code>HttpClient</code>, <code>CoverFetcher</code>, <code>TrailerFetcher</code> (ffmpeg), <code>AtomicFile</code></td></tr>
+    <tr><td><code>LlamaClient</code></td><td><code>llama.dll</code>, <code>EventBus</code> (для логирования), <code>LoggerModule</code></td></tr>
+    <tr><td><code>AtomicFile</code></td><td><code>QFile</code>, <code>QJsonDocument</code></td></tr>
+    <tr><td><code>HttpClient</code></td><td><code>QNetworkAccessManager</code>, <code>QEventLoop</code></td></tr>
+    <tr><td><code>SevenZip</code></td><td><code>7zr.exe</code>, <code>QProcess</code></td></tr>
+</table>
+
+<hr>
+
+<h2 id="changes">10. Типичные сценарии изменений</h2>
+<ul>
+    <li><strong>Добавление нового HTTP-запроса</strong> → использовать <code>HttpClient::get</code> в фоновом потоке с флагом отмены.</li>
+    <li><strong>Смена модели LLM</strong> → заменить <code>.gguf</code>, проверить параметры <code>kCtxSize</code>, <code>kMaxTokens</code> в <code>LlamaClient.cpp</code>.</li>
+    <li><strong>Атомарная запись нового конфига</strong> → использовать <code>AtomicFile::writeJson</code> или <code>writeBytes</code>.</li>
+    <li><strong>Архивация/распаковка другого формата</strong> → расширить <code>SevenZip</code> новыми параметрами.</li>
+    <li><strong>Новый тип уведомления</strong> → <code>NotificationLevel</code> enum, <code>Notification.qml</code></li>
+    <li><strong>Добавление настройки</strong> → <code>SettingsManager</code>, <code>Settings.qml</code>, <code>ModuleHost.cpp</code></li>
+    <li><strong>Добавить новый модуль</strong> → два файла <code>.h/.cpp</code> + строка в <code>main.cpp</code></li>
+</ul>
+
+<hr>
+
+<h2 id="quick">11. Быстрый справочник (дополненный)</h2>
+<table>
+    <tr><th>Задача</th><th>Файл(ы)</th></tr>
+    <tr><td>Атомарная запись JSON</td><td><code>AtomicFile::writeJson</code></td></tr>
+    <tr><td>Синхронный HTTP GET</td><td><code>HttpClient::get</code></td></tr>
+    <tr><td>Инференс LLM</td><td><code>LlamaClient::runInference</code></td></tr>
+    <tr><td>Архивация игры</td><td><code>SevenZip::compress</code></td></tr>
+    <tr><td>Разархивация игры</td><td><code>SevenZip::extract</code></td></tr>
+    <tr><td>Поиск пути к 7zr.exe</td><td><code>SevenZip::findBinary</code></td></tr>
+    <tr><td>Логирование из любого потока</td><td><code>LlamaClient::log</code> или <code>emit moduleEvent("logger","log",...)</code></td></tr>
+    <tr><td>MAC-адрес пульта G72</td><td><code>G72BatteryModule.cpp</code> (<code>kFallbackMac</code>)</td></tr>
+    <tr><td>Нормализация названия игры</td><td><code>TitleNormalizer::normalize()</code></td></tr>
+    <tr><td>Локальная БД Steam</td><td><code>SteamAppList</code>, <code>external_tools/applicationslist/applications.json</code></td></tr>
+</table>
+
+<hr>
+
+<h2 id="resources">12. Ресурсы (.qrc файлы)</h2>
+<p><strong>assets.qrc</strong> — <code>background.png</code>, иконки, шрифт <code>Montserrat-SemiBold.ttf</code>, курсоры.<br>
+<strong>qml.qrc</strong> — все QML-файлы, включая <code>base/</code>.</p>
+
+<hr>
+
+<h2 id="gameinfo-json">13. Формат game_info.json</h2>
+<p>Атомарно обновляется через <code>AtomicFile::writeJson</code>.</p>
+<pre><code>{
+  "id": "a3f1c8d9e2b4",
+  "name": "Half-Life 2",
+  "type": "installed",
+  "coverPath": "C:\\Games\\Half-Life 2\\launcher\\media\\cover.jpg",
+  "backdropPath": "...",
+  "trailerPath": "...",
+  "mediaFetched": true,
+  "description": "...",
+  "genre": "..."
+}
+</code></pre>
+
+<h3>Жизненный цикл type</h3>
+<pre>installed ↔ archive (архивирование/разархивирование)
+external → (нельзя архивировать)</pre>
+
+<hr>
+
+<h2 id="folder-structure">14. Структура папки игры</h2>
+<pre>
+&lt;installPath&gt;/
+└── Half-Life 2/
+    ├── game/                 # игровые файлы
+    ├── launcher/             # launch.ps1, icon.png, media/
+    │   └── media/            # cover.jpg, backdrop.jpg, trailer.mp4
+    ├── archive/              # Half-Life 2.7z
+    ├── game_info.json
+    └── tile_id.txt
+</pre>
+
+<hr>
+
+<footer>
+    MediaStation Architecture · Полная версия от 15 мая 2026 (rev 10)<br>
+    Учтены все файлы из MediaStation.pro, добавлены утилиты AtomicFile, HttpClient, LlamaClient, SevenZip,<br>
+    а также раздел внешних зависимостей external_tools/.
+</footer>
+
+</body>
+</html>

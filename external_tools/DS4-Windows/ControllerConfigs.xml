@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- Controller config data. 22.03.2026 11:32:30 -->
+
+<Controllers>
+  <Controller Mac="F1:04:29:49:F8:82" ControllerType="DS4">
+    <DS4SupportSettings>
+      <Copycat>False</Copycat>
+    </DS4SupportSettings>
+  </Controller>
+</Controllers>

@@ -1,0 +1,6 @@
+512 416 60
+c 1 0 part0
+c 1 15 part1
+c 1 0 part2
+c 1 0 part3
+f 0 0 part4 10

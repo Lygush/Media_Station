@@ -1,0 +1,535 @@
+// TileManager.cpp
+// ─────────────────────────────────────────────────────────────────────────────
+// TileManager — управление деревом плиток и файловой системой.
+// Вся логика установки делегируется InstallManager (m_installer).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#include "TileManager.h"
+#include "NotificationModule.h"
+#include "core/EventBus.h"
+#include "tools/AtomicFile.h"
+
+#include <QStorageInfo>
+#include <QRegularExpression>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+
+// ─────────────────────────────────────────────────────────────────────────────
+const QStringList TileManager::s_knownScreens = { "games", "tv" };
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Конструктор / деструктор
+// ═════════════════════════════════════════════════════════════════════════════
+
+TileManager::TileManager(QObject *parent)
+    : QObject(parent)
+    , dataDir(QCoreApplication::applicationDirPath() + "/data")
+    , m_structurePath(QCoreApplication::applicationDirPath() + "/data/structure.json")
+// m_installer = nullptr — инжектируется из main.cpp через setInstallManager()
+{
+    dataDir.mkpath(".");
+    loadStructure();
+}
+
+TileManager::~TileManager() = default;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// setInstallManager — инъекция зависимости из main.cpp
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TileManager::setInstallManager(InstallManager *im)
+{
+    Q_ASSERT(im);
+    m_installer = im;
+
+    // Пробрасываем все сигналы InstallManager наружу.
+    // QML подписан на TileManager.xxx, поэтому сигналы должны идти от него.
+    connect(m_installer, &InstallManager::installationProgress,
+            this,        &TileManager::installationProgress);
+    connect(m_installer, &InstallManager::installationFinished,
+            this,        &TileManager::installationFinished);
+    connect(m_installer, &InstallManager::installationCancelled,
+            this,        &TileManager::installationCancelled);
+    connect(m_installer, &InstallManager::exeScanReady,
+            this,        &TileManager::exeScanReady);
+    connect(m_installer, &InstallManager::exeDescriptionReady,
+            this,        &TileManager::exeDescriptionReady);
+    connect(m_installer, &InstallManager::dependencyCheckReady,
+            this,        &TileManager::dependencyCheckReady);
+    connect(m_installer, &InstallManager::launchExeUpdated,
+            this,        &TileManager::launchExeUpdated);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// IModule::initialize — подписка на события шины
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TileManager::initialize(EventBus *bus, SettingsManager * /*settings*/)
+{
+    m_bus = bus;
+
+    // ── GameLibraryModule → TileManager ──────────────────────────────────────
+    connect(bus, &EventBus::moduleEvent, this,
+            [this, bus](const QString &mod, const QString &ev, const QVariantMap &data)
+            {
+                if (mod != "gameLibrary") return;
+
+                // ── createTile: создать плитку в нужном экране/папке ─────────────────
+                if (ev == "createTile") {
+                    const QString storageKey = data["storageKey"].toString();
+                    const bool    isFolder   = data["isFolder"].toBool();
+                    const QString gameId     = data["gameId"].toString();
+                    const QString tileId     = "lib_" + gameId;
+
+                    // Не создаём дубликат если плитка уже есть.
+                    if (countTilesById(tileId) > 0) {
+                        qDebug() << "TileManager: tile already exists, skipping createTile:" << tileId;
+                        const int count = countTilesById(tileId);
+                        emit bus->moduleEvent("tileManager", "tileCountChanged",
+                                              QVariantMap{{ "gameId", gameId }, { "count", count }});
+                        return;
+                    }
+
+                    QVariantMap tile;
+                    tile["type"]          = "shortcut";
+                    tile["kind"]          = "app";
+                    tile["title"]         = data["title"].toString();
+                    tile["icon"]          = data["iconPath"].toString();
+                    tile["path"]          = data["ps1Path"].toString();
+                    tile["id"]            = tileId;
+                    tile["installFolder"] = data["installPath"].toString();
+
+                    QVariantList tiles = isFolder ? loadFolder(storageKey) : loadScreen(storageKey);
+                    tiles.append(tile);
+                    if (isFolder) saveFolder(storageKey, tiles);
+                    else          saveScreen(storageKey, tiles);
+
+                    qDebug() << "TileManager: created tile from library:" << tileId
+                             << "in" << storageKey;
+
+                    emit tileStructureChanged(storageKey, isFolder);
+
+                    emit bus->moduleEvent("tileManager", "tileCountChanged",
+                                          QVariantMap{{ "gameId", gameId }, { "count", countTilesById(tileId) }});
+                }
+
+                // ── removeTiles: удалить плитки из structure.json по tileId ──────────
+                else if (ev == "removeTiles") {
+                    const QVariantList locs = data["tileLocations"].toList();
+                    const QString gameId    = data["gameId"].toString();
+                    const QString tileId    = "lib_" + gameId;
+
+                    if (!gameId.isEmpty())
+                        removeTileFromStructure(tileId);
+
+                    for (const QVariant &v : locs) {
+                        const QString loc = v.toString();
+                        if (!loc.isEmpty())
+                            removeTileFromStructure(loc);
+                    }
+
+                    qDebug() << "TileManager: removed tiles for gameId:" << gameId
+                             << "locations:" << locs;
+
+                    emit tileStructureChanged(QString(), false);
+
+                    if (!gameId.isEmpty())
+                        emit bus->moduleEvent("tileManager", "tileCountChanged",
+                                              QVariantMap{{ "gameId", gameId }, { "count", countTilesById(tileId) }});
+                }
+
+                // ── queryTileCounts ───────────────────────────────────────────────────
+                else if (ev == "queryTileCounts") {
+                    const QVariantList entries = data["entries"].toList();
+                    for (const QVariant &v : entries) {
+                        const QVariantMap e      = v.toMap();
+                        const QString gameId     = e["gameId"].toString();
+                        if (gameId.isEmpty()) continue;
+
+                        int count = countTilesById("lib_" + gameId);
+                        if (count == 0) {
+                            const QVariantList locs = e["tileLocations"].toList();
+                            for (const QVariant &l : locs) {
+                                const QString loc = l.toString();
+                                if (!loc.isEmpty())
+                                    count += countTilesById(loc);
+                            }
+                        }
+
+                        emit bus->moduleEvent("tileManager", "tileCountChanged",
+                                              QVariantMap{{ "gameId", gameId }, { "count", count }});
+                    }
+                }
+            });
+}
+
+void TileManager::shutdown()
+{
+    if (m_installer)
+        m_installer->cancelAllInstallations();
+    m_installer = nullptr;
+    m_bus       = nullptr;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Уведомления
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TileManager::notify(NotificationLevel level,
+                         const QString     &msg,
+                         bool               autoDismiss,
+                         int                duration) const
+{
+    if (!m_bus) return;
+    emit m_bus->moduleEvent(
+        Notifications::kModule,
+        Notifications::kEventShow,
+        Notifications::makeEvent(msg, level, autoDismiss, duration));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Загрузка / сохранение structure.json
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TileManager::loadStructure()
+{
+    QFile f(m_structurePath);
+    if (f.open(QIODevice::ReadOnly)) {
+        QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+        if (doc.isObject()) {
+            m_structure = doc.object();
+            for (const QString &screen : s_knownScreens)
+                if (!m_structure.contains(screen))
+                    m_structure[screen] = QJsonArray();
+            return;
+        }
+    }
+    for (const QString &screen : s_knownScreens)
+        m_structure[screen] = QJsonArray();
+}
+
+void TileManager::saveStructure() const
+{
+    if (!AtomicFile::writeJson(m_structurePath, QJsonDocument(m_structure))) {
+        // Критичная ошибка — данные не сохранятся. Уведомляем пользователя.
+        notify(NotificationLevel::Error,
+               "Ошибка: не удалось сохранить структуру плиток");
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Рекурсивные хелперы дерева
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool TileManager::findNodeChildren(const QJsonArray &arr, const QString &id, QJsonArray &out)
+{
+    for (const QJsonValue &v : arr) {
+        const QJsonObject obj = v.toObject();
+        if (obj["id"].toString() == id) { out = obj["children"].toArray(); return true; }
+        if (obj["type"].toString() == "folder")
+            if (findNodeChildren(obj["children"].toArray(), id, out)) return true;
+    }
+    return false;
+}
+
+bool TileManager::setNodeChildren(QJsonArray &arr, const QString &id, const QVariantList &tiles)
+{
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject obj = arr[i].toObject();
+        if (obj["id"].toString() == id) {
+            obj["children"] = mergeChildren(obj["children"].toArray(), tiles);
+            arr[i] = obj; return true;
+        }
+        if (obj["type"].toString() == "folder") {
+            QJsonArray children = obj["children"].toArray();
+            if (setNodeChildren(children, id, tiles)) {
+                obj["children"] = children; arr[i] = obj; return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool TileManager::removeNodeById(QJsonArray &arr, const QString &id)
+{
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject obj = arr[i].toObject();
+        if (obj["id"].toString() == id) { arr.removeAt(i); return true; }
+        if (obj["type"].toString() == "folder") {
+            QJsonArray children = obj["children"].toArray();
+            if (removeNodeById(children, id)) {
+                obj["children"] = children; arr[i] = obj; return true;
+            }
+        }
+    }
+    return false;
+}
+
+QJsonArray TileManager::mergeChildren(const QJsonArray &existing, const QVariantList &tiles)
+{
+    QMap<QString, QJsonObject> existingById;
+    for (const QJsonValue &v : existing) {
+        const QJsonObject obj = v.toObject();
+        const QString eid = obj["id"].toString();
+        if (!eid.isEmpty()) existingById[eid] = obj;
+    }
+    QJsonArray result;
+    for (const QVariant &v : tiles) {
+        QJsonObject obj = QJsonObject::fromVariantMap(v.toMap());
+        if (obj["type"].toString() == "folder") {
+            const QString eid = obj["id"].toString();
+            if (existingById.contains(eid) && existingById[eid].contains("children"))
+                obj["children"] = existingById[eid]["children"];
+            else if (!obj.contains("children"))
+                obj["children"] = QJsonArray();
+        }
+        result.append(obj);
+    }
+    return result;
+}
+
+QVariantList TileManager::stripChildren(const QJsonArray &arr)
+{
+    QVariantList result;
+    result.reserve(arr.size());
+    for (const QJsonValue &v : arr) {
+        QJsonObject obj = v.toObject();
+        obj.remove("children");
+
+        // ── Обложка игры (Фаза 1) ──────────────────────────────────────────────
+        if (!obj["installFolder"].toString().isEmpty()) {
+            const QString infoPath = QDir::fromNativeSeparators(obj["installFolder"].toString())
+            + "/game_info.json";
+            QFile f(infoPath);
+            if (f.open(QIODevice::ReadOnly)) {
+                const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+                f.close();
+                if (doc.isObject()) {
+                    const QString coverPath = doc.object()["coverPath"].toString();
+                    if (!coverPath.isEmpty())
+                        obj["coverPath"] = coverPath;
+                }
+            }
+        }
+
+        result.append(obj.toVariantMap());
+    }
+    return result;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Публичный API — загрузка / сохранение плиток
+// ═════════════════════════════════════════════════════════════════════════════
+
+QVariantList TileManager::loadScreen(const QString &screen)
+{
+    return stripChildren(m_structure[screen].toArray());
+}
+
+void TileManager::saveScreen(const QString &screen, const QVariantList &tiles)
+{
+    m_structure[screen] = mergeChildren(m_structure[screen].toArray(), tiles);
+    saveStructure();
+}
+
+QVariantList TileManager::loadFolder(const QString &folderId)
+{
+    for (const QString &screen : s_knownScreens) {
+        QJsonArray children;
+        if (findNodeChildren(m_structure[screen].toArray(), folderId, children))
+            return stripChildren(children);
+    }
+    return {};
+}
+
+void TileManager::saveFolder(const QString &folderId, const QVariantList &tiles)
+{
+    for (const QString &screen : s_knownScreens) {
+        QJsonArray arr = m_structure[screen].toArray();
+        if (setNodeChildren(arr, folderId, tiles)) {
+            m_structure[screen] = arr;
+            saveStructure();
+            return;
+        }
+    }
+    qWarning() << "TileManager::saveFolder: folder not found:" << folderId;
+}
+
+void TileManager::deleteFolder(const QString &folderId)
+{
+    bool changed = false;
+    for (const QString &screen : s_knownScreens) {
+        QJsonArray arr = m_structure[screen].toArray();
+        if (removeNodeById(arr, folderId)) { m_structure[screen] = arr; changed = true; }
+    }
+    if (changed) saveStructure();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Список экранов и папок
+// ═════════════════════════════════════════════════════════════════════════════
+
+QVariantList TileManager::listScreens() const
+{
+    QVariantList result;
+    for (const QString &key : s_knownScreens) {
+        QString title = key; title[0] = title[0].toUpper();
+        result.append(QVariantMap{ {"storageKey", key}, {"isFolder", false}, {"title", title} });
+    }
+    return result;
+}
+
+QVariantList TileManager::listFolderTiles(const QString &storageKey, bool isFolder) const
+{
+    QJsonArray arr;
+    if (!isFolder) {
+        arr = m_structure[storageKey].toArray();
+    } else {
+        for (const QString &screen : s_knownScreens) {
+            QJsonArray children;
+            if (findNodeChildren(m_structure[screen].toArray(), storageKey, children))
+            { arr = children; break; }
+        }
+    }
+    QVariantList result;
+    for (const QJsonValue &v : std::as_const(arr)) {
+        QJsonObject obj = v.toObject();
+        if (obj["type"].toString() == "folder") {
+            obj.remove("children");
+            result.append(obj.toVariantMap());
+        }
+    }
+    return result;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// countTilesById
+// ═════════════════════════════════════════════════════════════════════════════
+
+int TileManager::countTilesByIdInArray(const QJsonArray &arr, const QString &tileId)
+{
+    int count = 0;
+    for (const QJsonValue &v : arr) {
+        const QJsonObject obj = v.toObject();
+        if (obj["id"].toString() == tileId) ++count;
+        if (obj["type"].toString() == "folder")
+            count += countTilesByIdInArray(obj["children"].toArray(), tileId);
+    }
+    return count;
+}
+
+int TileManager::countTilesById(const QString &tileId) const
+{
+    if (tileId.isEmpty()) return 0;
+    int total = 0;
+    for (const QString &screen : s_knownScreens)
+        total += countTilesByIdInArray(m_structure[screen].toArray(), tileId);
+    return total;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Файловая система
+// ═════════════════════════════════════════════════════════════════════════════
+
+QVariantList TileManager::listDrives()
+{
+    QVariantList result;
+    const QList<QStorageInfo> volumes = QStorageInfo::mountedVolumes();
+    for (const QStorageInfo &vol : volumes) {
+        if (!vol.isValid() || !vol.isReady()) continue;
+        QString rootPath = QDir::fromNativeSeparators(vol.rootPath());
+        if (!rootPath.endsWith('/')) rootPath += '/';
+        QString label = vol.displayName().trimmed();
+#ifdef Q_OS_WIN
+        const QString drive = (rootPath.length() >= 2 && rootPath[1] == ':')
+                                  ? rootPath.left(2).toUpper() : QString();
+        QString displayName;
+        if (drive.isEmpty()) {
+            displayName = label.isEmpty() ? rootPath : label + " (" + rootPath + ")";
+        } else {
+            displayName = (label.isEmpty() || label.compare(drive, Qt::CaseInsensitive) == 0)
+            ? drive : label + " (" + drive + ")";
+        }
+#else
+        const QString displayName = label.isEmpty() ? rootPath : label + " (" + rootPath + ")";
+#endif
+        result.append(QVariantMap{ {"name", displayName}, {"path", rootPath}, {"isDir", true} });
+    }
+    if (result.isEmpty())
+        result.append(QVariantMap{ {"name", "C:"}, {"path", "C:/"}, {"isDir", true} });
+    return result;
+}
+
+QVariantList TileManager::listDir(const QString &path, const QString &filterExts)
+{
+    QVariantList result;
+    const QDir dir(path);
+    if (!dir.exists()) return result;
+
+    auto toEntry = [](const QFileInfo &info, bool isDir) {
+        return QVariantMap{
+            {"name",  info.fileName()},
+            {"path",  QDir::fromNativeSeparators(info.absoluteFilePath())},
+            {"isDir", isDir}
+        };
+    };
+
+    const QFileInfoList dirs = dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
+                                                 QDir::Name | QDir::IgnoreCase);
+    for (const QFileInfo &info : dirs)
+        result.append(toEntry(info, true));
+
+    QStringList filters;
+    const QStringList exts = filterExts.split(',', Qt::SkipEmptyParts);
+    for (const QString &ext : exts)
+        filters << "*." + ext.trimmed() << "*." + ext.trimmed().toUpper();
+
+    const auto fileList = filters.isEmpty()
+                              ? dir.entryInfoList(QDir::Files, QDir::Name | QDir::IgnoreCase)
+                              : dir.entryInfoList(filters, QDir::Files, QDir::Name | QDir::IgnoreCase);
+
+    for (const QFileInfo &info : fileList)
+        result.append(toEntry(info, false));
+
+    return result;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// removeTileFromStructure
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TileManager::removeTileFromStructure(const QString &tileId)
+{
+    if (tileId.isEmpty()) return;
+    bool changed = false;
+    for (const QString &screen : s_knownScreens) {
+        QJsonArray arr = m_structure[screen].toArray();
+        if (removeNodeById(arr, tileId)) { m_structure[screen] = arr; changed = true; }
+    }
+    if (changed) saveStructure();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// readGameInfo — чтение game_info.json из папки установки
+// ═════════════════════════════════════════════════════════════════════════════
+
+QVariantMap TileManager::readGameInfo(const QString &installFolder) const
+{
+    if (installFolder.isEmpty())
+        return {};
+
+    const QString infoPath = QDir::fromNativeSeparators(installFolder) + "/game_info.json";
+    QFile f(infoPath);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject())
+        return {};
+
+    return doc.object().toVariantMap();
+}
