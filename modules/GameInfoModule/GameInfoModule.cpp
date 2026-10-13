@@ -16,6 +16,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDebug>
+#include <QDeadlineTimer>
 
 // ── вспомогательный макрос ────────────────────────────────────────────────────
 // Отправляет сообщение в LoggerModule через EventBus.
@@ -35,7 +36,9 @@ GameInfoModule::~GameInfoModule()
 
 void GameInfoModule::logMsg(const char *level, const QString &message)
 {
-    if (level == Logger::kLevelError || level == Logger::kLevelWarning)
+    // Сравниваем содержимое, а не указатели: литералы из заголовка в разных
+    // единицах трансляции могут иметь разные адреса
+    if (qstrcmp(level, Logger::kLevelError) == 0 || qstrcmp(level, Logger::kLevelWarning) == 0)
         qWarning() << "[GameInfoModule]" << message;
     else
         qDebug()   << "[GameInfoModule]" << message;
@@ -80,6 +83,14 @@ void GameInfoModule::shutdown()
         QMutexLocker locker(&m_candidateMutex);
         m_aborted = true;
         m_candidateCond.wakeAll();
+    }
+
+    // Прерываем генерацию и ДОЖИДАЕМСЯ фонового потока: раньше m_llama удалялся,
+    // пока doFetch ещё работал с ним (падение при выходе во время генерации).
+    if (m_llama) m_llama->requestAbort();
+    if (m_fetchFuture.isRunning()) {
+        GIM_LOG(Logger::kLevelInfo, "shutdown(): waiting for fetch thread");
+        m_fetchFuture.waitForFinished();
     }
 
     if (m_llama) {
@@ -135,7 +146,13 @@ void GameInfoModule::onFetchRequested(const QVariantMap &data)
     m_fetching = true;
     emit fetchingChanged();
 
-    QtConcurrent::run([this, tileId, title, installFolder]() {
+    {
+        QMutexLocker locker(&m_candidateMutex);
+        m_pendingTileId = tileId;   // fieldsReady и т.п. адресуются этой плитке
+        m_selectedAppId.clear();
+    }
+
+    m_fetchFuture = QtConcurrent::run([this, tileId, title, installFolder]() {
         doFetch(tileId, title, installFolder);
     });
 }
@@ -209,9 +226,17 @@ void GameInfoModule::doFetch(const QString &tileId,
                 }, Qt::QueuedConnection);
 
                 {
+                    // Не ждём вечно: если пользователь ушёл со страницы игры, раньше
+                    // поток висел навсегда и все следующие запросы отклонялись
+                    // («already fetching»). Через 5 минут — как «Пропустить».
                     QMutexLocker locker(&m_candidateMutex);
-                    while (m_selectedAppId.isEmpty() && m_pendingTileId == tileId && !m_aborted)
-                        m_candidateCond.wait(&m_candidateMutex);
+                    QDeadlineTimer deadline(5 * 60 * 1000);
+                    while (m_selectedAppId.isEmpty() && m_pendingTileId == tileId && !m_aborted) {
+                        if (!m_candidateCond.wait(&m_candidateMutex, deadline)) {
+                            m_selectedAppId = QStringLiteral("__skip__");
+                            break;
+                        }
+                    }
                     if (m_aborted) {
                         GIM_LOG(Logger::kLevelInfo, "doFetch: aborted while waiting for candidate selection");
                         return;
@@ -317,6 +342,11 @@ void GameInfoModule::doFetch(const QString &tileId,
     };
 
     const QVariantMap meta = generateGameInfo(title, sourceText, onToken, onJsonToken);
+
+    {
+        QMutexLocker locker(&m_candidateMutex);
+        if (m_aborted) return;   // приложение закрывается
+    }
 
     if (meta.isEmpty()) {
         GIM_LOG(Logger::kLevelError,
@@ -506,8 +536,13 @@ QVariantMap GameInfoModule::generateGameInfo(const QString &title, const QString
         for (const QString &key : shortFields)
             if (result.contains(key)) fields[key] = result[key];
 
-        QMetaObject::invokeMethod(this, [this, fields]() {
-            emit fieldsReady(m_pendingTileId, fields);
+        QString tileId;
+        {
+            QMutexLocker locker(&m_candidateMutex);
+            tileId = m_pendingTileId;
+        }
+        QMetaObject::invokeMethod(this, [this, tileId, fields]() {
+            emit fieldsReady(tileId, fields);
         }, Qt::QueuedConnection);
     }
 

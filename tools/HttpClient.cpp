@@ -47,8 +47,24 @@ QByteArray get(const QString &url, int timeoutMs, const std::atomic<bool> *cance
         loop.quit();
     });
 
+    // Флаг отмены проверяем и ВО ВРЕМЯ запроса — раньше отмена срабатывала
+    // только по окончании (до 30 с ожидания при загрузке трейлера/обложек).
+    QTimer cancelPoll;
+    if (cancelled) {
+        QObject::connect(&cancelPoll, &QTimer::timeout, &loop, [&]() {
+            if (cancelled->load()) {
+                reply->abort();
+                loop.quit();
+            }
+        });
+        cancelPoll.start(100);
+    }
+
     timer.start(timeoutMs);
-    loop.exec();
+    if (!reply->isFinished())
+        loop.exec();
+    cancelPoll.stop();
+    timer.stop();
 
     // Проверяем флаг отмены после получения ответа
     if (cancelled && cancelled->load()) {

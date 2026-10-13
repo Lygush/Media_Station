@@ -33,7 +33,7 @@ Item {
         { part: 3, start: 3000, count: 185, pause: 0  }
     ]
     readonly property var _fSeg:
-        ({ part: 4, start: 4000, count: 101, pause: 0 })
+        ({ part: 4, start: 4000, count: 102, pause: 0 })
 
     // ── Состояние ────────────────────────────────────────────────────────────
     // _phase: "idle" | "logo" | "wait" | "finishing" | "finished"

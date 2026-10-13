@@ -13,27 +13,21 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QHash>
+#include <QSet>
 
 #ifdef Q_OS_WIN
 #include <dwmapi.h>
-#pragma comment(lib, "dwmapi.lib")
 #endif
 
 AndroidTVModule::AndroidTVModule(QObject *parent)
     : QObject(parent)
-    , m_switching(false)
-    , m_exitRequested(false)
-    , m_overlayCooldown(false)
-    , m_emulatorShown(false)
-    , m_overlayCooldownTimer(nullptr)
 {}
 
 AndroidTVModule::~AndroidTVModule()
 {
-    // Деструктор только вызывает shutdown() — вся логика там.
-    // Это важно: ModuleHost вызывает shutdown() до удаления объекта,
-    // поэтому здесь уже всё должно быть завершено.
-    // Флаг m_shutdownDone в shutdown() защищает от двойного выполнения.
+    // ModuleHost вызывает shutdown() до удаления объекта; флаг m_shutdownDone
+    // защищает от повторного выполнения.
     shutdown();
 }
 
@@ -42,15 +36,22 @@ void AndroidTVModule::setMediaStationOpacity(int alpha)
 {
 #ifdef Q_OS_WIN
     if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd)) {
-        qWarning() << "[AndroidTV] setMediaStationOpacity: invalid HWND, trying to find again";
         m_mediaStationHwnd = findMediaStationWindow();
         if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd)) {
-            qWarning() << "[AndroidTV] setMediaStationOpacity: still invalid HWND, abort";
+            qWarning() << "[AndroidTV] setMediaStationOpacity: MediaStation window not found";
             return;
         }
     }
-    SetLayeredWindowAttributes(m_mediaStationHwnd, 0, alpha, LWA_ALPHA);
-    logToEmulatorFile(QString("MediaStation opacity set to %1").arg(alpha));
+    // Окно должно быть WS_EX_LAYERED, иначе SetLayeredWindowAttributes ничего не делает.
+    const LONG_PTR ex = GetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE);
+    if (!(ex & WS_EX_LAYERED))
+        SetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+
+    if (!SetLayeredWindowAttributes(m_mediaStationHwnd, 0, static_cast<BYTE>(alpha), LWA_ALPHA))
+        logToEmulatorFile(QString("WARNING: SetLayeredWindowAttributes(%1) failed, error=%2")
+                              .arg(alpha).arg(GetLastError()));
+    else
+        logToEmulatorFile(QString("MediaStation opacity set to %1").arg(alpha));
 #else
     Q_UNUSED(alpha)
 #endif
@@ -61,19 +62,17 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
     m_bus      = bus;
     m_settings = settings;
     m_appDir   = QCoreApplication::applicationDirPath();
+    m_avdHome  = resolveAvdHome();
 
     openEmulatorLogFile();
     logImportant(Logger::kLevelInfo, "initialized, appDir = " + m_appDir);
+    logToEmulatorFile("AVD home: " + m_avdHome);
 
     // Profile manager
     m_profileManager = new AndroidTVProfileManager(this);
+    m_profileManager->setAvdHome(m_avdHome);
     m_profileManager->load(m_appDir);
     logImportant(Logger::kLevelInfo, QString("Profiles loaded, active: %1").arg(m_profileManager->activeProfileId()));
-
-#ifdef Q_OS_WIN
-    m_mediaStationHwnd = findMediaStationWindow();
-    forceMediaStationTopmost();
-#endif
 
     // Клавиши пульта (обработчик handleRemoteKey находится в AndroidTVInput.cpp)
     connect(bus, &EventBus::moduleEvent, this,
@@ -83,7 +82,7 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
                     handleRemoteKey(data.value(QStringLiteral("key")).toString());
             });
 
-    // Обработка открытия/закрытия оверлея с cooldown и управлением прозрачностью
+    // Открытие/закрытие оверлея: cooldown и прозрачность MediaStation
     connect(bus, &EventBus::moduleEvent, this,
             [this](const QString &mod, const QString &ev, const QVariantMap &data) {
                 if (mod != QLatin1String(Overlay::kModule) ||
@@ -93,6 +92,13 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
                 const bool visible = data.value(QStringLiteral("visible"), false).toBool();
                 m_overlayOpen = visible;
 
+                // Прозрачностью управляем только когда эмулятор реально показан.
+                // Оверлей в контексте игры MediaStation не касается.
+                if (!m_emulatorShown) {
+                    m_overlayCooldown = false;
+                    return;
+                }
+
                 if (visible) {
                     if (m_overlayCooldownTimer) {
                         m_overlayCooldownTimer->stop();
@@ -101,42 +107,56 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
                     }
                     m_overlayCooldown = false;
                     setMediaStationOpacity(128);
-                    logToEmulatorFile("[Overlay] MediaStation set to semi-transparent (alpha=128)");
-                } else {
-                    m_overlayCooldown = true;
-                    if (!m_overlayCooldownTimer) {
-                        m_overlayCooldownTimer = new QTimer(this);
-                        m_overlayCooldownTimer->setSingleShot(true);
-                        m_overlayCooldownTimer->setInterval(kOverlayCooldownMs);
-                        connect(m_overlayCooldownTimer, &QTimer::timeout, this, [this]() {
-                            m_overlayCooldown = false;
+                    logToEmulatorFile("[Overlay] MediaStation semi-transparent (alpha=128)");
+                    return;
+                }
+
+                m_overlayCooldown = true;
+                if (!m_overlayCooldownTimer) {
+                    m_overlayCooldownTimer = new QTimer(this);
+                    m_overlayCooldownTimer->setSingleShot(true);
+                    m_overlayCooldownTimer->setInterval(kOverlayCooldownMs);
+                    connect(m_overlayCooldownTimer, &QTimer::timeout, this, [this]() {
+                        m_overlayCooldown = false;
+                        if (m_overlayCooldownTimer) {
                             m_overlayCooldownTimer->deleteLater();
                             m_overlayCooldownTimer = nullptr;
-                            logToEmulatorFile("[Overlay] Cooldown ended, keys allowed to emulator");
-                        });
-                        m_overlayCooldownTimer->start();
-                    }
-                    logToEmulatorFile("[Overlay] Overlay closed, cooldown started");
+                        }
+                        logToEmulatorFile("[Overlay] Cooldown ended, keys allowed to emulator");
+                    });
+                    m_overlayCooldownTimer->start();
+                }
 
-                    if (m_running && !m_exitRequested) {
-                        setMediaStationOpacity(0);
-                        logToEmulatorFile("[Overlay] MediaStation set to transparent (emulator active)");
-                    } else if (m_exitRequested) {
-                        logToEmulatorFile("[Overlay] Exit requested, skip opacity change");
-                        m_exitRequested = false;
-                    } else {
-                        setMediaStationOpacity(255);
-                        logToEmulatorFile("[Overlay] MediaStation set to opaque (emulator inactive)");
-                    }
+                if (m_exitRequested) {
+                    logToEmulatorFile("[Overlay] Exit requested, skip opacity change");
+                } else if (m_running) {
+                    setMediaStationOpacity(0);
+                    logToEmulatorFile("[Overlay] MediaStation transparent (emulator active)");
+                } else {
+                    setMediaStationOpacity(255);
                 }
             });
 
-    // Запрос остановки эмулятора
+    // Запрос остановки эмулятора (из оверлея)
     connect(bus, &EventBus::moduleEvent, this,
             [this](const QString &mod, const QString &ev, const QVariantMap &) {
                 if (mod == QLatin1String("androidtv") && ev == QLatin1String("stopRequested")) {
                     m_exitRequested = true;
                     stop();
+                }
+            });
+
+    // Игра, запущенная при работающем (скрытом) эмуляторе, не должна оказаться
+    // под TOPMOST-окном MediaStation.
+    connect(bus, &EventBus::moduleEvent, this,
+            [this](const QString &mod, const QString &ev, const QVariantMap &) {
+                if (mod != QLatin1String("game") || !(m_running || m_booting)) return;
+                if (ev == QLatin1String("launching") || ev == QLatin1String("appeared")) {
+                    stopKeepTopmostTimer();
+                    releaseMediaStationTopmost();
+                    logToEmulatorFile("[Game] game started — MediaStation TOPMOST released");
+                } else if ((ev == QLatin1String("closed") || ev == QLatin1String("failed")) && !m_emulatorShown) {
+                    forceMediaStationTopmost();
                 }
             });
 
@@ -154,11 +174,10 @@ void AndroidTVModule::registerWithQml(QQmlApplicationEngine *engine)
 
 void AndroidTVModule::shutdown()
 {
-    // Защита от двойного вызова (деструктор + ModuleHost::shutdownAll)
     if (m_shutdownDone) return;
     m_shutdownDone = true;
 
-    // 1. Останавливаем таймеры — они могут запускать новые операции
+    // 1. Таймеры — они могут запускать новые операции
     stopKeepTopmostTimer();
     stopBootPolling();
     stopWindowPolling();
@@ -172,39 +191,48 @@ void AndroidTVModule::shutdown()
         m_overlayCooldownTimer = nullptr;
     }
 
-    // 2. Убиваем эмулятор — синхронно, но быстро (TerminateProcess)
+    // 2. Вспомогательные процессы adb
+    stopKeyShell();
+    stopLogcat();
+
+    // 3. Эмулятор — синхронно, но быстро (TerminateProcess по всему дереву).
+    //    Обработчики отключаем: после shutdown() они не должны трогать UI/шину.
+    if (m_emulatorProcess)
+        m_emulatorProcess->disconnect(this);
     killEmulatorTree();
 
-    // 3. Останавливаем DNS-прокси
+    // 4. DNS-прокси
     stopDnsProxy();
 
-    // 4. adb kill-server — запускаем без ожидания завершения.
-    // kill-server завершает adb daemon, это нужно чтобы не оставлять
-    // зависший процесс. startDetached не блокирует GUI.
-    if (QFile::exists(adbPath())) {
+    // 5. adb kill-server — без ожидания (startDetached не блокирует GUI)
+    if (QFile::exists(adbPath()))
         QProcess::startDetached(adbPath(), {"kill-server"});
-    }
 
-    // 5. Удаляем объект процесса эмулятора (процесс уже убит в killEmulatorTree)
     delete m_emulatorProcess;
     m_emulatorProcess = nullptr;
 
-    // 6. Чистим локи AVD и лог-файл
+#ifdef Q_OS_WIN
+    if (m_timerResolutionSet) {
+        timeEndPeriod(1);
+        m_timerResolutionSet = false;
+    }
+#endif
+
+    // 6. Локи AVD и лог-файл
     cleanupAvdLocks();
     closeEmulatorLogFile();
 
     // 7. Восстанавливаем окно MediaStation
 #ifdef Q_OS_WIN
     if (m_mediaStationHwnd && IsWindow(m_mediaStationHwnd)) {
-        setMediaStationOpacity(255);
+        SetLayeredWindowAttributes(m_mediaStationHwnd, 0, 255, LWA_ALPHA);
         SetWindowPos(m_mediaStationHwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        ShowWindow(m_mediaStationHwnd, SW_SHOW);
         m_mediaStationHwnd = nullptr;
     }
 #endif
 
-    // 8. Обнуляем шину — никаких новых событий после этой точки
+    // 8. Никаких событий на шину после этой точки
     m_bus = nullptr;
 }
 
@@ -220,6 +248,7 @@ void AndroidTVModule::setBooting(bool v)
     if (m_booting == v) return;
     m_booting = v;
     emit bootingChanged();
+    updateProfileLock();
 }
 
 void AndroidTVModule::setRunning(bool v)
@@ -227,6 +256,7 @@ void AndroidTVModule::setRunning(bool v)
     if (m_running == v) return;
     m_running = v;
     emit runningChanged();
+    updateProfileLock();
 }
 
 void AndroidTVModule::setSwitching(bool v)
@@ -236,33 +266,71 @@ void AndroidTVModule::setSwitching(bool v)
     emit switchingChanged();
 }
 
+void AndroidTVModule::setEmulatorShown(bool shown)
+{
+    if (m_emulatorShown == shown) return;
+    m_emulatorShown = shown;
+    emit activeChanged();
+}
+
+void AndroidTVModule::updateProfileLock()
+{
+    if (m_profileManager)
+        m_profileManager->setLocked(m_booting || m_running);
+}
+
 #ifdef Q_OS_WIN
 void AndroidTVModule::killEmulatorTree()
 {
-    if (!m_emulatorPid) return;
+    const DWORD roots[] = { static_cast<DWORD>(m_initialEmulatorPid),
+                            static_cast<DWORD>(m_emulatorPid) };
 
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        QHash<DWORD, DWORD>   parentOf;   // pid → ppid
+        QHash<DWORD, QString> nameOf;
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnapshot, &pe)) {
+            do {
+                parentOf.insert(pe.th32ProcessID, pe.th32ParentProcessID);
+                nameOf.insert(pe.th32ProcessID, QString::fromWCharArray(pe.szExeFile));
+            } while (Process32NextW(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
 
-    PROCESSENTRY32 pe;
-    pe.dwSize = sizeof(PROCESSENTRY32);
-
-    if (Process32First(hSnapshot, &pe)) {
-        do {
-            if (pe.th32ParentProcessID == static_cast<DWORD>(m_emulatorPid) ||
-                pe.th32ProcessID == static_cast<DWORD>(m_emulatorPid)) {
-                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                if (hProc) {
-                    TerminateProcess(hProc, 1);
-                    CloseHandle(hProc);
-                    logToEmulatorFile(QString("Terminated process %1 (%2)").arg(pe.th32ProcessID).arg(pe.szExeFile));
+        // Всё дерево: emulator.exe → qemu-system-*.exe → crashpad_handler и т.д.
+        QList<DWORD> order;
+        QSet<DWORD>  seen;
+        for (DWORD r : roots) {
+            if (r && parentOf.contains(r) && !seen.contains(r)) {
+                seen.insert(r);
+                order.append(r);
+            }
+        }
+        for (int i = 0; i < order.size(); ++i) {
+            const DWORD parent = order.at(i);
+            for (auto it = parentOf.constBegin(); it != parentOf.constEnd(); ++it) {
+                if (it.value() == parent && it.key() != parent && !seen.contains(it.key())) {
+                    seen.insert(it.key());
+                    order.append(it.key());
                 }
             }
-        } while (Process32Next(hSnapshot, &pe));
-    }
-    CloseHandle(hSnapshot);
+        }
 
-    if (m_emulatorProcess && m_emulatorProcess->state() == QProcess::Running) {
+        // Снизу вверх: сначала самые глубокие потомки
+        for (int i = order.size() - 1; i >= 0; --i) {
+            const DWORD pid = order.at(i);
+            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            if (hProc) {
+                TerminateProcess(hProc, 1);
+                CloseHandle(hProc);
+                logToEmulatorFile(QString("Terminated process %1 (%2)").arg(pid).arg(nameOf.value(pid)));
+            }
+        }
+    }
+
+    if (m_emulatorProcess && m_emulatorProcess->state() != QProcess::NotRunning) {
         m_emulatorProcess->kill();
         m_emulatorProcess->waitForFinished(2000);
     }
@@ -270,29 +338,33 @@ void AndroidTVModule::killEmulatorTree()
 #else
 void AndroidTVModule::killEmulatorTree()
 {
-    if (m_emulatorProcess && m_emulatorProcess->state() == QProcess::Running) {
+    if (m_emulatorProcess && m_emulatorProcess->state() != QProcess::NotRunning) {
         m_emulatorProcess->kill();
         m_emulatorProcess->waitForFinished(2000);
     }
 }
 #endif
 
-void AndroidTVModule::cleanupAvdLocks()
+void AndroidTVModule::removeAvdLocks(const QString &avdDirPath)
 {
-    QDir avdDir(avdHomePath());
-    QStringList avds = avdDir.entryList(QStringList() << "*.avd", QDir::Dirs);
-    for (const QString &avd : avds) {
-        QDir d(avdDir.filePath(avd));
-        QStringList locks = d.entryList({"*.lock"}, QDir::Files);
-        for (const QString &lock : locks) {
-            if (QFile::remove(d.absoluteFilePath(lock)))
-                logToEmulatorFile("Removed stale AVD lock: " + lock);
-        }
+    // Эмулятор создаёт *.lock. На Windows это ПАПКИ (внутри файл pid),
+    // на других ОС — файлы. Удаляем и то, и другое.
+    QDir d(avdDirPath);
+    if (!d.exists()) return;
+    const QFileInfoList locks = d.entryInfoList(
+        {"*.lock"}, QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
+    for (const QFileInfo &fi : locks) {
+        const bool ok = fi.isDir() ? QDir(fi.absoluteFilePath()).removeRecursively()
+                                   : QFile::remove(fi.absoluteFilePath());
+        logToEmulatorFile((ok ? "Removed stale AVD lock: " : "WARNING: could not remove AVD lock: ")
+                          + fi.fileName());
     }
 }
 
-void AndroidTVModule::cleanupAvdForProfile(const QString &avdName)
+void AndroidTVModule::cleanupAvdLocks()
 {
-    // Not needed; we just remove locks in cleanupAvdLocks()
-    Q_UNUSED(avdName);
+    QDir avdDir(avdHomePath());
+    const QStringList avds = avdDir.entryList(QStringList() << "*.avd", QDir::Dirs);
+    for (const QString &avd : avds)
+        removeAvdLocks(avdDir.filePath(avd));
 }

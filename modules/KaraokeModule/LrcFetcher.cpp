@@ -3,6 +3,7 @@
 
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QDebug>
@@ -60,13 +61,48 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
         return result;
     }
 
-    const QString url = buildUrl(artist, title, album, durationSec);
-    qDebug() << "[LrcFetcher] GET" << url;
+    // /api/get требует ВСЕ поля (артист, трек, альбом, длительность). Без TagLib
+    // альбома и длительности нет → lrclib отвечает 400 и текст никогда не
+    // находился. В этом случае сразу используем /api/search.
+    QByteArray raw;
+    if (!album.trimmed().isEmpty() && durationSec > 0) {
+        const QString url = buildUrl(artist, title, album, durationSec);
+        qDebug() << "[LrcFetcher] GET" << url;
+        raw = HttpClient::get(url, HttpClient::kTimeoutDefault, cancelled);
+        if (cancelled && cancelled->load())
+            return result;
+    }
 
-    const QByteArray raw = HttpClient::get(url, HttpClient::kTimeoutDefault, cancelled);
+    if (raw.isEmpty()) {
+        QUrlQuery q;
+        q.addQueryItem("artist_name", cleanTag(artist));
+        q.addQueryItem("track_name",  cleanTag(title));
+        QUrl url("https://lrclib.net/api/search");
+        url.setQuery(q);
+        qDebug() << "[LrcFetcher] SEARCH" << url.toString();
+        const QByteArray found = HttpClient::get(url.toString(), HttpClient::kTimeoutDefault, cancelled);
+        if (cancelled && cancelled->load())
+            return result;
 
-    if (cancelled && cancelled->load())
-        return result;
+        const QJsonArray arr = QJsonDocument::fromJson(found).array();
+        QJsonObject best;
+        for (const QJsonValue &v : arr) {
+            const QJsonObject o = v.toObject();
+            // Предпочитаем синхронизированный текст; при известной длительности —
+            // ближайший по ней вариант
+            const bool synced = !o.value("syncedLyrics").toString().trimmed().isEmpty();
+            const bool bestSynced = !best.value("syncedLyrics").toString().trimmed().isEmpty();
+            if (best.isEmpty() || (synced && !bestSynced)) { best = o; continue; }
+            if (synced == bestSynced && durationSec > 0
+                && qAbs(o.value("duration").toDouble() - durationSec)
+                   < qAbs(best.value("duration").toDouble() - durationSec))
+                best = o;
+        }
+        if (!best.isEmpty())
+            raw = QJsonDocument(best).toJson(QJsonDocument::Compact);
+        else if (!found.isEmpty())
+            return result;   // сеть есть, но трек не найден
+    }
 
     if (raw.isEmpty()) {
         // HttpClient логирует детали — здесь просто отмечаем сетевую ошибку

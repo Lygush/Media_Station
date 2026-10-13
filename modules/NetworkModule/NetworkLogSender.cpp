@@ -12,6 +12,7 @@
 #include <QTimer>
 #include <QUuid>
 #include <QThreadPool>
+#include <QPointer>
 
 // ─── Конструктор / деструктор ───────────────────────────────────────────────
 NetworkLogSender::NetworkLogSender(QObject *parent)
@@ -40,6 +41,13 @@ void NetworkLogSender::shutdown()
 void NetworkLogSender::discoverServers()
 {
     if (m_busy) return;
+    // Повторный поиск во время текущего — перезапускаем, а не плодим таймеры/обработчики
+    if (m_discoverTimer) {
+        m_discoverTimer->stop();
+        m_discoverTimer->deleteLater();
+        m_discoverTimer = nullptr;
+    }
+    if (m_discoverConn) disconnect(m_discoverConn);
     m_foundServers.clear();
     emit foundServersChanged();
     setStatus("Поиск серверов...");
@@ -64,8 +72,9 @@ void NetworkLogSender::discoverServers()
     }
 
     QTimer *timer = new QTimer(this);
+    m_discoverTimer = timer;
     timer->setSingleShot(true);
-    auto readConn = connect(m_udpSocket, &QUdpSocket::readyRead, this, [this]() {
+    m_discoverConn = connect(m_udpSocket, &QUdpSocket::readyRead, this, [this]() {
         while (m_udpSocket->hasPendingDatagrams()) {
             QByteArray reply(static_cast<int>(m_udpSocket->pendingDatagramSize()), 0);
             QHostAddress sender;
@@ -79,8 +88,9 @@ void NetworkLogSender::discoverServers()
             }
         }
     });
-    connect(timer, &QTimer::timeout, this, [this, timer, readConn]() {
-        disconnect(readConn);
+    connect(timer, &QTimer::timeout, this, [this, timer]() {
+        disconnect(m_discoverConn);
+        if (m_discoverTimer == timer) m_discoverTimer = nullptr;
         timer->deleteLater();
         setStatus(m_foundServers.isEmpty()
                       ? "Серверы не найдены"
@@ -195,22 +205,30 @@ void NetworkLogSender::startPacking()
     // SevenZip::compress — блокирующий, запускаем в пуле потоков.
     // Прогресс и завершение передаём обратно в GUI-поток через invokeMethod.
     const QString archivePath = m_archivePath;
-    QThreadPool::globalInstance()->start([this, sourceDir, archivePath]() {
+    // Отмена и закрытие приложения во время упаковки: раньше поток продолжал
+    // писать архив и обращался к уже удалённому объекту.
+    m_packCancel = std::make_shared<std::atomic<bool>>(false);
+    const auto cancelFlag = m_packCancel;
+    const QPointer<NetworkLogSender> self(this);
+    QThreadPool::globalInstance()->start([self, sourceDir, archivePath, cancelFlag]() {
 
         const SevenZip::Result r = SevenZip::compress(
             sourceDir,
             QStringLiteral("*"),    // архивируем всё в sourceDir
             archivePath,
-            nullptr,                // NetworkLogSender не поддерживает отмену архивации
-            [this](int pct, const QString &) {
+            cancelFlag.get(),
+            [self](int pct, const QString &) {
+                if (!self) return;
                 // Прогресс архивации занимает 0–40% общего прогресса
-                QMetaObject::invokeMethod(this, [this, pct]() {
-                    setProgress(pct * 40 / 100);
+                QMetaObject::invokeMethod(self.data(), [self, pct]() {
+                    if (self) self->setProgress(pct * 40 / 100);
                 }, Qt::QueuedConnection);
             });
 
-        QMetaObject::invokeMethod(this, [this, r, archivePath]() {
-            onPackFinishedInternal(r, archivePath);
+        if (cancelFlag->load()) { QFile::remove(archivePath); return; }
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, r, archivePath]() {
+            if (self) self->onPackFinishedInternal(r, archivePath);
         }, Qt::QueuedConnection);
     });
 }
@@ -361,6 +379,7 @@ void NetworkLogSender::sendChunk()
     m_socket->write(chunk);
 }
 
+
 void NetworkLogSender::onBytesWritten(qint64 bytes)
 {
     if (m_step != StepSending || !m_archiveFile) return;
@@ -381,8 +400,12 @@ void NetworkLogSender::onBytesWritten(qint64 bytes)
         m_lastBytes = m_bytesSent;
         m_lastMs    = elapsed;
     }
-    if (m_bytesSent < m_archiveSize)
-        sendChunk();
+    // Следующий кусок — только когда предыдущий почти ушёл в сеть. Раньше на
+    // каждый bytesWritten дочитывалось ещё 2 МБ, и весь архив оседал в памяти.
+    if (m_bytesSent < m_archiveSize) {
+        if (m_socket && m_socket->bytesToWrite() < kChunkSize)
+            sendChunk();
+    }
     else if (m_archiveFile) {
         m_archiveFile->close();
         m_archiveFile->deleteLater();
@@ -416,6 +439,11 @@ void NetworkLogSender::onSocketError(QAbstractSocket::SocketError)
 // ─── Вспомогательные ────────────────────────────────────────────────────────
 void NetworkLogSender::cleanup()
 {
+    if (m_packCancel) {
+        m_packCancel->store(true);
+        m_packCancel.reset();
+    }
+
     if (!m_tmpLogsDir.isEmpty()) {
         QDir tmp(m_tmpLogsDir);
         if (tmp.exists()) {

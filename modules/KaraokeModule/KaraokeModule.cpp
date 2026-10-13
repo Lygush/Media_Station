@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QtConcurrent/QtConcurrent>
 #include <QDebug>
+#include <QUrl>
 
 // Для чтения ID3-тегов используем TagLib — если недоступен,
 // fallback на имя файла. Подключается опционально через DEFINES += USE_TAGLIB.
@@ -74,8 +75,12 @@ void KaraokeModule::shutdown()
 
 // ── Q_INVOKABLE ───────────────────────────────────────────────────────────────
 
-void KaraokeModule::openSong(const QString &filePath)
+void KaraokeModule::openSong(const QString &filePathOrUrl)
 {
+    // QML может передать file:-URL (в т.ч. сетевой путь) — приводим к локальному пути
+    const QString filePath = filePathOrUrl.startsWith(QLatin1String("file:"))
+                                 ? QUrl(filePathOrUrl).toLocalFile()
+                                 : filePathOrUrl;
     if (m_processing) {
         qWarning() << "[KaraokeModule] уже идёт обработка, игнорируем:" << filePath;
         return;
@@ -182,6 +187,11 @@ void KaraokeModule::onWorkerFinished()
 
     if (m_cancelled.load()) {
         qDebug() << "[KaraokeModule] обработка отменена";
+        // Раньше при отмене не отправлялось ничего — экран караоке навсегда
+        // оставался в состоянии «обработка» с прогресс-баром.
+        emit error(QStringLiteral("Обработка отменена"));
+        if (m_bus)
+            emit m_bus->moduleEvent("karaoke", "cancelled", {{"songPath", m_currentSongPath}});
         return;
     }
 

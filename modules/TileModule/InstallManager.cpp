@@ -27,6 +27,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QPointer>
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Конструктор / деструктор
@@ -137,8 +138,17 @@ void InstallManager::cancelAllInstallations()
 {
     for (auto &task : m_installTasks)
         if (task.cancelFlag) task.cancelFlag->store(true);
-    for (auto &task : m_installTasks)
-        if (task.watcher && task.watcher->isRunning()) task.watcher->waitForFinished();
+    for (auto &task : m_installTasks) {
+        if (task.watcher) {
+            if (task.watcher->isRunning()) task.watcher->waitForFinished();
+            // Обработчик finished уже не найдёт задачу — отключаем его и убираем
+            // недокопированную папку здесь (раньше при выходе она оставалась).
+            task.watcher->disconnect(this);
+            task.watcher->deleteLater();
+        }
+        if (task.gameRootPtr && !task.gameRootPtr->isEmpty())
+            QDir(*task.gameRootPtr).removeRecursively();
+    }
     m_installTasks.clear();
 }
 
@@ -203,6 +213,9 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
             emit installationCancelled(tileId);
 
         } else if (!success) {
+            // Ошибка копирования — не оставляем полупустую папку игры
+            if (!gameRootPathPtr->isEmpty())
+                QDir(*gameRootPathPtr).removeRecursively();
             m_installTasks.remove(tileId);
 
             qWarning() << "[InstallManager] Installation failed:" << tileId;
@@ -239,8 +252,9 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
         watcher->deleteLater();
     });
 
+    const QPointer<InstallManager> self(this);
     QFuture<QVariantMap> future = QtConcurrent::run(
-        [this, tileId, title, sourceDirPath, exeRelativePath, iconPath,
+        [this, self, tileId, title, sourceDirPath, exeRelativePath, iconPath,
          gamesInstallDir, cancelFlag, gameRootPathPtr]() -> QVariantMap
     {
         const QString sourceDir = QDir::fromNativeSeparators(
@@ -321,7 +335,7 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
             if (percent != lastPercent) {
                 lastPercent = percent;
                 const qreal progress = qreal(copied) / totalFiles;
-                QMetaObject::invokeMethod(this, [this, tileId, progress]() {
+                if (self) QMetaObject::invokeMethod(self.data(), [this, tileId, progress]() {
                     if (m_installTasks.contains(tileId))
                         m_installTasks[tileId].progress = progress;
                     emit installationProgress(tileId, progress);
@@ -652,7 +666,8 @@ QString InstallManager::findInstallFolderByTileId(const QString &tileId,
 
 void InstallManager::scanExeFiles(const QString &requestId, const QString &dirPath)
 {
-    QFuture<void> scanFuture = QtConcurrent::run([this, requestId, dirPath]() {
+    const QPointer<InstallManager> self(this);
+    QFuture<void> scanFuture = QtConcurrent::run([this, self, requestId, dirPath]() {
         const QString rootDir = QDir::fromNativeSeparators(
             QDir(dirPath).absolutePath());
 
@@ -682,7 +697,7 @@ void InstallManager::scanExeFiles(const QString &requestId, const QString &dirPa
             result.append(entry);
         }
 
-        QMetaObject::invokeMethod(this, [this, requestId, result]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, requestId, result]() {
             emit exeScanReady(requestId, result);
         }, Qt::QueuedConnection);
     });
@@ -694,13 +709,17 @@ void InstallManager::scanExeFiles(const QString &requestId, const QString &dirPa
 
 void InstallManager::getExeDescription(const QString &requestId, const QString &exePath)
 {
-    QFuture<void> descFuture = QtConcurrent::run([this, requestId, exePath]() {
+    const QPointer<InstallManager> self(this);
+    QFuture<void> descFuture = QtConcurrent::run([this, self, requestId, exePath]() {
         QString description;
 #ifdef Q_OS_WIN
         const QString nativePath = QDir::toNativeSeparators(exePath);
         const QString safePath   = QString(nativePath).replace("'", "''");
+        // OutputEncoding=UTF8 — иначе PowerShell пишет в OEM-кодировке и
+        // кириллические названия приходили «кракозябрами».
         const QString script = QString(
-            "$v = (Get-Item '%1').VersionInfo; "
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "$v = (Get-Item -LiteralPath '%1').VersionInfo; "
             "if ($v.ProductName -and $v.ProductName.Trim() -ne '') { $v.ProductName.Trim() } "
             "elseif ($v.FileDescription -and $v.FileDescription.Trim() -ne '') { $v.FileDescription.Trim() } "
             "else { '' }"
@@ -713,7 +732,7 @@ void InstallManager::getExeDescription(const QString &requestId, const QString &
 #else
         Q_UNUSED(exePath)
 #endif
-        QMetaObject::invokeMethod(this, [this, requestId, description]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, requestId, description]() {
             emit exeDescriptionReady(requestId, description);
         }, Qt::QueuedConnection);
     });
@@ -733,7 +752,8 @@ void InstallManager::updateLaunchExe(const QString &tileId,
         return;
     }
 
-    QFuture<void> updateFuture = QtConcurrent::run([this, tileId, installFolder, newExeRelative]() {
+    const QPointer<InstallManager> self(this);
+    QFuture<void> updateFuture = QtConcurrent::run([this, self, tileId, installFolder, newExeRelative]() {
         const QString gameRoot = QDir::fromNativeSeparators(installFolder);
         const QString gameDir  = gameRoot + "/game";
 
@@ -743,7 +763,7 @@ void InstallManager::updateLaunchExe(const QString &tileId,
 
         if (!QFile::exists(exeAbs)) {
             qWarning() << "[InstallManager] updateLaunchExe: exe not found:" << exeAbs;
-            QMetaObject::invokeMethod(this, [this, tileId]() {
+            if (self) QMetaObject::invokeMethod(self.data(), [this, tileId]() {
                 log(Logger::kLevelWarning,
                     QString("updateLaunchExe: exe not found for %1").arg(tileId));
                 notify(NotificationLevel::Error,
@@ -783,7 +803,7 @@ void InstallManager::updateLaunchExe(const QString &tileId,
         const QString ps1Native = ok ? QDir::toNativeSeparators(ps1Path) : QString();
         const QString exeFinal  = ok ? exeRelNative : QString();
 
-        QMetaObject::invokeMethod(this, [this, tileId, ok, ps1Native, exeFinal]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, tileId, ok, ps1Native, exeFinal]() {
             if (ok) {
                 log(Logger::kLevelInfo,
                     QString("Launch exe updated: %1 → %2").arg(tileId, exeFinal));
@@ -812,7 +832,8 @@ void InstallManager::checkDependencies(const QString &requestId,
     qDebug() << "[InstallManager] checkDependencies requestId:" << requestId
              << "exe:" << QFileInfo(exePath).fileName();
 
-    QFuture<void> depFuture = QtConcurrent::run([this, requestId, exePath, toolPath]() {
+    const QPointer<InstallManager> self(this);
+    QFuture<void> depFuture = QtConcurrent::run([this, self, requestId, exePath, toolPath]() {
 
 #ifdef Q_OS_WIN
         // ── Определяем путь к анализатору ────────────────────────────────────
@@ -822,7 +843,7 @@ void InstallManager::checkDependencies(const QString &requestId,
 
         if (!QFile::exists(analyzerPath)) {
             qWarning() << "[InstallManager] PEDependencyAnalyzer not found:" << analyzerPath;
-            QMetaObject::invokeMethod(this, [this, requestId]() {
+            if (self) QMetaObject::invokeMethod(self.data(), [this, requestId]() {
                 emit dependencyCheckReady(requestId, {});
             }, Qt::QueuedConnection);
             return;
@@ -835,7 +856,7 @@ void InstallManager::checkDependencies(const QString &requestId,
         if (!process.waitForStarted(5000)) {
             qWarning() << "[InstallManager] Failed to start PEDependencyAnalyzer:"
                        << process.errorString();
-            QMetaObject::invokeMethod(this, [this, requestId]() {
+            if (self) QMetaObject::invokeMethod(self.data(), [this, requestId]() {
                 emit dependencyCheckReady(requestId, {});
             }, Qt::QueuedConnection);
             return;
@@ -844,7 +865,7 @@ void InstallManager::checkDependencies(const QString &requestId,
             qWarning() << "[InstallManager] PEDependencyAnalyzer timed out for"
                        << QFileInfo(exePath).fileName();
             process.kill();
-            QMetaObject::invokeMethod(this, [this, requestId]() {
+            if (self) QMetaObject::invokeMethod(self.data(), [this, requestId]() {
                 emit dependencyCheckReady(requestId, {});
             }, Qt::QueuedConnection);
             return;
@@ -882,7 +903,7 @@ void InstallManager::checkDependencies(const QString &requestId,
 
         // ── Публикуем результат в GUI-поток ───────────────────────────────────
         const QString exeName = QFileInfo(exePath).fileName();
-        QMetaObject::invokeMethod(this, [this, requestId, deps, exeName]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, requestId, deps, exeName]() {
             if (deps.missing.isEmpty()) {
                 const QString msg = QString("Dependencies OK for %1 inputTypes=[%2]")
                     .arg(exeName, deps.inputTypes.join(", "));
@@ -903,7 +924,7 @@ void InstallManager::checkDependencies(const QString &requestId,
 #else
         Q_UNUSED(exePath)
         Q_UNUSED(toolPath)
-        QMetaObject::invokeMethod(this, [this, requestId]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, requestId]() {
             emit dependencyCheckReady(requestId, {});
         }, Qt::QueuedConnection);
 #endif

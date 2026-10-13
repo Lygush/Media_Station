@@ -177,8 +177,12 @@ void TrailerFetcher::startFfmpegConversion(const QString &streamUrl)
     connect(m_ffmpegProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &TrailerFetcher::onFfmpegFinished);
     connect(m_ffmpegProcess, &QProcess::errorOccurred,
-            this, [this](QProcess::ProcessError) {
+            this, [this](QProcess::ProcessError e) {
+                if (!m_ffmpegProcess) return;
                 qWarning() << "TrailerFetcher: ffmpeg process error:" << m_ffmpegProcess->errorString();
+                // Crashed (в т.ч. kill при отмене) придёт ещё и в finished —
+                // результат отдаём там, иначе finished эмитился дважды
+                if (e != QProcess::FailedToStart) return;
                 m_ffmpegProcess->deleteLater();
                 m_ffmpegProcess = nullptr;
                 emit finished(QString());
@@ -360,17 +364,24 @@ QString TrailerFetcher::parseTrailerUrl(const QByteArray &json, const QString & 
 
     // Новый формат: hls_h264, dash_h264, dash_av1
     // Старый формат: mp4.max, mp4.480
+    // Прямой mp4 предпочтительнее: не требует ffmpeg. Раньше сначала брался
+    // HLS-поток, и без tools/ffmpeg/ffmpeg.exe трейлер не скачивался вовсе,
+    // даже если у игры был обычный mp4.
     QString url;
-    url = first["hls_h264"].toString();
+    const QJsonObject mp4 = first["mp4"].toObject();
+    url = mp4["max"].toString();
     if (url.isEmpty())
-        url = first["dash_h264"].toString();
+        url = mp4["480"].toString();
 
-    if (url.isEmpty()) {
-        const QJsonObject mp4 = first["mp4"].toObject();
-        url = mp4["max"].toString();
+    if (url.isEmpty() && QFile::exists(m_ffmpegPath)) {
+        url = first["hls_h264"].toString();
         if (url.isEmpty())
-            url = mp4["480"].toString();
+            url = first["dash_h264"].toString();
     }
+    if (url.isEmpty() && !QFile::exists(m_ffmpegPath)
+        && (first.contains("hls_h264") || first.contains("dash_h264")))
+        qWarning() << "TrailerFetcher: only HLS/DASH trailer available, but ffmpeg not found at"
+                   << m_ffmpegPath;
 
     if (url.isEmpty())
         qDebug() << "TrailerFetcher: no playable URL found in movies[0]";

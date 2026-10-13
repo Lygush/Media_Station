@@ -7,4 +7,4 @@ SUBDIRS += \
 
 # Указываем Qt Creator где лежат .pro файлы для каждого subdir
 MediaStation.file = MediaStation.pro
-Updater.file      = updater/Updater.pro
+Updater.file      = Updater/Updater.pro

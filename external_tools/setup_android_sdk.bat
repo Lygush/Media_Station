@@ -19,9 +19,12 @@ if "%~1"=="" (
 
 :: All paths use delayed expansion to handle spaces in DEPLOY_ROOT
 set "SDK_ROOT=!DEPLOY_ROOT!\tools\android-sdk"
-set "AVD_HOME=!DEPLOY_ROOT!\android-tv\avd"
-set "CONFIG_DIR=!DEPLOY_ROOT!\android-tv\config"
-set "BLOCKLIST_DIR=!DEPLOY_ROOT!\android-tv\blocklists"
+:: IMPORTANT: MediaStation looks for the AVD in <app>\tools\android-tv\avd
+:: (AndroidTVModule::avdHomePath). Older versions of this script created it in
+:: <app>\android-tv\avd, so the app started the emulator with an empty AVD.
+set "AVD_HOME=!DEPLOY_ROOT!\tools\android-tv\avd"
+set "CONFIG_DIR=!DEPLOY_ROOT!\tools\android-tv\config"
+set "BLOCKLIST_DIR=!DEPLOY_ROOT!\tools\android-tv\blocklists"
 set "CMDLINE_ZIP=%PROJECT_ROOT%\tools\cmdline-tools-latest-windows.zip"
 set "SDKMANAGER=!SDK_ROOT!\cmdline-tools\latest\bin\sdkmanager.bat"
 set "AVDMANAGER=!SDK_ROOT!\cmdline-tools\latest\bin\avdmanager.bat"
@@ -91,7 +94,8 @@ set "ANDROID_EMULATOR_HOME=!AVD_HOME!"
 
 echo.
 echo [2/5] Accepting SDK licenses...
-echo y | call "!SDKMANAGER!" --licenses >nul 2>&1
+:: There are several licenses - a single "y" is not enough
+(for /l %%i in (1,1,30) do @echo y) | call "!SDKMANAGER!" --sdk_root="!SDK_ROOT!" --licenses >nul 2>&1
 echo [OK] Licenses accepted
 
 echo.
@@ -99,7 +103,7 @@ echo [3/5] Downloading SDK components (5-15 min, about 1.5 GB)...
 echo       platform-tools, emulator, system-images;android-34;android-tv;x86
 echo.
 
-call "!SDKMANAGER!" "platform-tools" "emulator" "system-images;android-34;android-tv;x86"
+call "!SDKMANAGER!" --sdk_root="!SDK_ROOT!" "platform-tools" "emulator" "system-images;android-34;android-tv;x86"
 
 if !errorlevel! neq 0 (
     echo [ERROR] sdkmanager failed. Check your internet connection.
@@ -113,8 +117,15 @@ echo.
 echo [4/5] Creating AVD MediaStation_TV...
 mkdir "!AVD_HOME!" 2>nul
 
-call "!AVDMANAGER!" list avd 2>nul | findstr /C:"MediaStation_TV" >nul
-if !errorlevel! equ 0 (
+:: Migrate an AVD created by an older version of this script (android-tv\avd)
+if exist "!DEPLOY_ROOT!\android-tv\avd\MediaStation_TV.avd\config.ini" (
+    if not exist "!AVD_HOME!\MediaStation_TV.avd\config.ini" (
+        echo [INFO] Moving AVD from old location android-tv\avd ...
+        xcopy /e /i /q /y "!DEPLOY_ROOT!\android-tv\avd\*" "!AVD_HOME!\" >nul
+    )
+)
+
+if exist "!AVD_HOME!\MediaStation_TV.avd\config.ini" (
     echo [SKIP] AVD MediaStation_TV already exists
     goto avd_done
 )
@@ -127,14 +138,12 @@ if !errorlevel! neq 0 (
     exit /b 1
 )
 
-set "AVD_CFG=!AVD_HOME!\MediaStation_TV.avd\config.ini"
-echo hw.ramSize=2048>> "!AVD_CFG!"
-echo hw.gpu.enabled=yes>> "!AVD_CFG!"
-echo hw.gpu.mode=host>> "!AVD_CFG!"
-echo showDeviceFrame=no>> "!AVD_CFG!"
+:: hw.ramSize / hw.gpu.* / showDeviceFrame are written by MediaStation on every
+:: launch (patchAvdConfig); appending them here only produced duplicate keys.
 echo [OK] AVD created
 
 :avd_done
+
 
 echo.
 echo [5/5] Creating android-tv config files...
@@ -156,9 +165,9 @@ if exist "!CONFIG_DIR!\dnsproxy.yml" (
         echo   - 8.8.8.8
         echo   - 1.1.1.1
         echo blocklist-files:
-        echo   - android-tv/blocklists/default.txt
+        echo   - tools/android-tv/blocklists/default.txt
     ) > "!CONFIG_DIR!\dnsproxy.yml"
-    echo [OK] android-tv\config\dnsproxy.yml created
+    echo [OK] tools\android-tv\config\dnsproxy.yml created
 )
 
 if exist "!BLOCKLIST_DIR!\default.txt" (
@@ -177,7 +186,7 @@ if exist "!BLOCKLIST_DIR!\default.txt" (
         echo moatads.com
         echo pagead2.googlesyndication.com
     ) > "!BLOCKLIST_DIR!\default.txt"
-    echo [OK] android-tv\blocklists\default.txt created
+    echo [OK] tools\android-tv\blocklists\default.txt created
 )
 
 echo.

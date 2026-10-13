@@ -29,6 +29,8 @@
 #include <QtConcurrent/QtConcurrentRun>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QPointer>
+#include <QThreadPool>
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Конструктор / деструктор
@@ -135,22 +137,32 @@ QVariantMap GameLibraryModule::readGameInfo(const QString &folderPath) const
 
 bool GameLibraryModule::writeGameInfo(const QString &folderPath, const QVariantMap &info) const
 {
+    if (folderPath.isEmpty()) return false;
     QDir().mkpath(folderPath);
 
-    const QString infoPath = folderPath + "/game_info.json";
-    const QString tmpPath  = infoPath  + ".tmp";
+    // В m_entries есть служебные поля времени выполнения (_archiveProgress,
+    // _savedTileLocs, available, tileCount…). Раньше они попадали в game_info.json,
+    // и после перезапуска, например, устаревший tileCount не пересчитывался.
+    QVariantMap clean = info;
+    for (auto it = clean.begin(); it != clean.end(); ) {
+        const QString &k = it.key();
+        if (k.startsWith(QLatin1Char('_')) || k == QLatin1String("available")
+            || k == QLatin1String("tileCount") || k == QLatin1String("archiving")
+            || k == QLatin1String("archiveProgress") || k == QLatin1String("archiveCurrentFile")
+            || k == QLatin1String("extracting") || k == QLatin1String("extractProgress"))
+            it = clean.erase(it);
+        else
+            ++it;
+    }
 
-    const QJsonDocument doc(QJsonObject::fromVariantMap(info));
-    QFile f(tmpPath);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "GameLibraryModule: cannot write" << tmpPath;
+    const QString infoPath = folderPath + "/game_info.json";
+    // AtomicFile: запись через временный файл с атомарной заменой (раньше было
+    // remove + rename — при сбое между ними файл терялся)
+    if (!AtomicFile::writeJson(infoPath, QJsonDocument(QJsonObject::fromVariantMap(clean)))) {
+        qWarning() << "GameLibraryModule: cannot write" << infoPath;
         return false;
     }
-    f.write(doc.toJson(QJsonDocument::Indented));
-    f.close();
-
-    QFile::remove(infoPath);
-    return QFile::rename(tmpPath, infoPath);
+    return true;
 }
 
 // ── Путь к архиву внутри папки игры ────────────────────────────────────────
@@ -311,7 +323,8 @@ void GameLibraryModule::scanLibrary()
                 m_entries[it.key()].value("installPath").toString());
     }
 
-    QThreadPool::globalInstance()->start([this, basePath, activePaths]() {
+    const QPointer<GameLibraryModule> self(this);
+    QThreadPool::globalInstance()->start([this, self, basePath, activePaths]() {
         QVariantList results;
 
         if (!basePath.isEmpty()) {
@@ -330,7 +343,7 @@ void GameLibraryModule::scanLibrary()
                     const QString gameId = info.value("id").toString();
                     results.append(info);
 
-                    QMetaObject::invokeMethod(this, [this, gameId, info]() {
+                    if (self) QMetaObject::invokeMethod(self.data(), [this, gameId, info]() {
                         // Не перезаписываем если идёт активная задача для этой игры.
                         if (!m_archiveTasks.contains(gameId) && !m_extractTasks.contains(gameId))
                             m_entries[gameId] = info;
@@ -341,7 +354,7 @@ void GameLibraryModule::scanLibrary()
             }
         }
 
-        QMetaObject::invokeMethod(this, [this, results]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, results]() {
             m_scanning = false;
             emit scanningChanged();
             emit scanFinished(results);
@@ -370,10 +383,11 @@ void GameLibraryModule::scanLibrary()
 
 void GameLibraryModule::requestFolderSize(const QString &gameId, const QString &folderPath)
 {
-    QThreadPool::globalInstance()->start([this, gameId, folderPath]() {
+    const QPointer<GameLibraryModule> self(this);
+    QThreadPool::globalInstance()->start([this, self, gameId, folderPath]() {
         const qint64 bytes = calcFolderSize(folderPath);
 
-        QMetaObject::invokeMethod(this, [this, gameId, bytes]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, gameId, bytes]() {
             if (m_entries.contains(gameId)) {
                 m_entries[gameId]["sizeCached"] = bytes;
                 const QString ip = m_entries[gameId].value("installPath").toString();
@@ -512,7 +526,7 @@ void GameLibraryModule::archiveGame(const QString &gameId)
         emit archiveFinished(gameId, false);
         return;
     }
-    if (m_archiveTasks.contains(gameId)) return;
+    if (m_archiveTasks.contains(gameId) || m_extractTasks.contains(gameId)) return;
 
     QVariantMap entry         = m_entries[gameId];
     const QString installPath = QDir::fromNativeSeparators(
@@ -629,8 +643,9 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                 watcher->deleteLater();
             });
 
+    const QPointer<GameLibraryModule> self(this);
     QFuture<bool> future = QtConcurrent::run(
-        [this, gameId, installPath, archiveDir, archiveFinal, cancelFlag]() -> bool
+        [this, self, gameId, installPath, archiveDir, archiveFinal, cancelFlag]() -> bool
         {
             if (cancelFlag->load()) return false;
 
@@ -647,9 +662,9 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                 QStringLiteral("game"),
                 archiveFinal,
                 cancelFlag.get(),
-                [this, gameId](int pct, const QString &curFile) {
+                [this, self, gameId](int pct, const QString &curFile) {
                     const qreal progress = pct / 100.0;
-                    QMetaObject::invokeMethod(this,
+                    if (self) QMetaObject::invokeMethod(self.data(),
                         [this, gameId, progress, curFile]() {
                             if (m_entries.contains(gameId)) {
                                 m_entries[gameId]["_archiveProgress"]    = progress;
@@ -691,7 +706,7 @@ void GameLibraryModule::extractGame(const QString &gameId,
         emit extractFinished(gameId, false);
         return;
     }
-    if (m_extractTasks.contains(gameId)) return;
+    if (m_extractTasks.contains(gameId) || m_archiveTasks.contains(gameId)) return;
 
     const QString installPath = QDir::fromNativeSeparators(
         m_entries[gameId].value("installPath").toString());
@@ -718,16 +733,17 @@ void GameLibraryModule::extractGame(const QString &gameId,
     etask.destFolder  = installPath + "/game";
     m_extractTasks.insert(gameId, etask);
 
-    QThreadPool::globalInstance()->start([this, gameId, installPath, archivePath,
+    const QPointer<GameLibraryModule> self(this);
+    QThreadPool::globalInstance()->start([this, self, gameId, installPath, archivePath,
                                           keepArchive, storageKey, isFolder, cancelFlag]() {
 
         const SevenZip::Result r = SevenZip::extract(
             archivePath,
             installPath,   // workDir: 7zr восстановит подпапку game/ на месте
             cancelFlag.get(),
-            [this, gameId](int pct, const QString &) {
+            [this, self, gameId](int pct, const QString &) {
                 const qreal progress = pct / 100.0;
-                QMetaObject::invokeMethod(this, [this, gameId, progress]() {
+                if (self) QMetaObject::invokeMethod(self.data(), [this, gameId, progress]() {
                     m_extractProgress[gameId] = progress;
                     emit extractProgress(gameId, progress);
                 }, Qt::QueuedConnection);
@@ -736,7 +752,7 @@ void GameLibraryModule::extractGame(const QString &gameId,
         const bool cancelled = (r == SevenZip::Cancelled);
         const bool ok        = (r == SevenZip::Ok);
 
-        QMetaObject::invokeMethod(this,
+        if (self) QMetaObject::invokeMethod(self.data(),
                                   [this, gameId, ok, cancelled, installPath, archivePath,
                                    keepArchive, storageKey, isFolder]()
                                   {
@@ -811,6 +827,17 @@ void GameLibraryModule::removeFromLibrary(const QString &gameId)
 void GameLibraryModule::deleteGame(const QString &gameId)
 {
     if (!m_entries.contains(gameId)) return;
+
+    // Нельзя удалять папку, в которую прямо сейчас пишет/из которой читает 7z
+    if (m_archiveTasks.contains(gameId) || m_extractTasks.contains(gameId)) {
+        qWarning() << "GameLibraryModule::deleteGame: task in progress for" << gameId;
+        if (m_bus)
+            emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
+                                    Notifications::makeEvent(
+                                        "Сначала отмените архивацию/распаковку этой игры",
+                                        NotificationLevel::Warning, true, 4000));
+        return;
+    }
 
     const QVariantMap entry   = m_entries[gameId];
     const QString installPath = entry.value("installPath").toString();

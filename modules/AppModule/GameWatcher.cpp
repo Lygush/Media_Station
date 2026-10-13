@@ -289,7 +289,8 @@ quint32 GameWatcher::readPidFile(const QString &pidFilePath, int timeoutMs)
             f.close();
             bool ok = false;
             const DWORD pid = static_cast<DWORD>(content.toULong(&ok));
-            if (ok && pid > 0) return static_cast<quint32>(pid);
+            // "0" — launch.ps1 сообщает об ошибке запуска: не ждём весь таймаут
+            if (ok) return static_cast<quint32>(pid);
         }
         QThread::msleep(kPidPollMs);
     }

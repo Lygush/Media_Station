@@ -4,20 +4,39 @@
 #include <QFile>
 #include <QDebug>
 #include <QThread>
+#include <QElapsedTimer>
 #ifdef Q_OS_WIN
 #  include <windows.h>
 #endif
 
 struct TranscribeCallbackData {
     WhisperProgressCb cb;
-    bool cancelled = false;
+    bool          cancelled    = false;
+    int           lastProgress = 0;
+    QElapsedTimer sinceCheck;
 };
 
 static void progressCallback(whisper_context *, whisper_state *, int progress, void *userdata)
 {
     auto *d = static_cast<TranscribeCallbackData *>(userdata);
-    if (d && d->cb)
-        if (!d->cb(progress)) d->cancelled = true;
+    if (!d) return;
+    d->lastProgress = progress;
+    if (d->cb && !d->cb(progress)) d->cancelled = true;
+}
+
+// Вызывается whisper.cpp часто во время вычислений. Раньше отмена проверялась
+// только в progress_callback (раз в несколько процентов) и не прерывала
+// whisper_full — «Отмена» срабатывала лишь после окончания распознавания.
+static bool abortCallback(void *userdata)
+{
+    auto *d = static_cast<TranscribeCallbackData *>(userdata);
+    if (!d) return false;
+    if (d->cancelled) return true;
+    if (d->cb && (!d->sinceCheck.isValid() || d->sinceCheck.elapsed() > 250)) {
+        d->sinceCheck.restart();
+        if (!d->cb(d->lastProgress)) d->cancelled = true;
+    }
+    return d->cancelled;
 }
 
 WhisperWrapper::WhisperWrapper(QObject *parent) : QObject(parent) {}
@@ -156,14 +175,16 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
     if (progressCb) {
         params.progress_callback           = progressCallback;
         params.progress_callback_user_data = &cbData;
+        params.abort_callback              = abortCallback;
+        params.abort_callback_user_data    = &cbData;
     }
 
     // ── whisper_full (не parallel!) ───────────────────────────────────────────
     qDebug() << "[WhisperWrapper] Запускаем whisper_full...";
     const int ret = m_fnFull(m_ctx, params, pcmf32.data(), nSamples);
     qDebug() << "[WhisperWrapper] ret =" << ret;
-    if (ret != 0) { result.error = QString("whisper_full вернул: %1").arg(ret); return result; }
     if (cbData.cancelled) { result.error = "Отменено"; return result; }
+    if (ret != 0) { result.error = QString("whisper_full вернул: %1").arg(ret); return result; }
 
     // ── Читаем сегменты и группируем токены в слова ───────────────────────────
     // Whisper токены — это части слова (BPE). Токен начинающийся с пробела
@@ -181,13 +202,15 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         const int nTok = m_fnNTokens(m_ctx, s);
 
         // Собираем все токены сегмента в слова
-        QString  curWord;
+        // Слово собираем в БАЙТАХ: токен BPE может содержать половину UTF-8
+        // символа (кириллица), и пословное декодирование давало «�» в тексте.
+        QByteArray curWord;
         qint64   curT0 = -1, curT1 = -1;
 
         auto flushWord = [&]() {
-            if (curWord.isEmpty() || curT0 < 0) return;
-            const QString w = curWord.trimmed();
-            if (w.isEmpty()) return;
+            if (curWord.isEmpty() || curT0 < 0) { curWord.clear(); return; }
+            const QString w = QString::fromUtf8(curWord).trimmed();
+            if (w.isEmpty()) { curWord.clear(); return; }
             // Фильтруем галлюцинации
             const QString wLow = w.toLower();
             for (const QString &h : hallucinations)
@@ -204,7 +227,7 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         for (int t = 0; t < nTok; ++t) {
             const char *raw = m_fnTokenText(m_ctx, s, t);
             if (!raw) continue;
-            const QString tok = QString::fromUtf8(raw);
+            const QByteArray tok(raw);
 
             // Спецтокены пропускаем
             if ((tok.startsWith('<') && tok.endsWith('>')) ||

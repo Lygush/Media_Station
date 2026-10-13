@@ -9,6 +9,7 @@
 #include <QVariantList>
 #include <QMutex>
 #include <QWaitCondition>
+#include <QFuture>
 
 class EventBus;
 class SettingsManager;
@@ -80,4 +81,5 @@ private:
     QString        m_selectedAppId;
     QString        m_pendingTileId;
     bool           m_aborted = false;  // выставляется в shutdown() чтобы разбудить wait
+    QFuture<void>  m_fetchFuture;      // фоновый doFetch — дожидаемся в shutdown()
 };

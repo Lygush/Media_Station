@@ -25,6 +25,17 @@ Column {
 
     signal saveAndRefresh(string profileId, string field, var value)
 
+    // profileSizeMb() — обычный вызов, QML не знает, когда пересчитать.
+    // Счётчик ревизий обновляется при смене профиля/данных и после очистки.
+    property int _sizeRev: 0
+    onCurrentProfileIdChanged: _sizeRev++
+    onProfileDataChanged: _sizeRev++
+    function _sizeMb() {
+        var _dep = root._sizeRev
+        return AndroidTV && AndroidTV.profileManager
+               ? AndroidTV.profileManager.profileSizeMb(root.currentProfileId) : -1
+    }
+
     spacing: 0
 
     // ── Активный профиль ──────────────────────────────────────────────────────
@@ -37,8 +48,11 @@ Column {
                 checked: root.currentProfileId !== ""
                          && AndroidTV != null && AndroidTV.profileManager != null
                          && root.currentProfileId === AndroidTV.profileManager.activeProfileId
+                // Пока эмулятор запущен, сменить активный профиль нельзя
+                opacity: (AndroidTV && AndroidTV.profileManager && AndroidTV.profileManager.locked) ? 0.4 : 1.0
                 onToggled: {
-                    if (!checked && AndroidTV && AndroidTV.profileManager)
+                    if (!checked && AndroidTV && AndroidTV.profileManager
+                            && !AndroidTV.profileManager.locked)
                         AndroidTV.profileManager.setActiveProfile(root.currentProfileId)
                 }
             }
@@ -89,7 +103,7 @@ Column {
         label: Settings.safeTr("ram")
         SelectGroup {
             model: [1024, 2048, 4096, 8192]
-            currentValue: root.profileData.ramMb || 4096
+            currentValue: root.profileData.ramMb || 2048
             buttonWidth:  Settings.us(70)
             labelFor: function(v) {
                 return v >= 1024 ? (v / 1024 + " GB") : (v + " MB")
@@ -199,9 +213,10 @@ Column {
                     return val !== undefined && val !== "auto"
                 }
                 onToggled: {
-                    audioTimerSwitch.checked = !audioTimerSwitch.checked
-                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs",
-                                        audioTimerSwitch.checked ? 100 : "auto")
+                    // Не присваиваем checked напрямую — это рвёт биндинг, и при
+                    // переключении профиля переключатель показывал чужое значение
+                    var enable = !audioTimerSwitch.checked
+                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", enable ? 100 : "auto")
                 }
             }
         }
@@ -238,9 +253,8 @@ Column {
                     return val !== undefined && val !== "auto"
                 }
                 onToggled: {
-                    dsoundLatencySwitch.checked = !dsoundLatencySwitch.checked
-                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs",
-                                        dsoundLatencySwitch.checked ? 200 : "auto")
+                    var enable = !dsoundLatencySwitch.checked
+                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", enable ? 200 : "auto")
                 }
             }
         }
@@ -260,15 +274,13 @@ Column {
 
                 Text {
                     text: {
-                        var mb = AndroidTV && AndroidTV.profileManager
-                                 ? AndroidTV.profileManager.profileSizeMb(root.currentProfileId) : -1
+                        var mb = root._sizeMb()
                         if (mb < 0) return Settings.safeTr("qcow2_not_found")
                         if (mb < 1024) return mb + " MB"
                         return (mb / 1024).toFixed(1) + " GB"
                     }
                     color: {
-                        var mb = AndroidTV && AndroidTV.profileManager
-                                 ? AndroidTV.profileManager.profileSizeMb(root.currentProfileId) : -1
+                        var mb = root._sizeMb()
                         var ratio = mb / 3072
                         if (ratio > 0.85) return "#FF6060"
                         if (ratio > 0.6)  return "#FFB347"
@@ -282,13 +294,11 @@ Column {
                     radius: Settings.us(3); animated: true; duration: 400
                     trackColor: Settings.accent(0.12)
                     value: {
-                        var mb = AndroidTV && AndroidTV.profileManager
-                                 ? AndroidTV.profileManager.profileSizeMb(root.currentProfileId) : -1
+                        var mb = root._sizeMb()
                         return mb <= 0 ? 0 : Math.min(1.0, mb / 3072)
                     }
                     barColor: {
-                        var mb = AndroidTV && AndroidTV.profileManager
-                                 ? AndroidTV.profileManager.profileSizeMb(root.currentProfileId) : -1
+                        var mb = root._sizeMb()
                         var ratio = mb / 3072
                         if (ratio > 0.85) return "#FF6060"
                         if (ratio > 0.6)  return "#FFB347"
@@ -301,7 +311,8 @@ Column {
             Item {
                 width: Settings.us(145); height: Settings.us(32)
                 anchors.verticalCenter: parent.verticalCenter
-                enabled: AndroidTV && !AndroidTV.booting && !AndroidTV.running
+                enabled: AndroidTV && !(AndroidTV.profileManager && AndroidTV.profileManager.locked
+                                        && root.currentProfileId === AndroidTV.profileManager.activeProfileId)
                 Rectangle {
                     anchors.fill: parent; radius: 9
                     color: clearMA.containsMouse && parent.enabled ? "#55FF4444" : "#33FF4444"
@@ -326,6 +337,7 @@ Column {
                                     { label: Settings.safeTr("delete"), role: "danger",
                                       action: function() {
                                           AndroidTV.profileManager.clearProfileData(root.currentProfileId)
+                                          root._sizeRev++
                                       }
                                     },
                                     { label: Settings.safeTr("cancel"), role: "primary",

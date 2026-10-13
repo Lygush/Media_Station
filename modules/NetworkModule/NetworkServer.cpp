@@ -15,6 +15,8 @@
 #include <QNetworkInterface>
 #include <QStandardPaths>
 #include <QThreadPool>
+#include <QPointer>
+#include <utility>
 
 // ─── UDP-обнаружение ─────────────────────────────────────────────────────────
 
@@ -106,9 +108,11 @@ void NetworkModule::readyRead()
                 socket->write("READY\n");
                 qDebug() << "[NetworkModule] update negotiation OK, size:" << st.expectedSize;
 
+                // Буфер забираем ДО вызова: receiveArchiveData может удалить
+                // ClientState (cleanupClient), и ссылка st станет висячей.
                 if (!st.buffer.isEmpty()) {
-                    receiveArchiveData(socket, st.buffer);
-                    st.buffer.clear();
+                    const QByteArray chunk = std::exchange(st.buffer, QByteArray());
+                    receiveArchiveData(socket, chunk);
                 }
                 return;
             }
@@ -164,24 +168,30 @@ void NetworkModule::readyRead()
                 socket->write("READY\n");
 
                 if (!st.buffer.isEmpty()) {
-                    receiveArchiveData(socket, st.buffer);
-                    st.buffer.clear();
+                    const QByteArray chunk = std::exchange(st.buffer, QByteArray());
+                    receiveArchiveData(socket, chunk);
                 }
+                return;   // остальное придёт уже в фазе PhaseReceiving
             }
         }
         return;
     }
 
     if (st.phase == PhaseReceiving || st.phase == PhaseUpdate) {
-        receiveArchiveData(socket, st.buffer);
-        st.buffer.clear();
+        const QByteArray chunk = std::exchange(st.buffer, QByteArray());
+        receiveArchiveData(socket, chunk);
+        return;
     }
+
+    // PhaseExtracting: архив уже принят, лишние данные игнорируем
+    st.buffer.clear();
 }
 
 void NetworkModule::receiveArchiveData(QTcpSocket *socket, const QByteArray &data)
 {
-    if (data.isEmpty()) return;
+    if (data.isEmpty() || !m_clients.contains(socket)) return;
     ClientState &st = m_clients[socket];
+    if (st.receivedBytes >= st.expectedSize) return;   // архив уже принят целиком
 
     if (!st.archiveFile) {
         st.archiveFile = new QFile(st.tempArchivePath, this);
@@ -192,13 +202,16 @@ void NetworkModule::receiveArchiveData(QTcpSocket *socket, const QByteArray &dat
         }
     }
 
-    const qint64 written = st.archiveFile->write(data);
-    if (written != data.size()) {
+    // Не пишем в архив больше объявленного размера (хвост — уже не архив)
+    const qint64 remaining = st.expectedSize - st.receivedBytes;
+    const QByteArray part  = data.size() > remaining ? data.left(remaining) : data;
+    const qint64 written   = st.archiveFile->write(part);
+    if (written != part.size()) {
         qWarning() << "[NetworkModule] partial write (disk full?)";
         cleanupClient(socket, true);
         return;
     }
-    st.receivedBytes += data.size();
+    st.receivedBytes += part.size();
 
     if (st.expectedSize > 0) {
         const qreal progress = qMin(qreal(st.receivedBytes) / st.expectedSize, 1.0);
@@ -278,39 +291,60 @@ void NetworkModule::extractAndInstall(QTcpSocket *socket)
     st.gameRootPath = gameRootPath;
 
     const QString extractDir = gameRootPath + "/game";
+    const auto cancelFlag    = st.cancelFlag;
+    // Модуль может быть удалён, пока поток пула ещё распаковывает
+    const QPointer<NetworkModule> self(this);
 
     // Запускаем разархивацию в пуле потоков — SevenZip::extract блокирующий
-    QThreadPool::globalInstance()->start([this, socket, gameRootPath, archivePath,
-                                          extractDir, tileId, title,
+    QThreadPool::globalInstance()->start([self, socket, gameRootPath, archivePath,
+                                          extractDir, tileId, title, cancelFlag,
                                           exeRelativePath, iconRelativePath, kind]() {
+        int lastPct = -1;
         const SevenZip::Result r = SevenZip::extract(
             archivePath,
             extractDir,
-            nullptr,
-            [this, tileId](int pct, const QString &) {
-                if (!tileId.isEmpty()) {
-                    QMetaObject::invokeMethod(this, [this, tileId, pct]() {
-                        emit installProgress(tileId, pct / 100.0, "extracting");
-                    }, Qt::QueuedConnection);
-                }
+            cancelFlag.get(),
+            [self, tileId, &lastPct](int pct, const QString &) {
+                if (tileId.isEmpty() || pct == lastPct || !self) return;
+                lastPct = pct;
+                QMetaObject::invokeMethod(self.data(), [self, tileId, pct]() {
+                    if (self) emit self->installProgress(tileId, pct / 100.0, "extracting");
+                }, Qt::QueuedConnection);
             });
 
-        QMetaObject::invokeMethod(this,
-            [this, socket, gameRootPath, archivePath,
+        if (!self) {   // приложение закрывается
+            QFile::remove(archivePath);
+            if (r != SevenZip::Ok) QDir(gameRootPath).removeRecursively();
+            return;
+        }
+
+        QMetaObject::invokeMethod(self.data(),
+            [self, socket, gameRootPath, archivePath, cancelFlag,
              tileId, title, exeRelativePath, iconRelativePath, kind, r]() {
+                if (!self) return;
+                NetworkModule *m = self.data();
 
                 QFile::remove(archivePath);
 
-                if (!m_clients.contains(socket)) return;
-                ClientState &st2 = m_clients[socket];
+                // Установку отменили (или клиент отключился) во время распаковки —
+                // папку удаляем здесь, когда 7z уже точно не пишет в неё.
+                if (cancelFlag->load() || r == SevenZip::Cancelled || !m->m_clients.contains(socket)) {
+                    QDir(gameRootPath).removeRecursively();
+                    return;
+                }
+                ClientState &st2 = m->m_clients[socket];
                 st2.extractProcess  = nullptr;
                 st2.tempArchivePath.clear();
 
-                if (st2.cancelled) return;
+                if (st2.cancelled) {
+                    QDir(gameRootPath).removeRecursively();
+                    return;
+                }
 
                 if (r != SevenZip::Ok) {
                     qWarning() << "[NetworkModule] extraction failed for" << tileId
                                << SevenZip::resultToString(r);
+                    st2.gameRootPath.clear();
                     socket->write("FAIL: extraction error\n");
                     socket->disconnectFromHost();
                     QDir(gameRootPath).removeRecursively();
@@ -319,8 +353,9 @@ void NetworkModule::extractAndInstall(QTcpSocket *socket)
 
                 st2.gameRootPath.clear();
 
-                emit m_bus->networkExtractFinished(
-                    tileId, title, gameRootPath, exeRelativePath, iconRelativePath, kind);
+                if (m->m_bus)
+                    emit m->m_bus->networkExtractFinished(
+                        tileId, title, gameRootPath, exeRelativePath, iconRelativePath, kind);
 
                 socket->write("OK: installation started\n");
                 socket->disconnectFromHost();
@@ -343,6 +378,7 @@ void NetworkModule::cleanupClient(QTcpSocket *socket, bool sendCancel)
     ClientState &st = m_clients[socket];
 
     st.cancelled = true;
+    if (st.cancelFlag) st.cancelFlag->store(true);
 
     if (sendCancel && socket->state() == QAbstractSocket::ConnectedState) {
         socket->write("CANCEL\n");
@@ -366,11 +402,13 @@ void NetworkModule::cleanupClient(QTcpSocket *socket, bool sendCancel)
         st.extractProcess = nullptr;
     }
 
-    if (!st.gameRootPath.isEmpty()) {
+    // Во время распаковки папку удаляет обработчик завершения фоновой задачи
+    // (иначе 7z продолжал бы писать в удаляемую папку).
+    if (!st.gameRootPath.isEmpty() && st.phase != PhaseExtracting) {
         QDir dir(st.gameRootPath);
         if (dir.exists()) dir.removeRecursively();
-        st.gameRootPath.clear();
     }
+    st.gameRootPath.clear();
 
     m_clients.remove(socket);
 }

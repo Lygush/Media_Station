@@ -64,10 +64,16 @@ int main(int argc, char *argv[])
         qWarning() << "main: cursor asset not found, using system default";
     }
 
-    QQmlApplicationEngine engine;
+    // Движок создаётся в куче и удаляется явно ДО ModuleHost: иначе (порядок
+    // деструкторов стековых объектов) модули удалялись раньше QML-движка, и
+    // при выходе биндинги обращались к уже уничтоженным контекст-объектам.
+    auto *enginePtr = new QQmlApplicationEngine;
+    QQmlApplicationEngine &engine = *enginePtr;
     qmlRegisterSingletonType(QUrl("qrc:/qml/Settings.qml"), "AppSettings", 1, 0, "Settings");
 
-    engine.addImportPath("C:/Qt/6.10.2-msvc-full/qml");
+    // Раньше здесь был жёстко прописан путь C:/Qt/6.10.2-msvc-full/qml: на другой
+    // машине/версии Qt он либо отсутствует, либо подмешивает чужие QML-плагины.
+    // QML-модули ищутся рядом с exe (windeployqt) и в стандартных путях Qt.
 
     ModuleHost host(&engine);
 
@@ -131,6 +137,8 @@ int main(int argc, char *argv[])
     engine.load(QUrl("qrc:/qml/Main.qml"));
     if (engine.rootObjects().isEmpty()) {
         qCritical() << "main: failed to load Main.qml";
+        host.shutdownAll();
+        delete enginePtr;
         return -1;
     }
 
@@ -138,15 +146,23 @@ int main(int argc, char *argv[])
     if (mainWindow) {
 #ifdef Q_OS_WIN
         const HWND hwnd = reinterpret_cast<HWND>(mainWindow->winId());
-        SetWindowLongPtr(hwnd, GWL_EXSTYLE,
-                         GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOPMOST);
+        // WS_EX_LAYERED нужен AndroidTVModule для прозрачности поверх эмулятора.
+        // TOPMOST здесь НЕ ставим: AndroidTVModule включает его только на время
+        // сессии Android TV, иначе окна запущенных игр оказывались бы под MediaStation.
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
         SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
         androidTVModule->setMediaStationHwnd(hwnd);
-        qDebug() << "main: main window configured as Layered+TOPMOST, HWND =" << hwnd;
+        qDebug() << "main: main window configured as Layered, HWND =" << hwnd;
 #endif
     } else {
         qWarning() << "main: failed to get main window for Layered setup";
     }
 
-    return app.exec();
+    const int rc = app.exec();
+
+    // 1) Модули завершают внешние процессы (эмулятор, DS4Windows, хуки), пока UI жив
+    host.shutdownAll();
+    // 2) Удаляем QML до модулей, на которые он ссылается
+    delete enginePtr;
+    return rc;
 }

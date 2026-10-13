@@ -5,12 +5,46 @@
 #include <QFile>
 #include <QDir>
 #include <QDebug>
+#include <QElapsedTimer>
 
 #include "DemucsWrapper.h"
 #include "WhisperWrapper.h"
 #include "LrcFetcher.h"
 #include "LrcBuilder.h"
 #include "../../tools/AtomicFile.h"
+
+
+// ffmpeg с возможностью отмены: раньше waitForFinished(120 с) не реагировал на
+// «Отмена», и до двух минут обработка продолжалась.
+static bool runCancellable(QProcess &proc, int timeoutMs, const std::atomic<bool> *cancelled,
+                           const char *what)
+{
+    proc.start();
+    if (!proc.waitForStarted(10'000)) {
+        qCritical() << "[KaraokeWorker]" << what << "не запустился:" << proc.errorString();
+        return false;
+    }
+    QElapsedTimer t;
+    t.start();
+    while (!proc.waitForFinished(200)) {
+        if (cancelled && cancelled->load()) {
+            proc.kill();
+            proc.waitForFinished(3000);
+            return false;
+        }
+        if (t.elapsed() > timeoutMs) {
+            qCritical() << "[KaraokeWorker]" << what << "timeout";
+            proc.kill();
+            proc.waitForFinished(3000);
+            return false;
+        }
+    }
+    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+        qCritical() << "[KaraokeWorker]" << what << "ошибка:" << proc.readAllStandardError().right(2000);
+        return false;
+    }
+    return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -41,13 +75,20 @@ void KaraokeWorker::run()
 
     // ── Шаг 1: ffmpeg → temp WAV 44100 stereo ────────────────────────────────
     reportProgress(0, "Подготовка аудио...");
-    if (!stepFfmpegToWav(m_meta.filePath, tempWav)) return;
-    if (isCancelled()) return;
+    if (!stepFfmpegToWav(m_meta.filePath, tempWav) || isCancelled()) {
+        QFile::remove(tempWav);
+        return;
+    }
 
     // ── Шаг 2: Demucs → vocals.wav + instrumental.wav ─────────────────────────
     reportProgress(10, "Разделение вокала...");
-    if (!stepDemucs(tempWav, vocalsWav, instrWav)) return;
-    if (isCancelled()) return;
+    if (!stepDemucs(tempWav, vocalsWav, instrWav) || isCancelled()) {
+        // Недописанные дорожки не должны выглядеть как готовый кэш
+        QFile::remove(tempWav);
+        QFile::remove(vocalsWav);
+        QFile::remove(instrWav);
+        return;
+    }
 
     // Temp WAV больше не нужен
     QFile::remove(tempWav);
@@ -85,14 +126,9 @@ bool KaraokeWorker::stepFfmpegToWav(const QString &inputPath, const QString &out
         "-sample_fmt", "s16",
         outputPath
     });
-    proc.start();
-    if (!proc.waitForFinished(120'000)) {
-        qCritical() << "[KaraokeWorker] ffmpeg timeout (44100)";
-        proc.kill();
-        return false;
-    }
-    if (proc.exitCode() != 0) {
-        qCritical() << "[KaraokeWorker] ffmpeg ошибка:" << proc.readAllStandardError();
+    // Длинные треки на медленном диске не укладывались в 2 минуты
+    if (!runCancellable(proc, 600'000, m_cancelled, "ffmpeg (44100)")) {
+        QFile::remove(outputPath);
         return false;
     }
     qDebug() << "[KaraokeWorker] ffmpeg → WAV готов:" << outputPath;
@@ -213,14 +249,8 @@ bool KaraokeWorker::stepFfmpegTo16k(const QString &inputWav, const QString &outp
         "-c:a", "pcm_s16le",
         outputWav
     });
-    proc.start();
-    if (!proc.waitForFinished(60'000)) {
-        qCritical() << "[KaraokeWorker] ffmpeg timeout (16k)";
-        proc.kill();
-        return false;
-    }
-    if (proc.exitCode() != 0) {
-        qCritical() << "[KaraokeWorker] ffmpeg 16k ошибка:" << proc.readAllStandardError();
+    if (!runCancellable(proc, 600'000, m_cancelled, "ffmpeg (16k)")) {
+        QFile::remove(outputWav);
         return false;
     }
     return true;

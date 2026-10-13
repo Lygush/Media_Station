@@ -25,8 +25,15 @@ QString AndroidTVModule::logcatLogPath() const
 void AndroidTVModule::openEmulatorLogFile()
 {
     if (m_emulatorLogFile.isOpen()) return;
+    // Первый раз за сессию — перезаписываем файл, дальше только дописываем
+    // (иначе запись в лог после closeEmulatorLogFile() стирала весь лог сессии).
+    static bool s_truncatedThisSession = false;
+    QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Text;
+    mode |= s_truncatedThisSession ? QIODevice::Append : QIODevice::Truncate;
+    s_truncatedThisSession = true;
+
     m_emulatorLogFile.setFileName(emulatorLogPath());
-    if (!m_emulatorLogFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    if (!m_emulatorLogFile.open(mode)) {
         qWarning() << "[AndroidTV] Cannot open emulator log file:" << emulatorLogPath();
         return;
     }

@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <functional>
+#include <atomic>
 
 struct llama_model;
 struct llama_context;
@@ -41,9 +42,15 @@ public:
     // Логирование через EventBus → LoggerModule. Безопасно из любого потока.
     void log(const char *level, const QString &message);
 
+    // Прервать текущий runInference() (из любого потока). Сбрасывается в
+    // начале следующего runInference().
+    void requestAbort() { m_abort.store(true); }
+    bool isAborted() const { return m_abort.load(); }
+
 private:
     llama_model   *m_model = nullptr;
     llama_context *m_ctx   = nullptr;
     bool           m_ready = false;
     EventBus      *m_bus   = nullptr;
+    std::atomic<bool> m_abort{false};
 };

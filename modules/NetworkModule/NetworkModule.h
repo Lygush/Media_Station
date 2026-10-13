@@ -22,6 +22,8 @@
 #include <QFile>
 #include <QElapsedTimer>
 #include <QStringList>
+#include <atomic>
+#include <memory>
 
 class EventBus;
 class SettingsManager;
@@ -108,6 +110,10 @@ private:
     // ── Сеть ──────────────────────────────────────────────────────────────────
     QTcpSocket *m_socket     = nullptr;
     QUdpSocket *m_udpSocket  = nullptr;
+    QTimer     *m_discoverTimer = nullptr;
+    QMetaObject::Connection m_discoverConn;
+    // Флаг отмены фоновой упаковки (shared_ptr — поток пула может пережить отправку)
+    std::shared_ptr<std::atomic<bool>> m_packCancel;
     QFile      *m_archiveFile = nullptr;
     QByteArray  m_incoming;
     QString     m_tmpLogsDir;
@@ -209,6 +215,8 @@ private:
         QString            gameRootPath;
         QPointer<QProcess> extractProcess;
         QFile             *archiveFile = nullptr;
+        // Флаг отмены для фоновой распаковки (живёт дольше ClientState)
+        std::shared_ptr<std::atomic<bool>> cancelFlag = std::make_shared<std::atomic<bool>>(false);
         bool               cancelled = false;
         bool               isUpdate = false;
     };

@@ -16,6 +16,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDateTime>
 
 // ─────────────────────────────────────────────────────────────────────────────
 const QStringList TileManager::s_knownScreens = { "games", "tv" };
@@ -80,7 +81,26 @@ void TileManager::initialize(EventBus *bus, SettingsManager * /*settings*/)
                 // ── createTile: создать плитку в нужном экране/папке ─────────────────
                 if (ev == "createTile") {
                     const QString storageKey = data["storageKey"].toString();
-                    const bool    isFolder   = data["isFolder"].toBool();
+                    bool          isFolder   = data["isFolder"].toBool();
+
+                    // storageKey должен быть экраном ("games"/"tv") или id папки.
+                    // Раньше при восстановлении плиток после отмены архивации сюда
+                    // приходили id из tile_id.txt, и в structure.json появлялись
+                    // «экраны» с мусорными ключами.
+                    if (!isFolder && !s_knownScreens.contains(storageKey)) {
+                        bool folderExists = false;
+                        for (const QString &screen : s_knownScreens) {
+                            QJsonArray tmp;
+                            if (findNodeChildren(m_structure[screen].toArray(), storageKey, tmp)) {
+                                folderExists = true; break;
+                            }
+                        }
+                        if (!folderExists) {
+                            qWarning() << "TileManager: createTile ignored, unknown location:" << storageKey;
+                            return;
+                        }
+                        isFolder = true;
+                    }
                     const QString gameId     = data["gameId"].toString();
                     const QString tileId     = "lib_" + gameId;
 
@@ -199,6 +219,7 @@ void TileManager::loadStructure()
     QFile f(m_structurePath);
     if (f.open(QIODevice::ReadOnly)) {
         QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+        f.close();
         if (doc.isObject()) {
             m_structure = doc.object();
             for (const QString &screen : s_knownScreens)
@@ -206,6 +227,12 @@ void TileManager::loadStructure()
                     m_structure[screen] = QJsonArray();
             return;
         }
+        // Повреждённый файл: раньше первая же запись молча затирала все плитки
+        // пользователя. Сохраняем копию, чтобы данные можно было восстановить.
+        const QString backup = m_structurePath + ".corrupted_"
+                               + QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+        QFile::copy(m_structurePath, backup);
+        qWarning() << "TileManager: structure.json is corrupted, backup saved to" << backup;
     }
     for (const QString &screen : s_knownScreens)
         m_structure[screen] = QJsonArray();
@@ -507,7 +534,11 @@ void TileManager::removeTileFromStructure(const QString &tileId)
     bool changed = false;
     for (const QString &screen : s_knownScreens) {
         QJsonArray arr = m_structure[screen].toArray();
-        if (removeNodeById(arr, tileId)) { m_structure[screen] = arr; changed = true; }
+        // removeNodeById удаляет только первое вхождение — у игры может быть
+        // несколько ярлыков в разных папках одного экрана
+        bool removedAny = false;
+        while (removeNodeById(arr, tileId)) removedAny = true;
+        if (removedAny) { m_structure[screen] = arr; changed = true; }
     }
     if (changed) saveStructure();
 }

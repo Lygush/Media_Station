@@ -3,6 +3,7 @@
 #include "NetworkModule.h"
 #include "core/EventBus.h"
 #include "SettingsManager.h"
+#include "LoggerModule.h"
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -76,6 +77,19 @@ void NetworkModule::onSettingsChanged(const QString &key, const QVariant &value)
 {
     if (key == QLatin1String("installPath"))
         m_installPath = value.toString();
+}
+
+// ── Логирование ──────────────────────────────────────────────────────────────
+// Раньше NetworkModule писал только через qDebug/qWarning, которые нигде не
+// сохраняются в продакшене — из-за этого сетевые сбои были не видны в
+// logs/app.log. Теперь дублируем в LoggerModule, как это делает InstallManager.
+void NetworkModule::log(const char *level, const QString &msg) const
+{
+    qDebug().noquote() << "[NetworkModule]" << level << msg;
+    if (!m_bus) return;
+    const QByteArray bytes = msg.toUtf8();
+    emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
+                            Logger::makeEvent(level, "network", bytes.constData()));
 }
 
 // ─── Реализация серверных методов вставляется из NetworkServer.cpp ─────────

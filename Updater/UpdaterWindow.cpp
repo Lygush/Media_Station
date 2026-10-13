@@ -710,16 +710,17 @@ void UpdaterWindow::doReplace()
         const QString oldAvdPath = oldToolsPath + "/android-tv/avd";
         const QString newAvdPath = newToolsPath  + "/android-tv/avd";
 
-        if (QDir(oldAvdPath).exists() && QDir(newAvdPath).exists()) {
+        if (QDir(oldAvdPath).exists()) {
+            QDir().mkpath(newAvdPath);
             setStatus("Мажорное обновление: перенос пользовательских настроек AndroidTV...");
             QApplication::processEvents();
 
-            // Копируем только файлы самого AVD-профиля, не трогая системный образ.
-            // Структура: avd/MediaStation_TV.ini + avd/MediaStation_TV.avd/
-            const QStringList avdItems = {
-                "MediaStation_TV.ini",
-                "MediaStation_TV.avd"
-            };
+            // Копируем все AVD (у каждого профиля Android TV свой <name>.ini +
+            // <name>.avd/) и ключи adb, не трогая системные образы. Раньше
+            // переносился только MediaStation_TV — остальные профили теряли данные.
+            QStringList avdItems = QDir(oldAvdPath).entryList(
+                {"*.ini", "*.avd", "adbkey", "adbkey.pub"},
+                QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
             bool anyOk = false;
             for (const QString &item : avdItems) {
                 const QString src = oldAvdPath + "/" + item;

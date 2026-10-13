@@ -10,6 +10,8 @@
 
 #include "core/IModule.h"
 #include <QObject>
+#include <QPointer>
+#include <QThread>
 #include <QString>
 #include <QVariantMap>
 
@@ -113,6 +115,10 @@ private:
 
     CoverFetcher   *m_coverFetcher   = nullptr;
     TrailerFetcher *m_trailerFetcher = nullptr;
+    // Рабочие потоки фетчеров — нужно дождаться их в shutdown(), иначе
+    // QThread уничтожается работающим (аварийное завершение при выходе)
+    QPointer<QThread> m_coverThread;
+    QPointer<QThread> m_trailerThread;
 
     EventBus        *m_bus      = nullptr;
     SettingsManager *m_settings = nullptr;

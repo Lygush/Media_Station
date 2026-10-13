@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QSaveFile>
 #include <QDir>
+#include <QFileInfo>
 #include <QProcess>
 #include <QThread>
 #include <QJsonObject>
@@ -69,10 +70,15 @@ JoystickModule::~JoystickModule()
 
 void JoystickModule::initialize(EventBus *bus, SettingsManager *)
 {
-    m_ds4ExePath  = QCoreApplication::applicationDirPath()
-    + "/tools/DS4Windows/DS4Windows.exe";
-    m_ds4CmdPath  = QCoreApplication::applicationDirPath()
-                   + "/tools/DS4Windows/DS4WindowsCmd.exe";
+    // В репозитории папка называется DS4-Windows (external_tools/DS4-Windows),
+    // а код искал только tools/DS4Windows — поддерживаем оба варианта
+    const QString appDir = QCoreApplication::applicationDirPath();
+    QString ds4Dir = appDir + "/tools/DS4Windows";
+    for (const QString &candidate : {appDir + "/tools/DS4Windows", appDir + "/tools/DS4-Windows"}) {
+        if (QFile::exists(candidate + "/DS4Windows.exe")) { ds4Dir = candidate; break; }
+    }
+    m_ds4ExePath  = ds4Dir + "/DS4Windows.exe";
+    m_ds4CmdPath  = ds4Dir + "/DS4WindowsCmd.exe";
     m_dataDirPath = QCoreApplication::applicationDirPath() + "/data";
     m_bus = bus;
 
@@ -446,9 +452,30 @@ QVariantList JoystickModule::controllers() const
 
 // ── Профили ───────────────────────────────────────────────────────────────────
 
-void JoystickModule::loadProfile(const QString &profileName) const
+void JoystickModule::loadProfile(const QString &requestedProfile) const
 {
     if (m_controllers.isEmpty()) return;
+
+    // Профиля "XInput" в комплекте нет (есть DS4.xml и Default.xml, где Default —
+    // эмуляция X360, т.е. XInput). Запрос несуществующего профиля DS4Windows
+    // молча игнорировал, и у XInput-игр оставался прежний (например DS4) профиль.
+    QString profileName = requestedProfile;
+    const QString ds4Dir = QFileInfo(m_ds4ExePath).absolutePath();
+    const QStringList profileDirs = {
+        ds4Dir + "/Profiles",
+        QDir::homePath() + "/AppData/Roaming/DS4Windows/Profiles"
+    };
+    bool exists = false, anyDir = false;
+    for (const QString &d : profileDirs) {
+        if (QDir(d).exists()) anyDir = true;
+        if (QFile::exists(d + "/" + profileName + ".xml")) { exists = true; break; }
+    }
+    // Если папку профилей найти не удалось — не угадываем, шлём как есть
+    if (anyDir && !exists && profileName != QLatin1String(kProfileDefault)) {
+        qDebug() << "[Joystick] Profile" << profileName << "not found, using" << kProfileDefault;
+        profileName = QString::fromLatin1(kProfileDefault);
+    }
+
     for (const ControllerInfo &c : m_controllers) {
         const QString cmd = QString("LoadProfile.%1.%2").arg(c.slot).arg(profileName);
         QThreadPool::globalInstance()->start([this, cmd]() { runCmdSync(cmd); });

@@ -2,6 +2,7 @@
 #include "AtomicFile.h"
 
 #include <QFile>
+#include <QSaveFile>
 #include <QJsonDocument>
 #include <QDebug>
 
@@ -11,36 +12,23 @@ namespace AtomicFile {
 
 static bool writeImpl(const QString &path, const QByteArray &data)
 {
-    const QString tmpPath = path + QStringLiteral(".tmp");
-
-    // 1. Пишем во временный файл
-    QFile tmp(tmpPath);
-    if (!tmp.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "AtomicFile: cannot open for writing:" << tmpPath
-                   << "—" << tmp.errorString();
+    // QSaveFile пишет во временный файл и заменяет оригинал атомарно
+    // (MoveFileEx/rename). Раньше было remove() + rename(): при сбое между
+    // ними (выключение питания, антивирус держит файл) оригинал терялся.
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) {
+        qWarning() << "AtomicFile: cannot open for writing:" << path << "—" << f.errorString();
         return false;
     }
-
-    const qint64 written = tmp.write(data);
-    tmp.close();
-
-    if (written != data.size()) {
-        qWarning() << "AtomicFile: partial write to" << tmpPath
-                   << "(wrote" << written << "of" << data.size() << "bytes)";
-        QFile::remove(tmpPath);
+    if (f.write(data) != data.size()) {
+        qWarning() << "AtomicFile: partial write to" << path << "—" << f.errorString();
+        f.cancelWriting();
         return false;
     }
-
-    // 2. Удаляем оригинал если есть, переименовываем tmp → оригинал
-    if (QFile::exists(path))
-        QFile::remove(path);
-
-    if (!QFile::rename(tmpPath, path)) {
-        qWarning() << "AtomicFile: rename failed:" << tmpPath << "→" << path;
-        QFile::remove(tmpPath);
+    if (!f.commit()) {
+        qWarning() << "AtomicFile: commit failed for" << path << "—" << f.errorString();
         return false;
     }
-
     return true;
 }
 

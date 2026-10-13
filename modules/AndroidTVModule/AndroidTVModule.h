@@ -4,6 +4,7 @@
 #include "core/IModule.h"
 #include <QObject>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QTimer>
 #include <QString>
 #include <QStringList>
@@ -34,7 +35,7 @@ struct AndroidTVProfile {
     QString id;
     QString name;
     QString avdName;
-    QString systemImagePath;          // relative to appDir
+    QString systemImagePath;          // относительно appDir или абсолютный путь к папке образа
     QString resolution;
     QString gpu;
     int     ramMb                     = 2048;
@@ -55,6 +56,7 @@ class AndroidTVProfileManager : public QAbstractListModel
     Q_PROPERTY(int count READ count NOTIFY countChanged)
     Q_PROPERTY(QString activeProfileId READ activeProfileId NOTIFY activeProfileIdChanged)
     Q_PROPERTY(QVariantMap currentProfileData READ currentProfileData NOTIFY currentProfileDataChanged)
+    Q_PROPERTY(bool locked READ isLocked NOTIFY lockedChanged)
 
 public:
     enum Roles {
@@ -102,18 +104,37 @@ public:
 
     void load(const QString &baseDir);
 
+    // Папка AVD. Задаётся модулем после определения фактического расположения
+    // (см. AndroidTVModule::resolveAvdHome()).
+    void setAvdHome(const QString &avdHome) { m_avdHome = avdHome; }
+    QString avdHome() const;
+
+    // Абсолютный путь к папке системного образа профиля.
+    QString systemImageDir(const AndroidTVProfile &p) const;
+
+    // Пока эмулятор запущен, нельзя менять активный профиль и удалять его данные.
+    void setLocked(bool locked);
+    bool isLocked() const { return m_locked; }
+
 signals:
     void countChanged();
     void activeProfileIdChanged();
     void profilesChanged();
     void currentProfileDataChanged();
+    void lockedChanged();
 
 private:
     QString generateId() const;
     QString profilesFilePath() const;
+    QString makeUniqueAvdName(const QString &base) const;
+    QString normalizeImagePath(const QString &path) const;
+    QVariantMap profileToMap(const AndroidTVProfile &p) const;
+    AndroidTVProfile makeDefaultProfile() const;
     QList<AndroidTVProfile> m_profiles;
     QString m_activeProfileId;
     QString m_baseDir;
+    QString m_avdHome;
+    bool    m_locked = false;
 };
 
 class AndroidTVModule : public QObject, public IModule
@@ -121,6 +142,8 @@ class AndroidTVModule : public QObject, public IModule
     Q_OBJECT
     Q_PROPERTY(bool    booting  READ isBooting  NOTIFY bootingChanged)
     Q_PROPERTY(bool    running  READ isRunning  NOTIFY runningChanged)
+    // active — окно эмулятора сейчас показано пользователю (MediaStation прозрачен)
+    Q_PROPERTY(bool    active   READ isActive   NOTIFY activeChanged)
     Q_PROPERTY(QString status   READ status     NOTIFY statusChanged)
     Q_PROPERTY(bool    switching READ isSwitching NOTIFY switchingChanged)
     Q_PROPERTY(qint64  qcow2SizeMb READ qcow2SizeMb NOTIFY qcow2SizeMbChanged)
@@ -140,12 +163,15 @@ public:
 
     bool    isBooting()   const { return m_booting;   }
     bool    isRunning()   const { return m_running;    }
+    bool    isActive()    const { return m_emulatorShown; }
     bool    isSwitching() const { return m_switching;  }
     QString status()      const { return m_status;     }
     qint64  qcow2SizeMb() const { return m_qcow2SizeMb; }
     AndroidTVProfileManager* profileManager() const { return m_profileManager; }
 
+#ifdef Q_OS_WIN
     void setMediaStationHwnd(HWND hwnd) { m_mediaStationHwnd = hwnd; }
+#endif
 
 public slots:
     Q_INVOKABLE void launch();
@@ -159,6 +185,7 @@ public slots:
 signals:
     void bootingChanged();
     void runningChanged();
+    void activeChanged();
     void statusChanged();
     void switchingChanged();
     void bootCompleted();
@@ -168,51 +195,83 @@ signals:
     void qcow2SizeMbChanged();
 
 private:
+    // ── Жизненный цикл ───────────────────────────────────────────────────────
     void startDnsProxy();
     void startEmulator();
     void stopDnsProxy();
     void startBootPolling();
     void stopBootPolling();
+    void onBootCompleted();
+    void onEmulatorFinished(int exitCode);
+    void failLaunch(const QString &userStatus, const QString &logMessage);
     void startWindowPolling();
     void stopWindowPolling();
-    void adb(const QStringList &args, std::function<void(QString)> callback = {});
+
+    // adbRaw — без привязки к устройству (kill-server / start-server),
+    // adb    — к нашему эмулятору (-s emulator-<port>).
+    void adbRaw(const QStringList &args, std::function<void(QString)> callback = {},
+                int timeoutMs = 10000);
+    void adb(const QStringList &args, std::function<void(QString)> callback = {},
+             int timeoutMs = 10000);
+    QProcessEnvironment toolsEnvironment() const;
+    QString adbSerial() const { return QStringLiteral("emulator-%1").arg(m_consolePort); }
+    int  pickFreeConsolePort() const;
+
     void restoreMediaStation();
     void applyBlocklist();
+
+    // ── AVD ──────────────────────────────────────────────────────────────────
+    QString resolveAvdHome() const;
+    bool ensureAvdExists(const AndroidTVProfile &profile);
     bool patchAvdIni(const AndroidTVProfile &profile);
     void loadEmulatorSettings(const AndroidTVProfile &profile);
     void patchAvdConfig(const AndroidTVProfile &profile, const QString &resolutionOverride = QString());
+    void removeAvdLocks(const QString &avdDirPath);
+    void syncAdbKeyAndRestartServer(const QString &avdName, std::function<void()> onReady = {});
+    void syncAdbKeys(const QString &avdName);
 
+    // ── Окна ─────────────────────────────────────────────────────────────────
     void setMediaStationOpacity(int alpha);
     void forceMediaStationTopmost();
+    void releaseMediaStationTopmost();   // HWND_NOTOPMOST: игры и другие окна снова могут быть сверху
     void startKeepTopmostTimer();
     void stopKeepTopmostTimer();
     void startPositionSyncTimer();
     void stopPositionSyncTimer();
-
-    void hideExtraEmulatorWindows(DWORD pid, HWND mainHwnd);
-    void positionEmulatorBehindMediaStation(HWND hwnd);
+    void setEmulatorShown(bool shown);
     void updateEmulatorPosition();
 
     void killEmulatorTree();
     void cleanupAvdLocks();
-    void cleanupAvdForProfile(const QString &avdName);
 
+    // ── Логи ─────────────────────────────────────────────────────────────────
     void logImportant(const char *level, const QString &msg);
     void logToEmulatorFile(const QString &msg, bool fromEmulator = false);
     void openEmulatorLogFile();
     void closeEmulatorLogFile();
 
+    // ── Ввод ─────────────────────────────────────────────────────────────────
     void handleRemoteKey(const QString &key);
     static int remoteKeyToAndroidKeyCode(const QString &key);
     void notifyKeyMode(bool emulatorActive);
+    void sendAndroidKey(int keyCode);
+    void startKeyShell();
+    void stopKeyShell();
 
-    HWND findEmulatorWindowByTitle() const;
+#ifdef Q_OS_WIN
+    void hideExtraEmulatorWindows(DWORD pid, HWND mainHwnd);
+    void positionEmulatorBehindMediaStation(HWND hwnd);
+    bool isEmulatorProcess(DWORD pid) const;
+    bool isEmulatorMainWindow(HWND hwnd) const;
+    HWND findEmulatorMainWindow(bool allowFallback) const;
     HWND findMediaStationWindow() const;
-    void installWinEventHook();
-    void removeWinEventHook();
+    QSize getCurrentScreenResolution() const;
     static void CALLBACK s_winEventProc(HWINEVENTHOOK hook, DWORD event,
                                         HWND hwnd, LONG idObject, LONG idChild,
                                         DWORD dwEventThread, DWORD dwmsEventTime);
+#endif
+    void installWinEventHook();
+    void removeWinEventHook();
     static AndroidTVModule *s_hookInstance;
 
     bool isSystemQcow2Valid(const AndroidTVProfile &profile);
@@ -222,10 +281,12 @@ private:
     void stopLogcat();
 
     QString m_appDir;
+    QString m_avdHome;
     QString adbPath()          const;
     QString emulatorPath()     const;
     QString dnsProxyPath()     const;
     QString avdHomePath()      const;
+    QString avdDirPath(const QString &avdName) const;
     QString blocklistPath()    const;
     QString jdkBinPath()       const;
     QString emulatorLogPath()  const;
@@ -246,6 +307,7 @@ private:
     void setBooting(bool v);
     void setRunning(bool v);
     void setSwitching(bool v);
+    void updateProfileLock();
 
     EventBus        *m_bus      = nullptr;
     SettingsManager *m_settings = nullptr;
@@ -259,18 +321,22 @@ private:
     QProcess *m_emulatorProcess = nullptr;
     QProcess *m_dnsProxyProcess = nullptr;
     int       m_dnsProxyPort    = 0;
+    int       m_consolePort     = 5554;
+    QString   m_launchAvdName;               // AVD, с которым запущен текущий эмулятор
     QTimer   *m_bootPollTimer   = nullptr;
     int       m_bootPollCount   = 0;
+    bool      m_bootPollInFlight = false;
     static constexpr int kBootPollIntervalMs = 2000;
-    static constexpr int kBootPollMaxTries   = 120;
+    static constexpr int kBootPollMaxTries   = 150;   // 5 минут
 
     QTimer   *m_windowPollTimer    = nullptr;
     QTimer   *m_keepTopmostTimer   = nullptr;
     QTimer   *m_positionSyncTimer  = nullptr;
     quint64   m_emulatorPid        = 0;
     quint64   m_initialEmulatorPid = 0;
-    static constexpr int kWindowPollIntervalMs = 50;
-    static constexpr int kWindowPollMaxTries   = 1200;
+    static constexpr int kWindowPollIntervalMs = 100;
+    static constexpr int kWindowPollMaxTries   = 3000;  // 5 минут
+    static constexpr int kWindowFallbackAfter  = 150;   // через 15 с ищем окно без проверки заголовка
 
     QFile       m_emulatorLogFile;
     QTextStream m_emulatorLogStream;
@@ -278,6 +344,8 @@ private:
     QFile       m_logcatLogFile;
     QTextStream m_logcatLogStream;
     QProcess   *m_logcatProcess = nullptr;
+
+    QProcess   *m_keyShell = nullptr;
 
     bool m_overlayOpen        = false;
     bool m_overlayCooldown    = false;
@@ -290,7 +358,6 @@ private:
     QTimer  *m_healthCheckTimer    = nullptr;
     static constexpr qint64 kMaxQcow2SizeMb = 3072;
 
-    void syncAdbKeyAndRestartServer(const QString &avdName, std::function<void()> onReady = {});
     void startHealthCheck();
     void stopHealthCheck();
 
@@ -301,6 +368,5 @@ private:
     HWND          m_emulatorHwnd     = nullptr;
     HWINEVENTHOOK m_winEventHook     = nullptr;
     bool          m_timerResolutionSet = false;
-    QSize getCurrentScreenResolution() const;
 #endif
 };

@@ -6,6 +6,7 @@
 #include "LoggerModule.h"
 
 #include <QDebug>
+#include <algorithm>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
@@ -91,7 +92,7 @@ LlamaClient::~LlamaClient()
 void LlamaClient::log(const char *level, const QString &message)
 {
     // Дублируем в qDebug/qWarning чтобы видеть в IDE даже без LoggerModule
-    if (level == Logger::kLevelError || level == Logger::kLevelWarning)
+    if (qstrcmp(level, Logger::kLevelError) == 0 || qstrcmp(level, Logger::kLevelWarning) == 0)
         qWarning() << "[LlamaClient]" << message;
     else
         qDebug()   << "[LlamaClient]" << message;
@@ -189,6 +190,9 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
         log(Logger::kLevelError, "runInference() called but client is not ready");
         return {};
     }
+    m_abort.store(false);
+    // KV-кэш мог остаться заполненным после прерванного/неудачного вызова
+    llama_kv_self_clear(m_ctx);
 
     // Универсальный chat template из метаданных GGUF.
     // QByteArray держим живыми до вызова llama_chat_apply_template —
@@ -251,11 +255,18 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
             .arg(nTokens).arg(kCtxSize).arg(kMaxTokens));
 
     if (nTokens > kCtxSize - kMaxTokens) {
-        const int truncated = kCtxSize - kMaxTokens;
+        // Раньше отрезался КОНЕЦ промпта — вместе с заголовком реплики ассистента
+        // (<|im_start|>assistant), и модель получала «битый» диалог. Теперь
+        // вырезаем середину (хвост источников), сохраняя начало и конец.
+        const int limit = kCtxSize - kMaxTokens;
+        const int keepTail = 256;
+        const int keepHead = limit - keepTail;
         log(Logger::kLevelWarning,
             QString("Prompt truncated: %1 → %2 tokens (would overflow context)")
-                .arg(nTokens).arg(truncated));
-        nTokens = truncated;
+                .arg(nTokens).arg(limit));
+        std::copy(tokens.begin() + (nTokens - keepTail), tokens.begin() + nTokens,
+                  tokens.begin() + keepHead);
+        nTokens = limit;
     }
     tokens.resize(nTokens);
 
@@ -263,6 +274,11 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
     const int n_batch    = 512;
     int       n_processed = 0;
     while (n_processed < nTokens) {
+        if (m_abort.load()) {
+            log(Logger::kLevelInfo, "runInference(): aborted during prompt decode");
+            llama_kv_self_clear(m_ctx);
+            return {};
+        }
         const int n_this = std::min(n_batch, nTokens - n_processed);
         llama_batch batch = llama_batch_get_one(tokens.data() + n_processed, n_this);
         if (llama_decode(m_ctx, batch) != 0) {
@@ -282,22 +298,48 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.4f));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(0));
 
-    const llama_token eosToken = llama_vocab_eos(vocab);
     QString result;
     int generatedTokens = 0;
 
+    // Токен BPE может содержать только ЧАСТЬ UTF-8 символа (кириллица — 2 байта).
+    // Раньше каждый токен декодировался отдельно → в русских описаниях
+    // появлялись символы «�». Копим байты и отдаём только завершённые символы.
+    QByteArray pendingBytes;
+    auto completeUtf8Prefix = [](const QByteArray &b) -> int {
+        int i = b.size();
+        // Ищем начало последнего символа (не continuation-байт 10xxxxxx)
+        int back = 0;
+        while (back < 4 && i - back - 1 >= 0 && (uchar(b[i - back - 1]) & 0xC0) == 0x80) ++back;
+        if (i - back - 1 < 0) return i;           // одни continuation-байты — отдаём как есть
+        const uchar lead = uchar(b[i - back - 1]);
+        int need = 1;
+        if      ((lead & 0xE0) == 0xC0) need = 2;
+        else if ((lead & 0xF0) == 0xE0) need = 3;
+        else if ((lead & 0xF8) == 0xF0) need = 4;
+        return (back + 1 >= need) ? i : i - back - 1;   // последний символ неполный — оставляем
+    };
+
     for (int i = 0; i < kMaxTokens; ++i) {
+        if (m_abort.load()) {
+            log(Logger::kLevelInfo, "runInference(): aborted during generation");
+            break;
+        }
         const llama_token newToken = llama_sampler_sample(sampler, m_ctx, -1);
 
-        if (newToken == eosToken) {
+        // EOG покрывает и eos, и <|im_end|>/<|eot_id|> разных шаблонов
+        if (llama_vocab_is_eog(vocab, newToken)) {
             log(Logger::kLevelInfo,
-                QString("EOS token reached after %1 generated tokens").arg(generatedTokens));
+                QString("End-of-generation token reached after %1 generated tokens").arg(generatedTokens));
             break;
         }
 
-        char buf[256] = {};
-        llama_token_to_piece(vocab, newToken, buf, sizeof(buf), 0, false);
-        const QString piece = QString::fromUtf8(buf);
+        char buf[256];
+        const int n = llama_token_to_piece(vocab, newToken, buf, sizeof(buf), 0, false);
+        if (n > 0) pendingBytes.append(buf, n);
+
+        const int ready = completeUtf8Prefix(pendingBytes);
+        const QString piece = QString::fromUtf8(pendingBytes.constData(), ready);
+        pendingBytes.remove(0, ready);
 
         if (piece.contains("<|im_end|>")) {
             log(Logger::kLevelInfo,
@@ -305,8 +347,10 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
             break;
         }
 
-        result += piece;
-        if (onToken) onToken(piece);
+        if (!piece.isEmpty()) {
+            result += piece;
+            if (onToken) onToken(piece);
+        }
         ++generatedTokens;
 
         llama_token tok = newToken;
@@ -322,6 +366,13 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
         log(Logger::kLevelWarning,
             QString("Generation hit kMaxTokens limit (%1) without stop token — "
                     "response may be truncated").arg(kMaxTokens));
+    }
+
+    // Остаток байт (если генерация оборвалась посреди символа)
+    if (!pendingBytes.isEmpty()) {
+        const QString tail = QString::fromUtf8(pendingBytes);
+        result += tail;
+        if (onToken) onToken(tail);
     }
 
     llama_sampler_free(sampler);

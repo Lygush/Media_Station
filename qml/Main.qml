@@ -34,7 +34,8 @@ Window {
             if (!OverlayModule) { root.goBack(); return }
             if (OverlayModule.visible) {
                 OverlayModule.hide()
-            } else if (AndroidTV?.running) {
+            } else if (AndroidTV?.active) {
+                // Оверлей Android TV — только когда эмулятор показан на экране
                 OverlayModule.show("androidtv")
             } else {
                 root.goBack()
@@ -326,7 +327,11 @@ Window {
         }
         onFinished: {
             if (AndroidTV?.running && !AndroidTV?.switching) {
+                // При неудаче C++ пошлёт emulatorRestoringMediaStation → затемнение уйдёт
                 AndroidTV.applyFullscreenAndSwitch()
+            } else if (!AndroidTV?.switching) {
+                // Эмулятор успел закрыться, пока шло затемнение — не оставляем чёрный экран
+                fadeInMediaCenter.start()
             }
             root.emulatorFadeInProgress = false
         }
@@ -381,6 +386,7 @@ Window {
 
         function onEmulatorRestoringMediaStation() {
             if (root.gameRunning) return
+            if (fadeInMediaCenter.running) return   // сигнал может прийти дважды (stop + exit)
             if (transitionOverlay.opacity > 0 || fadeToBlackEmulator.running) {
                 fadeToBlackEmulator.stop()
                 fadeInMediaCenter.start()
@@ -404,7 +410,8 @@ Window {
         }
 
         function onSearchPressed() {
-            console.log("Search pressed — feature not implemented yet")
+            // Кнопка «Поиск» на пульте — быстрый переход в библиотеку игр
+            if (!root.settingsOpen && !root.libraryOpen) root.openLibraryScreen()
         }
 
         function onMenuPressed() {
@@ -423,6 +430,14 @@ Window {
     }
 
     function launchGame(path, tileId) {
+        // Отслеживаются (затемнение, скрытие панели задач, ожидание окна) только
+        // игры, запускаемые через launch.ps1. Ссылки, .exe и прочие ярлыки
+        // AppController просто открывает — раньше для них экран оставался
+        // затемнённым до срабатывания watchdog (20 с).
+        if (!String(path || "").toLowerCase().endsWith(".ps1")) {
+            AppController.launch(path, tileId)
+            return
+        }
         root.launchingTileId = tileId
         root.gameLaunching   = true
         AppController.showBlackOverlay()

@@ -66,6 +66,17 @@ void GameMediaModule::shutdown()
         m_coverFetcher->cancel();
     if (m_trailerFetcher)
         m_trailerFetcher->cancel();
+
+    // Дожидаемся потоков (HttpClient реагирует на отмену за ~100 мс, ffmpeg убивается)
+    for (QThread *t : {m_coverThread.data(), m_trailerThread.data()}) {
+        if (!t) continue;
+        t->quit();
+        if (!t->wait(5000)) {
+            qWarning() << "GameMediaModule: fetch thread did not stop, terminating";
+            t->terminate();
+            t->wait(1000);
+        }
+    }
 }
 
 // ── Публичный API (QML + EventBus) ───────────────────────────────────────────
@@ -118,11 +129,16 @@ void GameMediaModule::startFetch(const QString &tileId,
     // ── CoverFetcher в потоке ─────────────────────────────────────────────────
     {
         auto *thread = new QThread(this);
-        m_coverFetcher = new CoverFetcher();
-        m_coverFetcher->moveToThread(thread);
+        m_coverThread = thread;
+        auto *fetcher = new CoverFetcher();
+        m_coverFetcher = fetcher;
+        fetcher->moveToThread(thread);
 
-        connect(thread, &QThread::started, this, [this, mediaDir, steamAppId]() {
-            m_coverFetcher->fetch(mediaDir, steamAppId);
+        // Контекст — сам fetcher (живёт в рабочем потоке). Раньше контекстом был
+        // this (GUI-поток), и вся блокирующая загрузка выполнялась в GUI —
+        // интерфейс замирал на время скачивания обложек и трейлера.
+        connect(thread, &QThread::started, fetcher, [fetcher, mediaDir, steamAppId]() {
+            fetcher->fetch(mediaDir, steamAppId);
         });
         connect(m_coverFetcher, &CoverFetcher::finished,
                 this,           &GameMediaModule::onCoversDone,
@@ -140,11 +156,13 @@ void GameMediaModule::startFetch(const QString &tileId,
     // ── TrailerFetcher в потоке ───────────────────────────────────────────────
     {
         auto *thread = new QThread(this);
-        m_trailerFetcher = new TrailerFetcher();
-        m_trailerFetcher->moveToThread(thread);
+        m_trailerThread = thread;
+        auto *fetcher = new TrailerFetcher();
+        m_trailerFetcher = fetcher;
+        fetcher->moveToThread(thread);
 
-        connect(thread, &QThread::started, this, [this, mediaDir, steamAppId]() {
-            m_trailerFetcher->fetch(mediaDir, steamAppId);
+        connect(thread, &QThread::started, fetcher, [fetcher, mediaDir, steamAppId]() {
+            fetcher->fetch(mediaDir, steamAppId);
         });
         connect(m_trailerFetcher, &TrailerFetcher::finished,
                 this,             &GameMediaModule::onTrailerDone,
@@ -247,7 +265,7 @@ void GameMediaModule::checkAllDone()
         QVariantMap eventData = media;
         eventData["tileId"]        = m_currentTileId;
         eventData["installFolder"] = m_currentInstallFolder;
-        emit m_bus->moduleEvent("gamemedia", "fetched", eventData);
+        if (m_bus) emit m_bus->moduleEvent("gamemedia", "fetched", eventData);
 
         notify("Медиа успешно загружены.");
     } else {
@@ -284,6 +302,7 @@ void GameMediaModule::saveToGameInfo(const QString &installFolder,
         obj["backdropPath"] = backdropPath;
     if (!trailerPath.isEmpty())
         obj["trailerPath"] = trailerPath;
+    obj["mediaFetched"] = true;
 
     if (!AtomicFile::writeJson(infoPath, QJsonDocument(obj)))
         qWarning() << "GameMediaModule: failed to update game_info.json at" << infoPath;

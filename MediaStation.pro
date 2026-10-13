@@ -150,6 +150,7 @@ win32: CONFIG += windows
 win32: LIBS += -luser32
 win32: LIBS += -lWindowsApp
 win32: LIBS += -lwinmm
+win32: LIBS += -ldwmapi   # DwmFlush (AndroidTVModule); #pragma comment работает только в MSVC
 
 # ==================== Прочее ====================
 DISTFILES +=

@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QAtomicPointer>
 
 // ---------- LoggerWorker ----------
 LoggerWorker::LoggerWorker(QObject *parent)
@@ -31,6 +32,14 @@ void LoggerWorker::setLogFilePath(const QString &path)
             qWarning() << "LoggerWorker: cannot create log directory" << dir.absolutePath();
             return;
         }
+    }
+
+    // Ротация: раньше MediaStation.log дописывался бесконечно
+    static constexpr qint64 kMaxLogSize = 10 * 1024 * 1024;
+    if (QFileInfo(path).size() > kMaxLogSize) {
+        const QString old = path + ".1";
+        QFile::remove(old);
+        QFile::rename(path, old);
     }
 
     m_file.setFileName(path);
@@ -66,6 +75,22 @@ void LoggerWorker::stop()
     }
 }
 
+// ---------- Перехват qWarning/qCritical ----------
+// Предупреждения Qt (ошибки QML, сетевые ошибки и т.п.) раньше были видны только
+// в отладчике. Теперь они дублируются в MediaStation.log.
+static QAtomicPointer<LoggerModule> s_logInstance;
+static QtMessageHandler s_prevHandler = nullptr;
+
+static void loggerMessageHandler(QtMsgType type, const QMessageLogContext &ctx, const QString &msg)
+{
+    if (s_prevHandler) s_prevHandler(type, ctx, msg);
+    if (type == QtDebugMsg || type == QtInfoMsg) return;   // не засоряем файл
+    LoggerModule *inst = s_logInstance.loadAcquire();
+    if (!inst) return;
+    const char *lvl = (type == QtWarningMsg) ? "warning" : "error";
+    inst->log(QString::fromLatin1(lvl), QStringLiteral("qt"), msg);
+}
+
 // ---------- LoggerModule ----------
 LoggerModule::LoggerModule(QObject *parent)
     : QObject(parent)
@@ -96,11 +121,18 @@ void LoggerModule::initialize(EventBus *bus, SettingsManager *settings)
     // Безопасный вызов слота в потоке воркера
     QMetaObject::invokeMethod(m_worker, "setLogFilePath", Qt::QueuedConnection, Q_ARG(QString, m_logFilePath));
 
+    s_logInstance.storeRelease(this);
+    s_prevHandler = qInstallMessageHandler(loggerMessageHandler);
+
     qDebug() << "LoggerModule initialized, log file:" << m_logFilePath;
 }
 
 void LoggerModule::shutdown()
 {
+    if (s_logInstance.loadAcquire() == this) {
+        s_logInstance.storeRelease(nullptr);
+        qInstallMessageHandler(s_prevHandler);
+    }
     if (m_worker) {
         // Блокирующий вызов stop() гарантирует завершение записи до выхода
         QMetaObject::invokeMethod(m_worker, "stop", Qt::BlockingQueuedConnection);

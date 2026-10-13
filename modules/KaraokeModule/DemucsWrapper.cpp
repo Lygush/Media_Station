@@ -390,6 +390,10 @@ bool DemucsWrapper::readWav(const QString &path,
         return false;
     }
 
+    // Размер data-чанка может быть больше фактического (недописанный файл или
+    // 0xFFFFFFFF у потоковой записи) — не читаем за пределами буфера
+    if (dataSize < 0 || dataOffset + dataSize > len)
+        dataSize = len - dataOffset;
     const int nSamples = dataSize / (channels * 2);
     left.resize(nSamples);
     right.resize(nSamples);
@@ -406,7 +410,7 @@ bool DemucsWrapper::writeWav(const QString &path,
                               const QVector<float> &right,
                               int sampleRate)
 {
-    const int nSamples  = left.size();
+    const int nSamples  = qMin(left.size(), right.size());
     const int dataSize  = nSamples * 4;
     const int totalSize = 44 + dataSize;
 

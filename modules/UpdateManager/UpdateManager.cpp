@@ -162,18 +162,23 @@ QString UpdateManager::prepareTempUpdater()
         return QString();
     }
 
-    // Копируем папку tools во временную папку (чтобы 7zr.exe был рядом с Updater)
+    // Updater'у из tools нужен только архиватор (UpdaterWindow ищет tools/7zr.exe).
+    // Раньше копировалась ВСЯ папка tools — Android SDK, JDK, системные образы
+    // (гигабайты) — обновление шло десятки минут и могло переполнить диск.
     const QString toolsSrc = m_appDir + "/tools";
     const QString toolsDst = dstUpdaterDir + "/tools";
-    if (QDir(toolsSrc).exists()) {
-        if (!copyDirectory(toolsSrc, toolsDst)) {
-            qWarning() << "[UpdateManager] Failed to copy tools folder, 7zr.exe may not be found";
-        } else {
-            qDebug() << "[UpdateManager] Tools folder copied to temp.";
-        }
-    } else {
-        qDebug() << "[UpdateManager] tools folder not found at" << toolsSrc;
+    QDir().mkpath(toolsDst);
+    int copied = 0;
+    for (const QString &name : {QStringLiteral("7zr.exe"), QStringLiteral("7z.exe"), QStringLiteral("7z.dll")}) {
+        const QString src = toolsSrc + "/" + name;
+        if (!QFile::exists(src)) continue;
+        QFile::remove(toolsDst + "/" + name);
+        if (QFile::copy(src, toolsDst + "/" + name)) ++copied;
+        else qWarning() << "[UpdateManager] Failed to copy" << src;
     }
+    if (copied == 0)
+        qWarning() << "[UpdateManager] 7zr.exe not found in" << toolsSrc
+                   << "— Updater will fall back to the target dir";
 
     qDebug() << "[UpdateManager] Prepared temp updater at:" << dstUpdaterDir;
     return tempDir; // возвращаем корень временной папки

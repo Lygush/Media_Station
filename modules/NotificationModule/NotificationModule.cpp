@@ -63,6 +63,18 @@ void NotificationModule::shutdown()
 
 void NotificationModule::enqueue(const NotificationItem &item)
 {
+    // Одинаковые сообщения подряд (например, повторяющиеся ошибки сети) не
+    // копим — иначе пользователю приходилось закрывать десятки копий
+    if (m_visible && m_current.message == item.message && m_current.level == item.level)
+        return;
+    for (const NotificationItem &q : std::as_const(m_queue))
+        if (q.message == item.message && q.level == item.level) return;
+    static constexpr int kMaxQueue = 20;
+    if (m_queue.size() >= kMaxQueue) {
+        qWarning() << "NotificationModule: queue full, dropping:" << item.message;
+        return;
+    }
+
     if (!m_visible) {
         // Ничего не показывается — показываем немедленно.
         m_current = item;

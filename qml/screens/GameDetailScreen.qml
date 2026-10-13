@@ -58,6 +58,14 @@ Item {
     }
 
     Component.onCompleted: loadLocalMetadata()
+    // Ушли со страницы, пока GameInfoModule ждёт выбора игры в базе Steam, —
+    // выбираем «Пропустить», иначе фоновая загрузка висела бы и блокировала
+    // последующие запросы описания.
+    Component.onDestruction: {
+        if (typeof GameInfoModule !== "undefined" && GameInfoModule
+                && GameInfoModule.stage === "db_select")
+            GameInfoModule.selectCandidate(root._tileId, "")
+    }
 
     // ── Connections: GameInfoModule ───────────────────────────────────────────
     Connections {

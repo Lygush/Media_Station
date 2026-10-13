@@ -1,6 +1,7 @@
 // settings/AndroidTvSettings.qml
 import QtQuick
 import QtQuick.Dialogs
+import QtQuick.Window
 import AppSettings 1.0
 import "../base"
 
@@ -23,7 +24,7 @@ Item {
             profileData = {
                 displayName:    raw.displayName    || "",
                 cores:          (typeof raw.cores   === "number") ? raw.cores   : 4,
-                ramMb:          (typeof raw.ramMb   === "number") ? raw.ramMb   : 4096,
+                ramMb:          (typeof raw.ramMb   === "number") ? raw.ramMb   : 2048,
                 resolution:     (typeof raw.resolution   === "string") ? raw.resolution   : "auto",
                 audioDriver:    (typeof raw.audioDriver  === "string") ? raw.audioDriver  : "dsound",
                 audioTimerMs:   (typeof raw.audioTimerMs === "string" || typeof raw.audioTimerMs === "number")
@@ -33,7 +34,7 @@ Item {
             }
         } else {
             profileData = {
-                displayName: "", cores: 4, ramMb: 4096, resolution: "auto",
+                displayName: "", cores: 4, ramMb: 2048, resolution: "auto",
                 audioDriver: "dsound", audioTimerMs: "auto", dsoundLatencyMs: "auto"
             }
         }
@@ -47,6 +48,7 @@ Item {
     }
 
     Component.onCompleted: {
+        if (AndroidTV) AndroidTV.refreshQcow2Size()
         if (AndroidTV && AndroidTV.profileManager)
             currentProfileId = AndroidTV.profileManager.activeProfileId
         refreshProfileData()
@@ -96,10 +98,94 @@ Item {
         anchors.fill: parent
         visible: root.subView !== "tiles"
 
-        Rectangle {
-            anchors.fill: parent; color: "transparent"
+        // ── Общие: состояние эмулятора, запуск/остановка, сброс данных ────────
+        Column {
             visible: root.subView === "common"
-            Text { anchors.centerIn: parent; text: "Common settings placeholder"; color: "white" }
+            anchors.fill: parent
+            anchors.margins: Settings.us(24)
+            spacing: 0
+
+            SettingsRow {
+                label: Settings.tr("atv_status")
+                Text {
+                    anchors.verticalCenter: parent ? parent.verticalCenter : undefined
+                    text: {
+                        if (!AndroidTV) return ""
+                        if (AndroidTV.running) return Settings.tr("atv_state_running")
+                        if (AndroidTV.booting) return Settings.tr("atv_state_booting")
+                        // Ошибка последнего запуска (если была)
+                        if (AndroidTV.status && AndroidTV.status.length > 0) return AndroidTV.status
+                        return Settings.tr("atv_state_stopped")
+                    }
+                    color: AndroidTV && AndroidTV.running ? Settings.accent(1.0) : "#CCFFFFFF"
+                    font.pixelSize: Settings.fs(13)
+                    elide: Text.ElideRight
+                    width: Math.min(implicitWidth, Settings.us(420))
+                }
+            }
+            SectionDivider {}
+
+            SettingsRow {
+                label: Settings.tr("atv_emulator")
+                Row {
+                    spacing: Settings.us(10)
+                    StyledButton {
+                        height: Settings.us(36)
+                        text: Settings.tr("atv_start")
+                        role: "primary"
+                        enabled: AndroidTV && !AndroidTV.running && !AndroidTV.booting
+                        opacity: enabled ? 1.0 : 0.4
+                        onClicked: if (enabled) AndroidTV.launch()
+                    }
+                    StyledButton {
+                        height: Settings.us(36)
+                        text: Settings.tr("atv_stop")
+                        role: "danger"
+                        enabled: AndroidTV && (AndroidTV.running || AndroidTV.booting)
+                        opacity: enabled ? 1.0 : 0.4
+                        onClicked: if (enabled) AndroidTV.stop()
+                    }
+                }
+            }
+            SectionDivider {}
+
+            SettingsRow {
+                label: Settings.tr("atv_user_data")
+                Row {
+                    spacing: Settings.us(12)
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                            var mb = AndroidTV ? AndroidTV.qcow2SizeMb : -1
+                            if (mb < 0) return Settings.safeTr("qcow2_not_found")
+                            return mb < 1024 ? (mb + " MB") : ((mb / 1024).toFixed(1) + " GB")
+                        }
+                        color: "white"; font.pixelSize: Settings.fs(13)
+                    }
+                    StyledButton {
+                        height: Settings.us(36)
+                        text: Settings.tr("atv_reset_data")
+                        role: "danger"
+                        enabled: AndroidTV && !AndroidTV.running && !AndroidTV.booting
+                        opacity: enabled ? 1.0 : 0.4
+                        onClicked: {
+                            if (!enabled) return
+                            var pd = Window.window ? Window.window.promptDialog : null
+                            if (!pd) { AndroidTV.resetQcow2(); return }
+                            pd.show({
+                                title:   Settings.tr("atv_reset_data"),
+                                message: Settings.tr("atv_reset_confirm"),
+                                buttons: [
+                                    { label: Settings.safeTr("delete"), role: "danger",
+                                      action: function() { AndroidTV.resetQcow2() } },
+                                    { label: Settings.safeTr("cancel"), role: "primary",
+                                      action: function() {} }
+                                ]
+                            })
+                        }
+                    }
+                }
+            }
         }
 
         Column {
@@ -134,13 +220,12 @@ Item {
     FileDialog {
         id: imageFileDialog
         title: Settings.safeTr("select_system_image")
-        nameFilters: ["Image files (*.img *.iso *.qcow2)", "All files (*)"]
+        nameFilters: ["System image (system.img)", "Image files (*.img)", "All files (*)"]
         onAccepted: {
-            var path = selectedFile.toString().replace(/^file:\/\/\//, "")
-            if (path.length > 0 && path[1] !== ":") path = "/" + path
+            // C++ сам разбирает file:-URL и берёт папку выбранного system.img
             if (AndroidTV && AndroidTV.profileManager) {
-                AndroidTV.profileManager.addProfile(path, "")
-                root.currentProfileId = AndroidTV.profileManager.activeProfileId
+                var newId = AndroidTV.profileManager.addProfile(selectedFile.toString(), "")
+                if (newId) root.currentProfileId = newId
             }
         }
     }
@@ -150,8 +235,9 @@ Item {
         id: imagePickerPopup
         onProfileAdded: function(imagePath, profileName) {
             if (AndroidTV && AndroidTV.profileManager) {
-                AndroidTV.profileManager.addProfile(imagePath, profileName)
-                root.currentProfileId = AndroidTV.profileManager.activeProfileId
+                // Открываем только что созданный профиль, а не активный
+                var newId = AndroidTV.profileManager.addProfile(imagePath, profileName)
+                if (newId) root.currentProfileId = newId
             }
         }
         onBrowseRequested: imageFileDialog.open()

@@ -91,8 +91,12 @@ QString GameInfoFetcher::fetchLocalAppInfo(const QString &normalizedTitle, QStri
 
 QString GameInfoFetcher::simplifyTitle(const QString &s)
 {
+    // UseUnicodePropertiesOption: без него \\w — только ASCII, и кириллические
+    // названия вычищались целиком (сходство всегда 0)
+    static const QRegularExpression kNonWordRe(QStringLiteral("[^\\w\\d\\s]"),
+                                               QRegularExpression::UseUnicodePropertiesOption);
     QString r = s.toLower();
-    r.remove(QRegularExpression("[^\\w\\d\\s]"));
+    r.remove(kNonWordRe);
     return r.simplified();
 }
 

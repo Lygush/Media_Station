@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QDebug>
+#include <QStandardPaths>
 
 namespace SevenZip {
 
@@ -26,6 +27,10 @@ QString findBinary()
         return sevenZ;
 
     // Фолбэк: ищем в PATH
+    for (const char *name : {"7zr", "7z"}) {
+        const QString found = QStandardPaths::findExecutable(QString::fromLatin1(name));
+        if (!found.isEmpty()) return found;
+    }
     return QStringLiteral("7zr");
 }
 
@@ -74,32 +79,34 @@ static Result runProcess(const QString          &binary,
 
         if (!onProgress) continue;
 
-        // Читаем stdout — 7zr пишет прогресс туда при -bsp1
-        const QString out = QString::fromUtf8(proc.readAllStandardOutput());
-        for (const QString &line : out.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        // Читаем stdout — 7zr пишет прогресс туда при -bsp1.
+        // Прогресс перерисовывается на месте через '\b'/'\r', а не '\n' —
+        // поэтому режем по всем трём и берём ПОСЛЕДНЕЕ значение в порции
+        // (раньше бралось первое, и прогресс сильно отставал).
+        const QString out = QString::fromLocal8Bit(proc.readAllStandardOutput());
+        int lastPercent = -1;
+        QString lastFile;
+        static const QRegularExpression kSplitRe(QStringLiteral("[\\r\\n\\x08]+"));
+        for (const QString &line : out.split(kSplitRe, Qt::SkipEmptyParts)) {
             const QRegularExpressionMatch m = kProgressRe.match(line);
             if (!m.hasMatch()) continue;
-
-            const int percent = m.captured(1).toInt();
+            lastPercent = m.captured(1).toInt();
 
             // Текущий файл идёт после "+ " в строке прогресса архивации
-            QString currentFile;
+            lastFile.clear();
             const int plusIdx = line.indexOf(QLatin1Char('+'));
             if (plusIdx >= 0)
-                currentFile = line.mid(plusIdx + 2).trimmed();
-
-            onProgress(percent, currentFile);
+                lastFile = line.mid(plusIdx + 2).trimmed();
         }
+        if (lastPercent >= 0)
+            onProgress(lastPercent, lastFile);
     }
 
     // Читаем оставшийся вывод после завершения
     if (onProgress) {
-        const QString tail = QString::fromUtf8(proc.readAllStandardOutput());
-        for (const QString &line : tail.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
-            const QRegularExpressionMatch m = kProgressRe.match(line);
-            if (m.hasMatch())
-                onProgress(m.captured(1).toInt(), {});
-        }
+        proc.readAllStandardOutput();
+        if (proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0)
+            onProgress(100, {});
     }
 
     const int exitCode = proc.exitCode();

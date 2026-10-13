@@ -1,4 +1,6 @@
 // modules/AndroidTVModule/AndroidTVLifecycle.cpp
+//
+// Запуск / остановка эмулятора, подготовка AVD, взаимодействие с adb.
 
 #include "AndroidTVModule.h"
 #include "LoggerModule.h"
@@ -10,13 +12,18 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHostAddress>
+#include <QMap>
+#include <QSet>
+#include <QTcpServer>
 #include <QTextStream>
+#include <QTimeZone>
 #include <QTimer>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QDebug>
-#include <QThread>
 #include <QRegularExpression>
+#include <memory>
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -37,7 +44,12 @@ QString AndroidTVModule::dnsProxyPath() const
 
 QString AndroidTVModule::avdHomePath() const
 {
-    return m_appDir + "/tools/android-tv/avd";
+    return m_avdHome.isEmpty() ? resolveAvdHome() : m_avdHome;
+}
+
+QString AndroidTVModule::avdDirPath(const QString &avdName) const
+{
+    return avdHomePath() + "/" + avdName + ".avd";
 }
 
 QString AndroidTVModule::blocklistPath() const
@@ -50,18 +62,74 @@ QString AndroidTVModule::jdkBinPath() const
     return m_appDir + "/tools/jdk/bin";
 }
 
+// Основное расположение AVD — tools/android-tv/avd. Старый setup_android_sdk.bat
+// создавал AVD в <deploy>/android-tv/avd, поэтому, если в основном месте пусто,
+// а в старом что-то есть, используем старое (иначе эмулятор стартует с
+// «пустым» AVD без config.ini и падает).
+QString AndroidTVModule::resolveAvdHome() const
+{
+    const QString primary = m_appDir + "/tools/android-tv/avd";
+    const QString legacy  = m_appDir + "/android-tv/avd";
+
+    auto hasAvd = [](const QString &dir) {
+        QDir d(dir);
+        return d.exists() && !d.entryList({"*.avd"}, QDir::Dirs | QDir::NoDotAndDotDot).isEmpty();
+    };
+
+    if (hasAvd(primary)) return primary;
+    if (hasAvd(legacy))  return legacy;
+    return primary;
+}
+
+// Окружение для adb / emulator: портативные SDK и JDK из папки tools.
+QProcessEnvironment AndroidTVModule::toolsEnvironment() const
+{
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    const QString sdkRoot = QDir::toNativeSeparators(m_appDir + "/tools/android-sdk");
+    const QString avdHome = QDir::toNativeSeparators(avdHomePath());
+
+    env.insert("JAVA_HOME",             QDir::toNativeSeparators(m_appDir + "/tools/jdk"));
+    env.insert("ANDROID_SDK_ROOT",      sdkRoot);
+    env.insert("ANDROID_HOME",          sdkRoot);
+    env.insert("ANDROID_AVD_HOME",      avdHome);
+    env.insert("ANDROID_EMULATOR_HOME", avdHome);
+    env.insert("SKIP_JDK_VERSION_CHECK", "true");
+    env.insert("PATH",
+               QDir::toNativeSeparators(m_appDir + "/tools/android-sdk/platform-tools")
+                   + QDir::listSeparator() + QDir::toNativeSeparators(jdkBinPath())
+                   + QDir::listSeparator() + env.value("PATH"));
+    return env;
+}
+
+// Консольный порт эмулятора: 5554, 5556, … Порт+1 — adb. Берём первую свободную
+// пару, чтобы не конфликтовать с другим запущенным эмулятором, и всегда
+// обращаемся к своему экземпляру через `adb -s emulator-<port>`.
+int AndroidTVModule::pickFreeConsolePort() const
+{
+    for (int port = 5554; port <= 5584; port += 2) {
+        QTcpServer a, b;
+        const bool freeA = a.listen(QHostAddress::LocalHost, static_cast<quint16>(port));
+        const bool freeB = b.listen(QHostAddress::LocalHost, static_cast<quint16>(port + 1));
+        a.close(); b.close();
+        if (freeA && freeB) return port;
+    }
+    return 5554;
+}
+
 void AndroidTVModule::loadEmulatorSettings(const AndroidTVProfile &profile)
 {
-    m_resolution = profile.resolution;
+    m_resolution = profile.resolution.trimmed();
 
-    // FIXED: replace "auto" or empty string with actual screen resolution
+    // "auto" или пусто → текущее разрешение экрана
     if (m_resolution.isEmpty() || m_resolution == QLatin1String("auto")) {
-        QSize screen = getCurrentScreenResolution();
+        QSize screen(0, 0);
+#ifdef Q_OS_WIN
+        screen = getCurrentScreenResolution();
+#endif
         if (screen.width() > 0 && screen.height() > 0) {
             m_resolution = QString("%1x%2").arg(screen.width()).arg(screen.height());
-            logImportant(Logger::kLevelWarning,
-                         QString("Resolution '%1' replaced with detected screen resolution: %2")
-                             .arg(profile.resolution).arg(m_resolution));
+            logToEmulatorFile(QString("Resolution '%1' → detected screen resolution %2")
+                                  .arg(profile.resolution, m_resolution));
         } else {
             m_resolution = "1920x1080";
             logImportant(Logger::kLevelWarning,
@@ -69,9 +137,17 @@ void AndroidTVModule::loadEmulatorSettings(const AndroidTVProfile &profile)
         }
     }
 
-    m_gpu        = profile.gpu;
-    m_ramMb      = profile.ramMb;
-    m_cores      = profile.cores;
+    // Валидация WxH
+    static const QRegularExpression kResRe(QStringLiteral("^(\\d{3,5})x(\\d{3,5})$"));
+    if (!kResRe.match(m_resolution).hasMatch()) {
+        logImportant(Logger::kLevelWarning,
+                     QString("Invalid resolution '%1', using 1920x1080").arg(m_resolution));
+        m_resolution = "1920x1080";
+    }
+
+    m_gpu            = profile.gpu.trimmed().isEmpty() ? QStringLiteral("auto") : profile.gpu.trimmed();
+    m_ramMb          = qBound(512, profile.ramMb, 16384);
+    m_cores          = qBound(1, profile.cores, 16);
     m_writableSystem = profile.writableSystem;
     m_noBootAnim     = profile.noBootAnim;
     m_noSnapshot     = profile.noSnapshot;
@@ -91,6 +167,8 @@ void AndroidTVModule::loadEmulatorSettings(const AndroidTVProfile &profile)
                      .arg(m_resolution, m_gpu).arg(m_ramMb).arg(m_cores).arg(m_audioDriver));
 }
 
+// ── Launch / stop ────────────────────────────────────────────────────────────
+
 void AndroidTVModule::launch()
 {
     if (m_booting) {
@@ -98,6 +176,7 @@ void AndroidTVModule::launch()
         return;
     }
     if (m_running && m_emulatorProcess && m_emulatorProcess->state() == QProcess::Running) {
+        // Эмулятор уже загружен и работает за MediaStation — просто показываем его.
         emit emulatorReadyBehind();
         return;
     }
@@ -105,42 +184,106 @@ void AndroidTVModule::launch()
     const AndroidTVProfile *profile = m_profileManager ? m_profileManager->activeProfile() : nullptr;
     if (!profile) {
         logImportant(Logger::kLevelError, "No active profile, cannot launch");
+        setStatus("Error: no active profile");
         return;
     }
 
+    if (!QFile::exists(emulatorPath())) {
+        logImportant(Logger::kLevelError, "emulator.exe not found: " + emulatorPath()
+                     + " — run external_tools/setup_android_sdk.bat");
+        setStatus("Error: emulator not found");
+        return;
+    }
+    if (!QFile::exists(adbPath())) {
+        logImportant(Logger::kLevelError, "adb.exe not found: " + adbPath());
+        setStatus("Error: adb not found");
+        return;
+    }
+
+    openEmulatorLogFile();
     logImportant(Logger::kLevelInfo, "launching Android TV emulator with profile " + profile->name);
     refreshQcow2Size();
 
+    m_exitRequested = false;
+    m_launchAvdName = profile->avdName;
+
     // Сразу сигнализируем UI — анимация запуска стартует мгновенно.
-    // Сам эмулятор запустится чуть позже, после того как ADB сервер поднят.
     setBooting(true);
     setStatus("Preparing ADB...");
+    startKeepTopmostTimer();
 
+    loadEmulatorSettings(*profile);
     startDnsProxy();
-    // startEmulator() вызывается из callback syncAdbKeyAndRestartServer,
-    // ПОСЛЕ завершения adb start-server — чтобы эмулятор не стартовал
-    // пока ADB сервер убит, что вызывало лаги при первом запуске.
+
+    // Эмулятор стартует ПОСЛЕ перезапуска adb-сервера, иначе первый запуск
+    // заметно лагает (adb переподключается к уже работающему эмулятору).
     syncAdbKeyAndRestartServer(profile->avdName, [this]() {
+        if (!m_booting || m_shutdownDone) {
+            logToEmulatorFile("launch cancelled before emulator start");
+            return;
+        }
         startEmulator();
     });
 }
 
 void AndroidTVModule::stop()
 {
-    if (!m_running && !m_booting) return;
+    if (!m_running && !m_booting) {
+        m_exitRequested = false;
+        return;
+    }
     setStatus("Stopping emulator...");
     logImportant(Logger::kLevelInfo, "stop() requested");
+
+    // Эмулятор ещё не успел стартовать (идёт перезапуск adb) — просто отменяем запуск.
+    if (!m_emulatorProcess || m_emulatorProcess->state() == QProcess::NotRunning) {
+        stopKeepTopmostTimer();
+        stopDnsProxy();
+        setBooting(false);
+        setRunning(false);
+        setStatus("");
+        restoreMediaStation();
+        m_exitRequested = false;
+        return;
+    }
+
     restoreMediaStation();
+    stopKeyShell();
     stopLogcat();
-    adb({"emu", "kill"});
-    QTimer::singleShot(5000, this, [this]() {
-        if (m_emulatorProcess && m_emulatorProcess->state() == QProcess::Running) {
-            logImportant(Logger::kLevelWarning, "emulator didn't respond, killing");
-            m_emulatorProcess->kill();
+    adb({"emu", "kill"}, {}, 5000);
+
+    QTimer::singleShot(6000, this, [this]() {
+        if (m_emulatorProcess && m_emulatorProcess->state() != QProcess::NotRunning) {
+            logImportant(Logger::kLevelWarning, "emulator didn't respond to 'emu kill', terminating process tree");
+            killEmulatorTree();
         }
         m_exitRequested = false;
     });
 }
+
+// Ошибка до/во время старта: возвращаем UI в исходное состояние.
+void AndroidTVModule::failLaunch(const QString &userStatus, const QString &logMessage)
+{
+    logImportant(Logger::kLevelError, logMessage);
+    stopKeepTopmostTimer();
+    stopBootPolling();
+    stopWindowPolling();
+    removeWinEventHook();
+    stopDnsProxy();
+    setBooting(false);
+    setRunning(false);
+    setStatus(userStatus);
+    restoreMediaStation();
+    m_exitRequested = false;
+    if (m_bus)
+        emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("launchFailed"),
+                                QVariantMap{{"reason", userStatus}});
+}
+
+// ── DNS proxy ────────────────────────────────────────────────────────────────
+// ВНИМАНИЕ: эмулятор получает DNS через -dns-server (порт всегда 53), поэтому
+// dnsproxy на порту 5300 эмулятором не используется. Оставлен как задел; если
+// он не установлен — просто пропускается.
 
 void AndroidTVModule::startDnsProxy()
 {
@@ -149,18 +292,20 @@ void AndroidTVModule::startDnsProxy()
         m_dnsProxyPort = 0;
         return;
     }
-    if (m_dnsProxyProcess && m_dnsProxyProcess->state() == QProcess::Running) {
+    if (m_dnsProxyProcess && m_dnsProxyProcess->state() != QProcess::NotRunning) {
         logToEmulatorFile("DNS proxy already running");
         return;
+    }
+    if (m_dnsProxyProcess) {
+        m_dnsProxyProcess->deleteLater();
+        m_dnsProxyProcess = nullptr;
     }
 
     m_dnsProxyPort = 5300;
 
     QStringList upstreams;
-    if (!m_dnsServer.isEmpty()) {
-        for (const QString &s : m_dnsServer.split(',', Qt::SkipEmptyParts))
-            upstreams << s.trimmed();
-    }
+    for (const QString &s : m_dnsServer.split(',', Qt::SkipEmptyParts))
+        if (!s.trimmed().isEmpty()) upstreams << s.trimmed();
     if (!upstreams.contains("8.8.8.8")) upstreams << "8.8.8.8";
     if (!upstreams.contains("1.1.1.1")) upstreams << "1.1.1.1";
 
@@ -176,33 +321,32 @@ void AndroidTVModule::startDnsProxy()
     m_dnsProxyProcess->setProgram(dnsProxyPath());
     m_dnsProxyProcess->setArguments(args);
     m_dnsProxyProcess->setWorkingDirectory(m_appDir + "/tools");
-    m_dnsProxyProcess->start();
+    m_dnsProxyProcess->setProcessChannelMode(QProcess::MergedChannels);
 
-    if (!m_dnsProxyProcess->waitForStarted(2000)) {
-        logImportant(Logger::kLevelError, "failed to start dnsproxy: " + m_dnsProxyProcess->errorString());
-        m_dnsProxyPort = 0;
-        return;
-    }
-
-    logToEmulatorFile("DNS proxy started PID " + QString::number(m_dnsProxyProcess->processId()) +
-                      " on port " + QString::number(m_dnsProxyPort));
-
-    connect(m_dnsProxyProcess, &QProcess::readyReadStandardError, this, [this]() {
-        const QString err = QString::fromUtf8(m_dnsProxyProcess->readAllStandardError()).trimmed();
-        if (!err.isEmpty()) logToEmulatorFile("[dnsproxy] " + err);
-    });
-    connect(m_dnsProxyProcess, &QProcess::readyReadStandardOutput, this, [this]() {
-        const QString out = QString::fromUtf8(m_dnsProxyProcess->readAllStandardOutput()).trimmed();
+    QProcess *proc = m_dnsProxyProcess;
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
+        const QString out = QString::fromUtf8(proc->readAllStandardOutput()).trimmed();
         if (!out.isEmpty()) logToEmulatorFile("[dnsproxy] " + out);
     });
+    connect(proc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus) {
+        if (m_dnsProxyPort != 0) {
+            logImportant(Logger::kLevelWarning, "DNS proxy exited unexpectedly with code " + QString::number(code));
+            m_dnsProxyPort = 0;
+        }
+    });
+    connect(proc, &QProcess::started, this, [this, proc]() {
+        logToEmulatorFile("DNS proxy started PID " + QString::number(proc->processId()) +
+                          " on port " + QString::number(m_dnsProxyPort));
+    });
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) {
+            logImportant(Logger::kLevelWarning, "failed to start dnsproxy: " + proc->errorString());
+            m_dnsProxyPort = 0;
+        }
+    });
 
-    connect(m_dnsProxyProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus) {
-                if (m_dnsProxyPort != 0) {
-                    logImportant(Logger::kLevelWarning, "DNS proxy exited unexpectedly with code " + QString::number(code));
-                    m_dnsProxyPort = 0;
-                }
-            });
+    // Без waitForStarted(): не блокируем GUI-поток
+    proc->start();
 }
 
 void AndroidTVModule::stopDnsProxy()
@@ -215,34 +359,99 @@ void AndroidTVModule::stopDnsProxy()
     }
 }
 
+// ── AVD preparation ──────────────────────────────────────────────────────────
+
+namespace {
+
+// Читает key=value файл (source.properties, config.ini, *.ini)
+QMap<QString, QString> readProperties(const QString &path)
+{
+    QMap<QString, QString> props;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return props;
+    QTextStream in(&f);
+    while (!in.atEnd()) {
+        const QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith('#')) continue;
+        const int eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        props.insert(line.left(eq).trimmed(), line.mid(eq + 1).trimmed());
+    }
+    return props;
+}
+
+QString abiToCpuArch(const QString &abi)
+{
+    if (abi == QLatin1String("x86"))         return QStringLiteral("x86");
+    if (abi == QLatin1String("x86_64"))      return QStringLiteral("x86_64");
+    if (abi == QLatin1String("arm64-v8a"))   return QStringLiteral("arm64");
+    if (abi.startsWith(QLatin1String("armeabi"))) return QStringLiteral("arm");
+    return QString();
+}
+
+// Плотность экрана как у штатных TV-профилей AVD Manager
+QString densityForHeight(int h)
+{
+    if (h >= 2160) return QStringLiteral("640");
+    if (h >= 1080) return QStringLiteral("320");
+    return QStringLiteral("213");
+}
+
+} // namespace
+
+// Создаёт AVD (папку, <name>.ini, config.ini), если её нет. Раньше при
+// отсутствии AVD создавался config.ini из трёх строк без hw.cpu.arch/abi.type —
+// эмулятор считал образ ARM-овым и не запускался.
+bool AndroidTVModule::ensureAvdExists(const AndroidTVProfile &profile)
+{
+    const QString avdDir = avdDirPath(profile.avdName);
+    if (!QDir(avdDir).exists()) {
+        if (!QDir().mkpath(avdDir)) {
+            logImportant(Logger::kLevelError, "cannot create AVD directory: " + avdDir);
+            return false;
+        }
+        logImportant(Logger::kLevelInfo, "Created AVD directory " + avdDir);
+    }
+    return patchAvdIni(profile);
+}
+
 bool AndroidTVModule::patchAvdIni(const AndroidTVProfile &profile)
 {
     const QString iniPath = avdHomePath() + "/" + profile.avdName + ".ini";
-    const QString avdDir  = QDir::toNativeSeparators(avdHomePath() + "/" + profile.avdName + ".avd");
-
-    QFile file(iniPath);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        // maybe file doesn't exist, create it
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            logImportant(Logger::kLevelError, "cannot create AVD ini: " + iniPath);
-            return false;
-        }
-        QTextStream out(&file);
-        out << "path=" + avdDir << "\n";
-        file.close();
-        logToEmulatorFile("Created AVD ini: " + iniPath);
-        return true;
-    }
+    const QString avdDir  = QDir::toNativeSeparators(avdDirPath(profile.avdName));
+    const QString imgDir  = m_profileManager ? m_profileManager->systemImageDir(profile)
+                                             : m_appDir + "/" + profile.systemImagePath;
+    const QMap<QString, QString> imgProps = readProperties(imgDir + "/source.properties");
+    const QString api = imgProps.value("AndroidVersion.ApiLevel");
 
     QStringList lines;
-    QTextStream in(&file);
-    while (!in.atEnd()) {
-        const QString line = in.readLine();
-        if (line.startsWith("path=")) lines << "path=" + avdDir;
-        else lines << line;
-    }
-    file.close();
+    bool hasPath = false, hasTarget = false, hasEncoding = false;
 
+    QFile file(iniPath);
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&file);
+        while (!in.atEnd()) {
+            const QString line = in.readLine();
+            const QString key  = line.section('=', 0, 0).trimmed();
+            if (key == QLatin1String("path")) {
+                lines << "path=" + avdDir;
+                hasPath = true;
+            } else if (key == QLatin1String("path.rel")) {
+                continue;   // устаревший относительный путь — абсолютного достаточно
+            } else {
+                if (key == QLatin1String("target"))            hasTarget = true;
+                if (key == QLatin1String("avd.ini.encoding"))  hasEncoding = true;
+                lines << line;
+            }
+        }
+        file.close();
+    }
+
+    if (!hasEncoding) lines.prepend("avd.ini.encoding=UTF-8");
+    if (!hasPath)     lines << "path=" + avdDir;
+    if (!hasTarget && !api.isEmpty()) lines << "target=android-" + api;
+
+    QDir().mkpath(avdHomePath());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
         logImportant(Logger::kLevelError, "cannot write AVD ini: " + iniPath);
         return false;
@@ -251,14 +460,13 @@ bool AndroidTVModule::patchAvdIni(const AndroidTVProfile &profile)
     for (const QString &l : lines) out << l << "\n";
     file.close();
 
-    logToEmulatorFile("AVD ini patched: path=" + avdDir);
+    logToEmulatorFile("AVD ini ready: path=" + avdDir);
     return true;
 }
 
-// FIXED: added resolutionOverride parameter
 void AndroidTVModule::patchAvdConfig(const AndroidTVProfile &profile, const QString &resolutionOverride)
 {
-    QString resolution = resolutionOverride.isEmpty() ? profile.resolution : resolutionOverride;
+    const QString resolution = resolutionOverride.isEmpty() ? profile.resolution : resolutionOverride;
 
     int w = resolution.section('x', 0, 0).toInt();
     int h = resolution.section('x', 1, 1).toInt();
@@ -267,61 +475,115 @@ void AndroidTVModule::patchAvdConfig(const AndroidTVProfile &profile, const QStr
         logToEmulatorFile(QString("WARNING: invalid resolution '%1', using 1920x1080").arg(resolution));
     }
 
-    const QString cfgPath = avdHomePath() + "/" + profile.avdName + ".avd/config.ini";
-    QFile file(cfgPath);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QDir().mkpath(avdHomePath() + "/" + profile.avdName + ".avd");
-        file.setFileName(cfgPath);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            logToEmulatorFile("WARNING: cannot create config.ini: " + cfgPath);
-            return;
-        }
-        QTextStream out(&file);
-        out << "hw.lcd.width=" << w << "\n";
-        out << "hw.lcd.height=" << h << "\n";
-        out << "image.sysdir.1=" << QDir::toNativeSeparators(m_appDir + "/" + profile.systemImagePath) << "\n";
-        file.close();
-        return;
+    const QString avdDir  = avdDirPath(profile.avdName);
+    const QString cfgPath = avdDir + "/config.ini";
+    QDir().mkpath(avdDir);
+
+    // Путь к образу: внутри SDK — относительный (как пишет avdmanager), иначе абсолютный.
+    const QString imgDirAbs = m_profileManager ? m_profileManager->systemImageDir(profile)
+                                               : m_appDir + "/" + profile.systemImagePath;
+    const QString sdkRoot   = m_appDir + "/tools/android-sdk";
+    QString imageSysDir;
+    {
+        const QString rel = QDir(sdkRoot).relativeFilePath(imgDirAbs);
+        if (!rel.startsWith(QLatin1String("..")) && !QDir::isAbsolutePath(rel))
+            imageSysDir = QDir::toNativeSeparators(rel) + QDir::separator();
+        else
+            imageSysDir = QDir::toNativeSeparators(imgDirAbs) + QDir::separator();
+        imageSysDir = QDir::toNativeSeparators(imageSysDir);
     }
 
-    const QString imageSysDir = QDir::toNativeSeparators(m_appDir + "/" + profile.systemImagePath);
-    const QString sdcardPath = QDir::toNativeSeparators(avdHomePath() + "/" + profile.avdName + ".avd/sdcard.img");
+    const QMap<QString, QString> imgProps = readProperties(imgDirAbs + "/source.properties");
+    const QString abi     = imgProps.value("SystemImage.Abi", "x86");
+    const QString tagId   = imgProps.value("SystemImage.TagId", "android-tv");
+    const QString tagDisp = imgProps.value("SystemImage.TagDisplay", "Android TV");
+    const QString api     = imgProps.value("AndroidVersion.ApiLevel");
+    const QString cpuArch = abiToCpuArch(abi).isEmpty() ? QStringLiteral("x86") : abiToCpuArch(abi);
 
+    // Всегда перезаписываем
     QMap<QString, QString> overrides = {
         { "hw.lcd.width",   QString::number(w) },
         { "hw.lcd.height",  QString::number(h) },
-        { "skin.name",      resolution },
+        { "skin.name",      QString("%1x%2").arg(w).arg(h) },
         { "skin.path",      "_no_skin"          },
         { "skin.dynamic",   "yes"               },
+        { "showDeviceFrame","no"                },
         { "image.sysdir.1", imageSysDir         },
-        { "sdcard.path",    sdcardPath          },
+        { "hw.ramSize",     QString::number(m_ramMb) },
+        { "hw.cpu.ncore",   QString::number(m_cores) },
         { "hw.audioInput",  "no"                },
         { "hw.audioOutput", "yes"               },
-        { "hw.soundcard",   "hda"               },
         { "hw.gpu.enabled", "yes"               },
-        { "hw.gpu.mode",    "host"              },
+        { "hw.gpu.mode",    m_gpu.isEmpty() ? QStringLiteral("auto") : m_gpu },
         { "vm.heapSize",    "256"               },
-        { "fastboot.forceFastBoot", "yes"       }
+        { "fastboot.forceFastBoot", "yes"       },
+        { "hw.lcd.density", densityForHeight(h) },
     };
+
+    // SD-карта: только если образ реально существует, иначе эмулятор ругается.
+    const QString sdcardPath = avdDir + "/sdcard.img";
+    if (QFile::exists(sdcardPath)) {
+        overrides.insert("sdcard.path", QDir::toNativeSeparators(sdcardPath));
+        overrides.insert("hw.sdCard", "yes");
+    } else {
+        overrides.insert("hw.sdCard", "no");
+    }
+
+    // Только если ключа нет (новый AVD или неполный config.ini)
+    QMap<QString, QString> defaults = {
+        { "avd.ini.encoding",     "UTF-8" },
+        { "abi.type",             abi },
+        { "hw.cpu.arch",          cpuArch },
+        { "tag.id",               tagId },
+        { "tag.display",          tagDisp },
+        { "hw.keyboard",          "yes" },
+        { "hw.dPad",              "yes" },
+        { "hw.mainKeys",          "yes" },
+        { "hw.initialOrientation","landscape" },
+        { "hw.camera.back",       "none" },
+        { "hw.camera.front",      "none" },
+        { "hw.gps",               "no" },
+        { "hw.sensors.orientation","no" },
+        { "hw.sensors.proximity", "no" },
+        { "hw.accelerometer",     "no" },
+        { "hw.battery",           "no" },
+        { "hw.trackBall",         "no" },
+        { "disk.dataPartition.size", "6G" },
+        { "PlayStore.enabled",    tagId.contains("google", Qt::CaseInsensitive) ? "yes" : "no" },
+        { "hw.device.name",       "tv_1080p" },
+        { "hw.device.manufacturer","Google" },
+        { "runtime.network.latency", "none" },
+        { "runtime.network.speed",   "full" },
+    };
+    if (!api.isEmpty())
+        defaults.insert("image.androidVersion.api", api);
 
     QStringList lines;
     QSet<QString> written;
-    QTextStream in(&file);
-    while (!in.atEnd()) {
-        const QString line = in.readLine();
-        const QString key  = line.section('=', 0, 0).trimmed();
-        if (overrides.contains(key)) {
-            lines << key + " = " + overrides[key];
+    QFile file(cfgPath);
+    const bool existed = file.exists();
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&file);
+        while (!in.atEnd()) {
+            const QString line = in.readLine();
+            const QString key  = line.section('=', 0, 0).trimmed();
+            if (key.isEmpty()) { lines << line; continue; }
+            if (written.contains(key)) continue;            // дубликаты (bat дописывал ключи повторно)
+            if (key == QLatin1String("sdcard.path") && !overrides.contains(key)) continue;
+            if (overrides.contains(key)) {
+                lines << key + "=" + overrides.value(key);
+            } else {
+                lines << line;
+            }
             written.insert(key);
-        } else {
-            lines << line;
         }
+        file.close();
     }
-    file.close();
 
     for (auto it = overrides.constBegin(); it != overrides.constEnd(); ++it)
-        if (!written.contains(it.key()))
-            lines << it.key() + " = " + it.value();
+        if (!written.contains(it.key())) { lines << it.key() + "=" + it.value(); written.insert(it.key()); }
+    for (auto it = defaults.constBegin(); it != defaults.constEnd(); ++it)
+        if (!written.contains(it.key())) { lines << it.key() + "=" + it.value(); written.insert(it.key()); }
 
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
         logToEmulatorFile("WARNING: cannot write config.ini: " + cfgPath);
@@ -331,14 +593,18 @@ void AndroidTVModule::patchAvdConfig(const AndroidTVProfile &profile, const QStr
     for (const QString &l : lines) out << l << "\n";
     file.close();
 
-    logToEmulatorFile(QString("AVD config.ini patched: lcd=%1x%2, sysdir=%3")
-                          .arg(w).arg(h).arg(imageSysDir));
+    logToEmulatorFile(QString("AVD config.ini %1: lcd=%2x%3, sysdir=%4, abi=%5")
+                          .arg(existed ? "patched" : "created")
+                          .arg(w).arg(h).arg(imageSysDir, abi));
 }
 
-void AndroidTVModule::syncAdbKeyAndRestartServer(const QString &avdName, std::function<void()> onReady)
+// ── ADB key / server ─────────────────────────────────────────────────────────
+
+void AndroidTVModule::syncAdbKeys(const QString &avdName)
 {
-    const QString adbKeyPubPath = QDir::homePath() + "/.android/adbkey.pub";
-    const QString savedKeyPath  = avdHomePath() + "/" + avdName + ".avd/adb_keys.txt";
+    const QString userAndroidDir = QDir::homePath() + "/.android";
+    const QString adbKeyPubPath  = userAndroidDir + "/adbkey.pub";
+    const QString savedKeyPath   = avdDirPath(avdName) + "/adb_keys.txt";
 
     QString currentKey, savedKey;
     {
@@ -352,22 +618,46 @@ void AndroidTVModule::syncAdbKeyAndRestartServer(const QString &avdName, std::fu
             savedKey = QString::fromUtf8(sf.readAll()).trimmed();
     }
 
-    const bool keyMismatch   = !currentKey.isEmpty() && (currentKey != savedKey);
-    const bool firstRun      = !currentKey.isEmpty() && savedKey.isEmpty();
+    if (currentKey.isEmpty()) {
+        logToEmulatorFile("WARNING: " + adbKeyPubPath + " not found — adb may show the device as unauthorized");
+        return;
+    }
+
+    // ANDROID_EMULATOR_HOME указывает на папку AVD. Эмулятор ищет ключ adb именно
+    // там, а adb создаёт его в %USERPROFILE%\.android. Без копии на production-
+    // образах (Google TV) устройство остаётся unauthorized и загрузка «зависает».
+    for (const QString &name : {QStringLiteral("adbkey"), QStringLiteral("adbkey.pub")}) {
+        const QString src = userAndroidDir + "/" + name;
+        const QString dst = avdHomePath() + "/" + name;
+        if (!QFile::exists(src)) continue;
+        QFile s(src), d(dst);
+        QByteArray srcData, dstData;
+        if (s.open(QIODevice::ReadOnly)) srcData = s.readAll();
+        if (d.open(QIODevice::ReadOnly)) dstData = d.readAll();
+        d.close();
+        if (!srcData.isEmpty() && srcData != dstData) {
+            QFile::remove(dst);
+            if (QFile::copy(src, dst))
+                logToEmulatorFile("Copied " + name + " to emulator home");
+            else
+                logToEmulatorFile("WARNING: could not copy " + name + " to " + dst);
+        }
+    }
+
+    const bool firstRun    = savedKey.isEmpty();
+    const bool keyMismatch = !firstRun && currentKey != savedKey;
 
     if (keyMismatch) {
+        // Ключ adb сменился: старый userdata хранит авторизацию со старым ключом.
         logImportant(Logger::kLevelWarning,
                      "ADB key changed — wiping userdata to re-authorize for " + avdName);
-
-        const QString avdDir = avdHomePath() + "/" + avdName + ".avd";
-        for (const QString &f : {
-                                 avdDir + "/userdata.img.qcow2",
-                                 avdDir + "/userdata-qemu.img",
-                                 avdDir + "/userdata-qemu.img.qcow2" }) {
+        const QString avdDir = avdDirPath(avdName);
+        for (const QString &f : { avdDir + "/userdata.img.qcow2",
+                                  avdDir + "/userdata-qemu.img",
+                                  avdDir + "/userdata-qemu.img.qcow2" }) {
             if (QFile::exists(f)) {
-                QFile::remove(f)
-                ? logToEmulatorFile("Wiped: " + QFileInfo(f).fileName())
-                : logToEmulatorFile("WARNING: could not wipe: " + f);
+                if (QFile::remove(f)) logToEmulatorFile("Wiped: " + QFileInfo(f).fileName());
+                else                  logToEmulatorFile("WARNING: could not wipe: " + f);
             }
         }
         QDir(avdDir + "/snapshots/default_boot").removeRecursively();
@@ -375,57 +665,36 @@ void AndroidTVModule::syncAdbKeyAndRestartServer(const QString &avdName, std::fu
     }
 
     if (keyMismatch || firstRun) {
+        QDir().mkpath(avdDirPath(avdName));
         QFile nf(savedKeyPath);
         if (nf.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
             nf.write(currentKey.toUtf8());
-            logToEmulatorFile(firstRun
-                                  ? "First run: saved ADB key for " + avdName
-                                  : "Saved new ADB key for " + avdName);
+            logToEmulatorFile(firstRun ? "First run: saved ADB key for " + avdName
+                                       : "Saved new ADB key for " + avdName);
         }
     }
-
-    auto *thread = QThread::create([this, onReady]() {
-        QProcessEnvironment adbEnv = QProcessEnvironment::systemEnvironment();
-        adbEnv.insert("JAVA_HOME",             QDir::toNativeSeparators(m_appDir + "/tools/jdk"));
-        adbEnv.insert("ANDROID_SDK_ROOT",      QDir::toNativeSeparators(m_appDir + "/tools/android-sdk"));
-        adbEnv.insert("ANDROID_HOME",          QDir::toNativeSeparators(m_appDir + "/tools/android-sdk"));
-        adbEnv.insert("ANDROID_AVD_HOME",      QDir::toNativeSeparators(avdHomePath()));
-        adbEnv.insert("ANDROID_EMULATOR_HOME", QDir::toNativeSeparators(avdHomePath()));
-        adbEnv.insert("PATH",
-                      QDir::toNativeSeparators(m_appDir + "/tools/android-sdk/platform-tools")
-                          + ";" + QDir::toNativeSeparators(jdkBinPath())
-                          + ";" + adbEnv.value("PATH"));
-
-        QProcess kill;
-        kill.setProgram(adbPath());
-        kill.setArguments({"kill-server"});
-        kill.setProcessEnvironment(adbEnv);
-        kill.start();
-        kill.waitForFinished(3000);
-        QMetaObject::invokeMethod(this, [this]() {
-            logToEmulatorFile("adb kill-server: done");
-        }, Qt::QueuedConnection);
-
-        QProcess start;
-        start.setProgram(adbPath());
-        start.setArguments({"start-server"});
-        start.setProcessEnvironment(adbEnv);
-        start.start();
-        start.waitForFinished(5000);
-        const QString out = QString::fromUtf8(start.readAllStandardOutput()).trimmed();
-        QMetaObject::invokeMethod(this, [this, out, onReady]() {
-            logToEmulatorFile("adb start-server: " + (out.isEmpty() ? "ok" : out));
-            if (onReady) onReady();
-        }, Qt::QueuedConnection);
-    });
-    thread->setObjectName("adb-restart");
-    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-    thread->start();
 }
+
+// Перезапуск adb-сервера полностью асинхронно (раньше — QThread с захватом this,
+// который мог пережить модуль при закрытии приложения).
+void AndroidTVModule::syncAdbKeyAndRestartServer(const QString &avdName, std::function<void()> onReady)
+{
+    adbRaw({"kill-server"}, [this, avdName, onReady](const QString &) {
+        logToEmulatorFile("adb kill-server: done");
+        adbRaw({"start-server"}, [this, avdName, onReady](const QString &out) {
+            logToEmulatorFile("adb start-server: " + (out.trimmed().isEmpty() ? QStringLiteral("ok") : out.trimmed()));
+            // Ключ adbkey создаётся adb при первом старте сервера — синхронизируем после.
+            syncAdbKeys(avdName);
+            if (onReady) onReady();
+        }, 15000);
+    }, 5000);
+}
+
+// ── system.img.qcow2 ─────────────────────────────────────────────────────────
 
 bool AndroidTVModule::isSystemQcow2Valid(const AndroidTVProfile &profile)
 {
-    const QString qcow2Path = avdHomePath() + "/" + profile.avdName + ".avd/system.img.qcow2";
+    const QString qcow2Path = avdDirPath(profile.avdName) + "/system.img.qcow2";
     if (!QFile::exists(qcow2Path))
         return true;
 
@@ -442,24 +711,31 @@ bool AndroidTVModule::isSystemQcow2Valid(const AndroidTVProfile &profile)
     proc.setArguments({"info", QDir::toNativeSeparators(qcow2Path)});
     proc.start();
     if (!proc.waitForFinished(3000)) {
+        proc.kill();
         logToEmulatorFile("qemu-img info timeout, assuming system.img.qcow2 is valid");
         return true;
     }
 
-    QString output = proc.readAllStandardOutput();
-    QRegularExpression re("backing file:\\s*(.+)");
-    QRegularExpressionMatch match = re.match(output);
+    const QString output = QString::fromUtf8(proc.readAllStandardOutput());
+    static const QRegularExpression re(QStringLiteral("backing file:\\s*([^\\r\\n]+)"));
+    const QRegularExpressionMatch match = re.match(output);
     if (!match.hasMatch()) {
         logToEmulatorFile("Could not parse backing file from qemu-img info");
         return true;
     }
 
+    // qemu-img может дописать "(actual path: ...)" — отрезаем
     QString actualBacking = match.captured(1).trimmed();
-    QString expectedBacking = QDir::toNativeSeparators(
-        m_appDir + "/" + profile.systemImagePath + "/system.img");
+    const int paren = actualBacking.indexOf(QLatin1String(" (actual path"));
+    if (paren > 0) actualBacking = actualBacking.left(paren).trimmed();
 
-    bool valid = (QFileInfo(actualBacking).canonicalFilePath() ==
-                  QFileInfo(expectedBacking).canonicalFilePath());
+    const QString imgDir = m_profileManager ? m_profileManager->systemImageDir(profile)
+                                            : m_appDir + "/" + profile.systemImagePath;
+    const QString expectedBacking = QDir::toNativeSeparators(imgDir + "/system.img");
+
+    const QString a = QFileInfo(actualBacking).canonicalFilePath();
+    const QString e = QFileInfo(expectedBacking).canonicalFilePath();
+    const bool valid = !a.isEmpty() && a.compare(e, Qt::CaseInsensitive) == 0;
 
     if (!valid) {
         logToEmulatorFile("system.img.qcow2 backing file mismatch:");
@@ -473,7 +749,7 @@ bool AndroidTVModule::isSystemQcow2Valid(const AndroidTVProfile &profile)
 
 void AndroidTVModule::repairSystemQcow2(const AndroidTVProfile &profile)
 {
-    const QString qcow2Path = avdHomePath() + "/" + profile.avdName + ".avd/system.img.qcow2";
+    const QString qcow2Path = avdDirPath(profile.avdName) + "/system.img.qcow2";
     if (!QFile::exists(qcow2Path))
         return;
 
@@ -481,60 +757,53 @@ void AndroidTVModule::repairSystemQcow2(const AndroidTVProfile &profile)
         return;
 
     logImportant(Logger::kLevelWarning,
-                 "system.img.qcow2 backing file mismatch, deleting it to regenerate");
+                 "system.img.qcow2 backing file mismatch (app folder moved?), deleting it to regenerate");
 
-    if (QFile::remove(qcow2Path)) {
-        logToEmulatorFile("Deleted system.img.qcow2");
-    } else {
-        logToEmulatorFile("WARNING: failed to delete system.img.qcow2");
-    }
+    if (QFile::remove(qcow2Path)) logToEmulatorFile("Deleted system.img.qcow2");
+    else                          logToEmulatorFile("WARNING: failed to delete system.img.qcow2");
 
-    QDir avdDir(avdHomePath() + "/" + profile.avdName + ".avd");
-    QStringList userdataFiles = avdDir.entryList(
+    QDir avdDir(avdDirPath(profile.avdName));
+    const QStringList userdataFiles = avdDir.entryList(
         {"userdata*.img", "userdata*.img.qcow2"}, QDir::Files);
     for (const QString &f : userdataFiles) {
-        if (QFile::remove(avdDir.absoluteFilePath(f)))
-            logToEmulatorFile("Removed " + f);
-        else
-            logToEmulatorFile("WARNING: could not remove " + f);
+        if (QFile::remove(avdDir.absoluteFilePath(f))) logToEmulatorFile("Removed " + f);
+        else                                           logToEmulatorFile("WARNING: could not remove " + f);
     }
+    // Снапшот ссылается на удалённые диски — его тоже нужно убрать
+    QDir(avdDirPath(profile.avdName) + "/snapshots/default_boot").removeRecursively();
 }
+
+// ── Emulator process ─────────────────────────────────────────────────────────
 
 void AndroidTVModule::startEmulator()
 {
     const AndroidTVProfile *profile = m_profileManager ? m_profileManager->activeProfile() : nullptr;
     if (!profile) {
-        logImportant(Logger::kLevelError, "No active profile, cannot start emulator");
+        failLaunch("Error: no active profile", "No active profile, cannot start emulator");
         return;
     }
 
     if (!QFile::exists(emulatorPath())) {
-        logImportant(Logger::kLevelError, "emulator.exe not found: " + emulatorPath());
-        setStatus("Error: emulator not found");
+        failLaunch("Error: emulator not found", "emulator.exe not found: " + emulatorPath());
         return;
     }
 
-    loadEmulatorSettings(*profile);   // m_resolution is already corrected here
+    const QString imgDir = m_profileManager->systemImageDir(*profile);
+    if (!QFile::exists(imgDir + "/system.img")) {
+        failLaunch("Error: system image not found",
+                   "System image not found: " + imgDir + "/system.img"
+                   + " — run external_tools/setup_android_sdk.bat or pick another image in the profile");
+        return;
+    }
 
+    setStatus("Preparing AVD...");
+
+    if (!ensureAvdExists(*profile)) {
+        failLaunch("Error preparing AVD", "Cannot prepare AVD " + profile->avdName);
+        return;
+    }
     repairSystemQcow2(*profile);
-
-    {
-        QDir avdDir(avdHomePath() + "/" + profile->avdName + ".avd");
-        const auto locks = avdDir.entryList({"*.lock"}, QDir::Files);
-        for (const QString &lock : locks) {
-            if (QFile::remove(avdDir.absoluteFilePath(lock)))
-                logToEmulatorFile("Removed stale AVD lock: " + lock);
-            else
-                logToEmulatorFile("WARNING: could not remove AVD lock: " + lock);
-        }
-    }
-
-    if (!patchAvdIni(*profile)) {
-        setBooting(false);
-        setStatus("Error preparing AVD");
-        return;
-    }
-    // FIXED: pass m_resolution (already corrected) to patchAvdConfig
+    removeAvdLocks(avdDirPath(profile->avdName));
     patchAvdConfig(*profile, m_resolution);
 
 #ifdef Q_OS_WIN
@@ -551,40 +820,50 @@ void AndroidTVModule::startEmulator()
     }
 #endif
 
-    startKeepTopmostTimer();
+    // Старый объект процесса (от прошлого запуска) — удаляем вместе со связями
+    if (m_emulatorProcess) {
+        m_emulatorProcess->disconnect(this);
+        if (m_emulatorProcess->state() != QProcess::NotRunning) {
+            m_emulatorProcess->kill();
+            m_emulatorProcess->waitForFinished(1000);
+        }
+        m_emulatorProcess->deleteLater();
+        m_emulatorProcess = nullptr;
+    }
+
+    m_consolePort = pickFreeConsolePort();
+    logToEmulatorFile(QString("Console port %1, adb serial %2").arg(m_consolePort).arg(adbSerial()));
 
     m_emulatorProcess = new QProcess(this);
+    QProcess *proc = m_emulatorProcess;
 
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    const QString jdkBin  = QDir::toNativeSeparators(jdkBinPath());
-    const QString sdkRoot = QDir::toNativeSeparators(m_appDir + "/tools/android-sdk");
-    const QString avdHome = QDir::toNativeSeparators(avdHomePath());
-
-    env.insert("JAVA_HOME",              QDir::toNativeSeparators(m_appDir + "/tools/jdk"));
-    env.insert("ANDROID_SDK_ROOT",       sdkRoot);
-    env.insert("ANDROID_HOME",           sdkRoot);
-    env.insert("ANDROID_AVD_HOME",       avdHome);
-    env.insert("ANDROID_EMULATOR_HOME",  avdHome);
-    env.insert("SKIP_JDK_VERSION_CHECK", "true");
-    env.insert("PATH", jdkBin + ";" + env.value("PATH"));
-
+    QProcessEnvironment env = toolsEnvironment();
     env.insert("ANDROID_EMULATOR_RENDERER", "host");
     env.insert("ANDROID_EMU_MEDIA_DECODER_CUDA_VPX", "1");
 
-    // Audio timer: only set if manually specified
-    QVariant audioTimerVal = profile->audioTimerMs;
-    if (audioTimerVal.type() == QVariant::Int) {
-        int audioTimerMs = audioTimerVal.toInt();
+    // Audio timer / DSound latency: только если заданы вручную (int), иначе "auto"
+    auto manualInt = [](const QVariant &v, int &out) -> bool {
+        if (!v.isValid() || v.isNull()) return false;
+        if (v.typeId() == QMetaType::QString) {
+            bool ok = false;
+            out = v.toString().toInt(&ok);
+            return ok;
+        }
+        bool ok = false;
+        out = v.toInt(&ok);
+        return ok;
+    };
+
+    int audioTimerMs = 0;
+    if (manualInt(profile->audioTimerMs, audioTimerMs) && audioTimerMs > 0) {
         env.insert("QEMU_AUDIO_TIMER_PERIOD", QString::number(audioTimerMs));
         logToEmulatorFile(QString("Audio timer override: %1 ms").arg(audioTimerMs));
     } else {
         logToEmulatorFile("Audio timer: auto");
     }
 
-    // Dsound latency: only set if manually specified
-    QVariant dsoundLatencyVal = profile->dsoundLatencyMs;
-    if (dsoundLatencyVal.type() == QVariant::Int) {
-        int dsoundLatencyMs = dsoundLatencyVal.toInt();
+    int dsoundLatencyMs = 0;
+    if (manualInt(profile->dsoundLatencyMs, dsoundLatencyMs) && dsoundLatencyMs > 0) {
         env.insert("QEMU_DSOUND_LATENCY_MILLIS", QString::number(dsoundLatencyMs));
         logToEmulatorFile(QString("DSound latency override: %1 ms").arg(dsoundLatencyMs));
     } else {
@@ -608,87 +887,76 @@ void AndroidTVModule::startEmulator()
     env.insert("QT_AUTO_SCREEN_SCALE_FACTOR", "0");
     env.insert("QT_SCREEN_SCALE_FACTORS",     "1");
 
-    m_emulatorProcess->setProcessEnvironment(env);
-    m_emulatorProcess->setProgram(emulatorPath());
+    proc->setProcessEnvironment(env);
+    proc->setProgram(emulatorPath());
+    proc->setWorkingDirectory(QFileInfo(emulatorPath()).absolutePath());
 
-    const QString dnsArg = profile->dnsServer.isEmpty() ? "8.8.8.8,1.1.1.1" : profile->dnsServer;
+    const QString dnsArg = m_dnsServer.trimmed().isEmpty() ? QStringLiteral("8.8.8.8,1.1.1.1")
+                                                           : m_dnsServer.trimmed();
     logToEmulatorFile("Using DNS: " + dnsArg);
 
     QStringList args;
     args << "-avd"        << profile->avdName
+         << "-port"       << QString::number(m_consolePort)
          << "-dns-server" << dnsArg
          << "-gpu"        << m_gpu
-         << "-skin"       << m_resolution   // m_resolution is already correct
+         << "-skin"       << m_resolution
          << "-memory"     << QString::number(m_ramMb)
          << "-cores"      << QString::number(m_cores)
          << "-netfast"
          << "-accel"      << "on"
          << "-skip-adb-auth"
+         << "-no-metrics"
+         << "-audio"      << m_audioDriver
          << "-feature"    << "GLDirectMem"
          << "-feature"    << "GLDMA"
          << "-feature"    << "VulkanNativeSwapchain";
 
+    // Часовой пояс хоста (IANA). Время эмулятор и так берёт с хоста, а явный
+    // пояс нужен потому, что Windows-имена зон эмулятор распознаёт не всегда.
+    const QByteArray tzId = QTimeZone::systemTimeZoneId();
+    if (!tzId.isEmpty() && tzId.contains('/'))
+        args << "-timezone" << QString::fromLatin1(tzId);
+
     if (m_writableSystem)  args << "-writable-system";
     if (m_noSnapshot)      args << "-no-snapshot";
     if (m_noSnapshotSave)  args << "-no-snapshot-save";
+    if (m_noBootAnim)      args << "-no-boot-anim";
 
-    args << "-no-boot-anim";
-    args << "-no-metrics";
-    args << "-audio" << m_audioDriver;
+    proc->setArguments(args);
+    logToEmulatorFile("emulator " + args.join(' '));
 
-    m_emulatorProcess->setArguments(args);
-
-    connect(m_emulatorProcess, &QProcess::readyReadStandardOutput, this, [this]() {
-        const QString out = QString::fromUtf8(m_emulatorProcess->readAllStandardOutput()).trimmed();
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
+        const QString out = QString::fromUtf8(proc->readAllStandardOutput()).trimmed();
         if (!out.isEmpty()) logToEmulatorFile(out, true);
     });
-    connect(m_emulatorProcess, &QProcess::readyReadStandardError, this, [this]() {
-        const QString err = QString::fromUtf8(m_emulatorProcess->readAllStandardError()).trimmed();
+    connect(proc, &QProcess::readyReadStandardError, this, [this, proc]() {
+        const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
         if (!err.isEmpty()) logToEmulatorFile(err, true);
     });
 
-    connect(m_emulatorProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus) {
-                logImportant(Logger::kLevelInfo, "emulator finished, exit code " + QString::number(code));
-                stopKeepTopmostTimer();
-                stopWindowPolling();
-                stopBootPolling();
-                stopHealthCheck();
-                stopLogcat();
-                removeWinEventHook();
-#ifdef Q_OS_WIN
-                if (m_timerResolutionSet) {
-                    timeEndPeriod(1);
-                    m_timerResolutionSet = false;
-                    logToEmulatorFile("Timer resolution restored to default");
-                }
-#endif
-                setBooting(false);
-                setRunning(false);
-                setStatus("");
-                restoreMediaStation();
-                emit emulatorClosed();
-                if (m_bus) emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("emulatorClosed"), {});
-                m_exitRequested = false;
-            });
-
-    connect(m_emulatorProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError err) {
-        logImportant(Logger::kLevelError, "emulator error: " + QString::number(err) + " - " + m_emulatorProcess->errorString());
-        stopKeepTopmostTimer();
-        stopLogcat();
-        setBooting(false);
-        setRunning(false);
-        setStatus("Error launching emulator");
-        m_exitRequested = false;
+    connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus) {
+        if (proc != m_emulatorProcess) return;
+        onEmulatorFinished(code);
     });
 
-    connect(m_emulatorProcess, &QProcess::started, this, [this]() {
-        m_emulatorPid        = m_emulatorProcess->processId();
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError err) {
+        if (proc != m_emulatorProcess) return;
+        // Crashed/Timedout приходят вместе с finished — их обрабатывает onEmulatorFinished
+        if (err == QProcess::FailedToStart)
+            failLaunch("Error launching emulator", "emulator failed to start: " + proc->errorString());
+        else
+            logToEmulatorFile("emulator process error " + QString::number(err) + ": " + proc->errorString());
+    });
+
+    connect(proc, &QProcess::started, this, [this, proc]() {
+        if (proc != m_emulatorProcess) return;
+        m_emulatorPid        = proc->processId();
         m_initialEmulatorPid = m_emulatorPid;
         logToEmulatorFile("emulator process started PID " + QString::number(m_emulatorPid));
 
 #ifdef Q_OS_WIN
-        HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, static_cast<DWORD>(m_emulatorPid));
+        HANDLE hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, static_cast<DWORD>(m_emulatorPid));
         if (hProc) {
             if (SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS))
                 logToEmulatorFile("Emulator process priority set to ABOVE_NORMAL");
@@ -697,6 +965,9 @@ void AndroidTVModule::startEmulator()
             CloseHandle(hProc);
         }
 
+        // Через 3 с поднимаем приоритет потоков фактического процесса эмулятора
+        // (emulator.exe перезапускает себя как qemu-system-*.exe; PID уточняется
+        // в WinEvent-хуке / опросе окон).
         QTimer::singleShot(3000, this, [this]() {
             if (!m_emulatorPid) return;
 
@@ -721,21 +992,19 @@ void AndroidTVModule::startEmulator()
                         continue;
 
                     HANDLE hThread = OpenThread(
-                        THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                        THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
                         FALSE, te.th32ThreadID);
                     if (!hThread) continue;
 
                     bool isAudioThread = false;
-
                     if (getThreadDesc) {
                         PWSTR desc = nullptr;
                         if (SUCCEEDED(getThreadDesc(hThread, &desc)) && desc) {
                             const QString name = QString::fromWCharArray(desc);
                             LocalFree(desc);
                             if (name.contains(QLatin1String("audio"), Qt::CaseInsensitive) ||
-                                name.contains(QLatin1String("dsound"), Qt::CaseInsensitive) ||
-                                name.contains(QLatin1String("winmm"), Qt::CaseInsensitive) ||
-                                name.contains(QLatin1String("sound"), Qt::CaseInsensitive)) {
+                                name.contains(QLatin1String("sound"), Qt::CaseInsensitive) ||
+                                name.contains(QLatin1String("winmm"), Qt::CaseInsensitive)) {
                                 isAudioThread = true;
                                 SetThreadPriority(hThread, THREAD_PRIORITY_TIME_CRITICAL);
                                 logToEmulatorFile(
@@ -745,12 +1014,10 @@ void AndroidTVModule::startEmulator()
                             }
                         }
                     }
-
                     if (!isAudioThread) {
                         SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
                         ++boostedNormal;
                     }
-
                     CloseHandle(hThread);
                 } while (Thread32Next(hSnap, &te));
             }
@@ -759,12 +1026,6 @@ void AndroidTVModule::startEmulator()
             logToEmulatorFile(
                 QString("Thread boost complete: %1 × ABOVE_NORMAL, %2 × TIME_CRITICAL (audio)")
                     .arg(boostedNormal).arg(boostedAudio));
-
-            if (boostedAudio == 0) {
-                logToEmulatorFile(
-                    "NOTE: audio thread not identified by name — "
-                    "all threads set to ABOVE_NORMAL.");
-            }
         });
 #endif
 
@@ -773,13 +1034,67 @@ void AndroidTVModule::startEmulator()
         startBootPolling();
     });
 
-    m_emulatorProcess->start();
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
+    setStatus("Starting emulator...");
+    proc->start();
 }
+
+void AndroidTVModule::onEmulatorFinished(int exitCode)
+{
+    const bool wasBooting = m_booting;
+    logImportant(Logger::kLevelInfo, "emulator finished, exit code " + QString::number(exitCode));
+
+    stopKeepTopmostTimer();
+    stopWindowPolling();
+    stopBootPolling();
+    stopHealthCheck();
+    stopLogcat();
+    stopKeyShell();
+    removeWinEventHook();
+    stopPositionSyncTimer();
+    stopDnsProxy();
+#ifdef Q_OS_WIN
+    if (m_timerResolutionSet) {
+        timeEndPeriod(1);
+        m_timerResolutionSet = false;
+        logToEmulatorFile("Timer resolution restored to default");
+    }
+#endif
+
+    setBooting(false);
+    setRunning(false);
+    restoreMediaStation();          // при !running/!booting снимает TOPMOST
+
+    // Сбрасываем состояние окна/процесса — иначе следующий запуск цепляется
+    // к мёртвому HWND и старому PID.
+#ifdef Q_OS_WIN
+    m_emulatorHwnd = nullptr;
+#endif
+    m_emulatorPid        = 0;
+    m_initialEmulatorPid = 0;
+    setEmulatorShown(false);
+    setSwitching(false);
+
+    if (wasBooting && !m_exitRequested)
+        setStatus(QString("Emulator exited during boot (code %1), see logs/Android_TV.log").arg(exitCode));
+    else if (!m_status.startsWith(QLatin1String("Error")) && !m_status.startsWith(QLatin1String("Boot timeout")))
+        setStatus("");
+
+    if (!m_launchAvdName.isEmpty())
+        removeAvdLocks(avdDirPath(m_launchAvdName));
+
+    refreshQcow2Size();
+    emit emulatorClosed();
+    if (m_bus) emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("emulatorClosed"), {});
+    m_exitRequested = false;
+}
+
+// ── Boot polling ─────────────────────────────────────────────────────────────
 
 void AndroidTVModule::startBootPolling()
 {
-    m_bootPollCount = 0;
+    stopBootPolling();
+    m_bootPollCount    = 0;
+    m_bootPollInFlight = false;
     setStatus("Loading Android TV...");
     m_bootPollTimer = new QTimer(this);
     m_bootPollTimer->setInterval(kBootPollIntervalMs);
@@ -787,73 +1102,33 @@ void AndroidTVModule::startBootPolling()
     connect(m_bootPollTimer, &QTimer::timeout, this, [this]() {
         ++m_bootPollCount;
         if (m_bootPollCount > kBootPollMaxTries) {
-            logImportant(Logger::kLevelError, "boot polling timeout");
             stopBootPolling();
-            setBooting(false);
-            setStatus("Boot timeout exceeded");
+            // Эмулятор, не загрузившийся за 5 минут, оставлять висеть бессмысленно
+            killEmulatorTree();
+            failLaunch("Boot timeout exceeded",
+                       QString("boot polling timeout (%1 s)").arg(kBootPollMaxTries * kBootPollIntervalMs / 1000));
             return;
         }
         if (m_bootPollCount % 5 == 0) {
             const int elapsed = m_bootPollCount * kBootPollIntervalMs / 1000;
             setStatus(QString("Loading... %1 sec").arg(elapsed));
-            logToEmulatorFile(QString("boot polling: %1 sec").arg(elapsed));
         }
+
+        // Один запрос за раз: adb может отвечать дольше интервала опроса
+        if (m_bootPollInFlight) return;
+        m_bootPollInFlight = true;
+
         adb({"shell", "getprop", "sys.boot_completed"}, [this](const QString &out) {
-            if (out.trimmed() != QLatin1String("1")) return;
-
-            logImportant(Logger::kLevelInfo, "sys.boot_completed = 1");
-            stopBootPolling();
-            setBooting(false);
-            setRunning(true);
-            setStatus("Android TV ready");
-            emit bootCompleted();
-            startHealthCheck();
-            startLogcat();
-            if (m_bus) emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("bootCompleted"), {});
-
-            // Синхронизируем timezone и время с хост-машиной.
-            // Используем service call alarm — работает без root на production образе.
-            {
-                const QTimeZone hostTz = QTimeZone::systemTimeZone();
-                const QString tzId = QString::fromLatin1(hostTz.id());
-
-                adb({"shell", "settings", "put", "global", "auto_time", "0"}, {});
-                adb({"shell", "settings", "put", "global", "auto_time_zone", "0"}, {});
-
-                // service call alarm 3 = AlarmManager.setTimeZone(String)
-                adb({"shell", "service", "call", "alarm", "3", "s16", tzId},
-                    [this, tzId](const QString &) {
-                        logToEmulatorFile("[Time] timezone synced: " + tzId);
-                });
-
-                // service call alarm 2 = AlarmManager.setTime(long millis)
-                const qint64 epochMs = QDateTime::currentMSecsSinceEpoch();
-                adb({"shell", "service", "call", "alarm", "2", "i64", QString::number(epochMs)},
-                    [this, epochMs](const QString &) {
-                        logToEmulatorFile("[Time] time synced: " + QString::number(epochMs));
-                });
+            m_bootPollInFlight = false;
+            if (!m_booting) return;   // уже загрузился / отменён
+            const QString res = out.trimmed();
+            if (res != QLatin1String("1")) {
+                if (m_bootPollCount % 10 == 0 && !res.isEmpty())
+                    logToEmulatorFile("boot poll: " + res.left(200));
+                return;
             }
-
-            logToEmulatorFile("Setting up ADB reverse port forwarding...");
-            adb({"reverse", "tcp:80", "tcp:80"}, [this](const QString &res) {
-                logToEmulatorFile("adb reverse tcp:80 -> " + res.trimmed());
-            });
-            adb({"reverse", "tcp:443", "tcp:443"}, [this](const QString &res) {
-                logToEmulatorFile("adb reverse tcp:443 -> " + res.trimmed());
-            });
-            adb({"reverse", "tcp:53", "tcp:53"}, [this](const QString &res) {
-                logToEmulatorFile("adb reverse tcp:53 -> " + res.trimmed());
-            });
-            adb({"reverse", "tcp:8080", "tcp:8080"}, [this](const QString &res) {
-                logToEmulatorFile("adb reverse tcp:8080 -> " + res.trimmed());
-            });
-            adb({"reverse", "tcp:8443", "tcp:8443"}, [this](const QString &res) {
-                logToEmulatorFile("adb reverse tcp:8443 -> " + res.trimmed());
-            });
-
-            applyBlocklist();
-            emit emulatorReadyBehind();
-        });
+            onBootCompleted();
+        }, 8000);
     });
 
     m_bootPollTimer->start();
@@ -866,7 +1141,35 @@ void AndroidTVModule::stopBootPolling()
         m_bootPollTimer->deleteLater();
         m_bootPollTimer = nullptr;
     }
+    m_bootPollInFlight = false;
 }
+
+void AndroidTVModule::onBootCompleted()
+{
+    logImportant(Logger::kLevelInfo, "sys.boot_completed = 1");
+    stopBootPolling();
+    stopKeepTopmostTimer();
+    setBooting(false);
+    setRunning(true);
+    setStatus("Android TV ready");
+    emit bootCompleted();
+    startHealthCheck();
+    if (m_bus) emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("bootCompleted"), {});
+
+    logToEmulatorFile("Setting up ADB reverse port forwarding...");
+    for (const char *port : {"80", "443", "8080", "8443"}) {
+        const QString spec = QStringLiteral("tcp:") + QLatin1String(port);
+        adb({"reverse", spec, spec}, [this, spec](const QString &res) {
+            logToEmulatorFile("adb reverse " + spec + " -> " + res.trimmed());
+        });
+    }
+
+    // Блоклист перезапускает adbd (adb root) — logcat стартует после него
+    applyBlocklist();
+    emit emulatorReadyBehind();
+}
+
+// ── Health check ─────────────────────────────────────────────────────────────
 
 void AndroidTVModule::startHealthCheck()
 {
@@ -875,14 +1178,12 @@ void AndroidTVModule::startHealthCheck()
     m_healthCheckTimer->setInterval(30 * 60 * 1000);
 
     connect(m_healthCheckTimer, &QTimer::timeout, this, [this]() {
-        const AndroidTVProfile *profile = m_profileManager ? m_profileManager->activeProfile() : nullptr;
-        if (!profile) return;
-        const QString qcow2Path = avdHomePath() + "/" + profile->avdName + ".avd/userdata-qemu.img.qcow2";
+        if (m_launchAvdName.isEmpty()) return;
+        const QString qcow2Path = avdDirPath(m_launchAvdName) + "/userdata-qemu.img.qcow2";
         QFileInfo fi(qcow2Path);
         if (fi.exists()) {
             const qint64 sizeMb = fi.size() / 1024 / 1024;
-            logImportant(Logger::kLevelInfo,
-                         QString("Health: userdata qcow2 = %1 MB").arg(sizeMb));
+            logImportant(Logger::kLevelInfo, QString("Health: userdata qcow2 = %1 MB").arg(sizeMb));
             if (m_qcow2SizeMb != sizeMb) {
                 m_qcow2SizeMb = sizeMb;
                 emit qcow2SizeMbChanged();
@@ -893,9 +1194,8 @@ void AndroidTVModule::startHealthCheck()
                                      "consider restarting").arg(kMaxQcow2SizeMb));
                 if (m_bus)
                     emit m_bus->moduleEvent(
-                        QStringLiteral("androidtv"),
-                        QStringLiteral("qcow2Warning"),
-                        QVariantMap{{"sizeMb", sizeMb}, {"limitMb", (int)kMaxQcow2SizeMb}});
+                        QStringLiteral("androidtv"), QStringLiteral("qcow2Warning"),
+                        QVariantMap{{"sizeMb", sizeMb}, {"limitMb", static_cast<int>(kMaxQcow2SizeMb)}});
             }
         }
 
@@ -910,12 +1210,10 @@ void AndroidTVModule::startHealthCheck()
 
         adb({"shell", "getprop", "sys.boot_completed"}, [this](const QString &out) {
             if (out.trimmed() != QLatin1String("1")) {
-                logImportant(Logger::kLevelWarning,
-                             "Health: emulator not responding to adb — may be frozen");
+                logImportant(Logger::kLevelWarning, "Health: emulator not responding to adb — may be frozen");
                 if (m_bus)
-                    emit m_bus->moduleEvent(
-                        QStringLiteral("androidtv"),
-                        QStringLiteral("emulatorUnresponsive"), {});
+                    emit m_bus->moduleEvent(QStringLiteral("androidtv"),
+                                            QStringLiteral("emulatorUnresponsive"), {});
             } else {
                 logToEmulatorFile("Health: emulator adb ping OK");
             }
@@ -937,89 +1235,131 @@ void AndroidTVModule::stopHealthCheck()
     }
 }
 
-void AndroidTVModule::adb(const QStringList &args, std::function<void(QString)> callback)
+// ── adb helpers ──────────────────────────────────────────────────────────────
+
+void AndroidTVModule::adbRaw(const QStringList &args, std::function<void(QString)> callback, int timeoutMs)
 {
+    if (!QFile::exists(adbPath())) {
+        logToEmulatorFile("adb.exe not found: " + adbPath());
+        if (callback)
+            QTimer::singleShot(0, this, [callback]() { callback(QString()); });
+        return;
+    }
+
     auto *proc = new QProcess(this);
     proc->setProgram(adbPath());
     proc->setArguments(args);
-
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.insert("JAVA_HOME",             QDir::toNativeSeparators(m_appDir + "/tools/jdk"));
-    env.insert("ANDROID_SDK_ROOT",      QDir::toNativeSeparators(m_appDir + "/tools/android-sdk"));
-    env.insert("ANDROID_HOME",          QDir::toNativeSeparators(m_appDir + "/tools/android-sdk"));
-    env.insert("ANDROID_AVD_HOME",      QDir::toNativeSeparators(avdHomePath()));
-    env.insert("ANDROID_EMULATOR_HOME", QDir::toNativeSeparators(avdHomePath()));
-    env.insert("PATH", QDir::toNativeSeparators(m_appDir + "/tools/android-sdk/platform-tools")
-                           + ";" + jdkBinPath() + ";" + env.value("PATH"));
-    proc->setProcessEnvironment(env);
+    proc->setProcessEnvironment(toolsEnvironment());
+    proc->setProcessChannelMode(QProcess::MergedChannels);
 
     auto *watchdog = new QTimer(proc);
     watchdog->setSingleShot(true);
-    watchdog->setInterval(10000);
-    connect(watchdog, &QTimer::timeout, this, [proc, args, this]() {
-        logToEmulatorFile(QString("adb watchdog: timeout 10s, killing: %1")
-                              .arg(args.join(QLatin1Char(' '))));
+    watchdog->setInterval(timeoutMs);
+    connect(watchdog, &QTimer::timeout, this, [this, proc, args, timeoutMs]() {
+        logToEmulatorFile(QString("adb watchdog: timeout %1 ms, killing: adb %2")
+                              .arg(timeoutMs).arg(args.join(QLatin1Char(' '))));
         proc->kill();
     });
 
-    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-            [proc, callback](int, QProcess::ExitStatus) {
-                if (callback) callback(QString::fromUtf8(proc->readAllStandardOutput()));
-                proc->deleteLater();
-            });
+    // finished и errorOccurred(FailedToStart) взаимоисключающие, но защищаемся от двойного вызова
+    auto done = std::make_shared<bool>(false);
+    auto finish = [this, proc, callback, done, watchdog]() {
+        if (*done) return;
+        *done = true;
+        watchdog->stop();
+        const QString out = QString::fromUtf8(proc->readAll());
+        proc->deleteLater();
+        if (callback && !m_shutdownDone) callback(out);
+    };
+
+    connect(proc, &QProcess::finished, this, [finish](int, QProcess::ExitStatus) { finish(); });
+    connect(proc, &QProcess::errorOccurred, this, [finish](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) finish();
+    });
 
     proc->start();
     watchdog->start();
 }
 
+void AndroidTVModule::adb(const QStringList &args, std::function<void(QString)> callback, int timeoutMs)
+{
+    adbRaw(QStringList{QStringLiteral("-s"), adbSerial()} + args, std::move(callback), timeoutMs);
+}
+
+// ── Blocklist (/system/etc/hosts) ────────────────────────────────────────────
+// Запись в /system возможна только при -writable-system и root-adb (образы
+// без Google Play). Раньше push делался без root и всегда завершался ошибкой.
+
 void AndroidTVModule::applyBlocklist()
 {
+    if (!m_writableSystem) {
+        logToEmulatorFile("blocklist: profile has writable system disabled, skipping");
+        startLogcat();
+        return;
+    }
+
     QFile list(blocklistPath());
     if (!list.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        logToEmulatorFile("blocklist not found, skipping");
+        logToEmulatorFile("blocklist not found (" + blocklistPath() + "), skipping");
+        startLogcat();
         return;
     }
 
     QStringList entries;
-    entries << "127.0.0.1 localhost";
+    entries << "127.0.0.1 localhost" << "::1 ip6-localhost";
 
     QTextStream in(&list);
     while (!in.atEnd()) {
         const QString line = in.readLine().trimmed();
         if (line.isEmpty() || line.startsWith('#')) continue;
-        entries << "0.0.0.0 " + line;
+        entries << "0.0.0.0 " + line.section(QRegularExpression("\\s+"), 0, 0);
     }
 
-    const QString tmpPath = m_appDir + "/tools/android-tv/config/hosts.tmp";
+    const QString tmpDir  = m_appDir + "/tools/android-tv/config";
+    const QString tmpPath = tmpDir + "/hosts.tmp";
+    QDir().mkpath(tmpDir);
     QFile tmp(tmpPath);
-    if (!tmp.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        logImportant(Logger::kLevelError, "cannot write temp hosts file");
+    if (!tmp.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        logImportant(Logger::kLevelError, "cannot write temp hosts file: " + tmpPath);
+        startLogcat();
         return;
     }
     QTextStream out(&tmp);
     for (const auto &e : entries) out << e << "\n";
     tmp.close();
 
-    logToEmulatorFile(QString("pushing %1 entries to /etc/hosts").arg(entries.size()));
+    logToEmulatorFile(QString("blocklist: pushing %1 entries to /system/etc/hosts").arg(entries.size()));
 
-    adb({"shell", "mount", "-o", "remount,rw", "/"}, [this, tmpPath](const QString &) {
-        adb({"push", QDir::toNativeSeparators(tmpPath), "/etc/hosts"}, [this](const QString &out) {
-            logToEmulatorFile("hosts push: " + out.trimmed());
-        });
-    });
+    adb({"root"}, [this, tmpPath](const QString &rootOut) {
+        logToEmulatorFile("adb root: " + rootOut.trimmed());
+        if (rootOut.contains(QLatin1String("cannot run as root"), Qt::CaseInsensitive)) {
+            logToEmulatorFile("blocklist: production image (no root) — hosts cannot be modified");
+            startLogcat();
+            return;
+        }
+        adb({"wait-for-device"}, [this, tmpPath](const QString &) {
+            adb({"remount"}, [this, tmpPath](const QString &remountOut) {
+                logToEmulatorFile("adb remount: " + remountOut.trimmed());
+                adb({"push", QDir::toNativeSeparators(tmpPath), "/system/etc/hosts"},
+                    [this](const QString &pushOut) {
+                        logToEmulatorFile("hosts push: " + pushOut.trimmed());
+                        startLogcat();
+                    }, 20000);
+            }, 20000);
+        }, 30000);
+    }, 15000);
 }
+
+// ── qcow2 ────────────────────────────────────────────────────────────────────
 
 void AndroidTVModule::refreshQcow2Size()
 {
     const AndroidTVProfile *profile = m_profileManager ? m_profileManager->activeProfile() : nullptr;
-    if (!profile) {
-        m_qcow2SizeMb = -1;
-        emit qcow2SizeMbChanged();
-        return;
+    qint64 sizeMb = -1;
+    if (profile) {
+        QFileInfo fi(avdDirPath(profile->avdName) + "/userdata-qemu.img.qcow2");
+        if (fi.exists()) sizeMb = fi.size() / 1024 / 1024;
     }
-    const QString path = avdHomePath() + "/" + profile->avdName + ".avd/userdata-qemu.img.qcow2";
-    QFileInfo fi(path);
-    const qint64 sizeMb = fi.exists() ? fi.size() / 1024 / 1024 : -1;
     if (m_qcow2SizeMb != sizeMb) {
         m_qcow2SizeMb = sizeMb;
         emit qcow2SizeMbChanged();
@@ -1036,7 +1376,7 @@ bool AndroidTVModule::resetQcow2()
     const AndroidTVProfile *profile = m_profileManager ? m_profileManager->activeProfile() : nullptr;
     if (!profile) return false;
 
-    const QString avdDir = avdHomePath() + "/" + profile->avdName + ".avd";
+    const QString avdDir = avdDirPath(profile->avdName);
     const QStringList targets = {
         avdDir + "/userdata-qemu.img.qcow2",
         avdDir + "/userdata.img.qcow2"
@@ -1064,70 +1404,59 @@ bool AndroidTVModule::resetQcow2()
     return anyDeleted;
 }
 
+// ── logcat ───────────────────────────────────────────────────────────────────
+
 void AndroidTVModule::startLogcat()
 {
-    const AndroidTVProfile *profile = m_profileManager ? m_profileManager->activeProfile() : nullptr;
-    QString avdName = profile ? profile->avdName : "Unknown";
+    if (!m_running) return;
     if (m_logcatProcess && m_logcatProcess->state() != QProcess::NotRunning) {
         logToEmulatorFile("logcat already running");
         return;
     }
 
-    m_logcatLogFile.setFileName(logcatLogPath());
-    if (!m_logcatLogFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-        logToEmulatorFile("ERROR: cannot open logcat log file: " + logcatLogPath());
-        return;
+    if (!m_logcatLogFile.isOpen()) {
+        m_logcatLogFile.setFileName(logcatLogPath());
+        if (!m_logcatLogFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            logToEmulatorFile("ERROR: cannot open logcat log file: " + logcatLogPath());
+            return;
+        }
+        m_logcatLogStream.setDevice(&m_logcatLogFile);
     }
-    m_logcatLogStream.setDevice(&m_logcatLogFile);
     m_logcatLogStream << "=== Android TV logcat started at "
                       << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
-                      << " Profile: " << avdName << " ===\n";
+                      << " AVD: " << m_launchAvdName << " ===\n";
     m_logcatLogStream.flush();
 
     m_logcatProcess = new QProcess(this);
-    m_logcatProcess->setProgram(adbPath());
-    m_logcatProcess->setArguments({"logcat", "-v", "threadtime"});
+    QProcess *proc = m_logcatProcess;
+    proc->setProgram(adbPath());
+    proc->setArguments({"-s", adbSerial(), "logcat", "-v", "threadtime"});
+    proc->setProcessEnvironment(toolsEnvironment());
 
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.insert("JAVA_HOME",             QDir::toNativeSeparators(m_appDir + "/tools/jdk"));
-    env.insert("ANDROID_SDK_ROOT",      QDir::toNativeSeparators(m_appDir + "/tools/android-sdk"));
-    env.insert("ANDROID_HOME",          QDir::toNativeSeparators(m_appDir + "/tools/android-sdk"));
-    env.insert("ANDROID_AVD_HOME",      QDir::toNativeSeparators(avdHomePath()));
-    env.insert("ANDROID_EMULATOR_HOME", QDir::toNativeSeparators(avdHomePath()));
-    env.insert("PATH", QDir::toNativeSeparators(m_appDir + "/tools/android-sdk/platform-tools")
-                           + ";" + jdkBinPath() + ";" + env.value("PATH"));
-    m_logcatProcess->setProcessEnvironment(env);
-
-    connect(m_logcatProcess, &QProcess::readyReadStandardOutput, this, [this]() {
-        QByteArray data = m_logcatProcess->readAllStandardOutput();
-        if (!data.isEmpty()) {
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
+        const QByteArray data = proc->readAllStandardOutput();
+        if (!data.isEmpty() && m_logcatLogFile.isOpen()) {
             m_logcatLogStream << QString::fromUtf8(data);
             m_logcatLogStream.flush();
         }
     });
-
-    connect(m_logcatProcess, &QProcess::readyReadStandardError, this, [this]() {
-        QByteArray data = m_logcatProcess->readAllStandardError();
-        if (!data.isEmpty()) {
+    connect(proc, &QProcess::readyReadStandardError, this, [this, proc]() {
+        const QByteArray data = proc->readAllStandardError();
+        if (!data.isEmpty())
             logToEmulatorFile("[logcat stderr] " + QString::fromUtf8(data).trimmed());
+    });
+    connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus) {
+        logToEmulatorFile("logcat process finished, exit code " + QString::number(code));
+        if (m_logcatLogFile.isOpen()) {
+            m_logcatLogStream << "=== logcat ended ===\n\n";
+            m_logcatLogStream.flush();
+            m_logcatLogFile.close();
         }
+        if (m_logcatProcess == proc) m_logcatProcess = nullptr;
+        proc->deleteLater();
     });
 
-    connect(m_logcatProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus) {
-                logToEmulatorFile("logcat process finished, exit code " + QString::number(code));
-                if (m_logcatLogFile.isOpen()) {
-                    m_logcatLogStream << "=== logcat ended ===\n\n";
-                    m_logcatLogStream.flush();
-                    m_logcatLogFile.close();
-                }
-                if (m_logcatProcess) {
-                    m_logcatProcess->deleteLater();
-                    m_logcatProcess = nullptr;
-                }
-            });
-
-    m_logcatProcess->start();
+    proc->start();
     logToEmulatorFile("logcat started, writing to " + logcatLogPath());
 }
 
@@ -1135,11 +1464,9 @@ void AndroidTVModule::stopLogcat()
 {
     if (m_logcatProcess && m_logcatProcess->state() != QProcess::NotRunning) {
         logToEmulatorFile("Stopping logcat...");
-        m_logcatProcess->terminate();
-        if (!m_logcatProcess->waitForFinished(3000)) {
-            m_logcatProcess->kill();
-            m_logcatProcess->waitForFinished(2000);
-        }
+        // У adb.exe нет обработчика WM_CLOSE → terminate() на Windows бесполезен
+        m_logcatProcess->kill();
+        m_logcatProcess->waitForFinished(2000);
     } else if (m_logcatLogFile.isOpen()) {
         m_logcatLogStream << "=== logcat ended (forced) ===\n\n";
         m_logcatLogStream.flush();

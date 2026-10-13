@@ -12,9 +12,9 @@ DEPENDPATH  += $$PWD/../../..
 
 SOURCES += \
     tst_g72battery_mock.cpp \
-    ../../../modules/BatteryModule/G72BatteryModule.cpp
+    ../../../modules/AirMouseModule/G72BatteryModule.cpp
 
 HEADERS += \
-    ../../../modules/BatteryModule/G72BatteryModule.h \
+    ../../../modules/AirMouseModule/G72BatteryModule.h \
     ../../../core/IModule.h \
     ../../../core/EventBus.h

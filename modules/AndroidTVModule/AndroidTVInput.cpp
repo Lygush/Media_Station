@@ -3,6 +3,7 @@
 // Управление вводом:
 //   • Обработка клавиш пульта G72 (handleRemoteKey)
 //   • Маппинг ключей G72 → Android keycode
+//   • Отправка через постоянный `adb shell` (без запуска adb.exe на каждую клавишу)
 //   • Переключение режима клавиш (notifyKeyMode)
 //   • Публичный Q_INVOKABLE sendRemoteKey для QML
 
@@ -11,6 +12,8 @@
 #include "G72KeysModule.h"
 #include "OverlayModule.h"
 #include "core/EventBus.h"
+
+#include <QFile>
 
 // ── Таблица маппинга G72-ключей → Android keycodes ───────────────────────────
 
@@ -28,7 +31,7 @@
         { G72Keys::kMenu,      82  }, // KEYCODE_MENU
         { G72Keys::kSearch,    84  }, // KEYCODE_SEARCH
         { G72Keys::kHomePage,  3   }, // KEYCODE_HOME (браузерная кнопка Home → Android Home)
-        { G72Keys::kFavorites, 268 }, // KEYCODE_BOOKMARK
+        { G72Keys::kFavorites, 174 }, // KEYCODE_BOOKMARK
         { G72Keys::kVolumeUp,  24  }, // KEYCODE_VOLUME_UP
         { G72Keys::kVolumeDown,25  }, // KEYCODE_VOLUME_DOWN
     };
@@ -42,7 +45,8 @@
 
 void AndroidTVModule::handleRemoteKey(const QString &key)
 {
-    if (!m_running) return;
+    // Клавиши нужны эмулятору только когда он показан пользователю
+    if (!m_running || !m_emulatorShown) return;
 
     // Кнопка Menu — переключает оверлей
     if (key == QLatin1String(G72Keys::kMenu)) {
@@ -71,14 +75,78 @@ void AndroidTVModule::handleRemoteKey(const QString &key)
 
     const int keyCode = remoteKeyToAndroidKeyCode(key);
     if (keyCode < 0) {
-        logToEmulatorFile(
-            QString("[Input] Unknown remote key: %1").arg(key));
+        logToEmulatorFile(QString("[Input] Unknown remote key: %1").arg(key));
         return;
     }
 
-    logToEmulatorFile(
-        QString("[Input] Remote key '%1' → ADB keyevent %2")
-            .arg(key).arg(keyCode));
+    sendAndroidKey(keyCode);
+}
+
+// ── Отправка keyevent ────────────────────────────────────────────────────────
+// Раньше на каждую клавишу запускался новый adb.exe (+ подключение к серверу),
+// из-за чего навигация отставала на сотни миллисекунд, а при удержании кнопки
+// копилась очередь процессов. Теперь держим один `adb shell` и пишем в его stdin.
+
+void AndroidTVModule::startKeyShell()
+{
+    if (m_keyShell) return;
+    if (!QFile::exists(adbPath())) return;
+
+    m_keyShell = new QProcess(this);
+    QProcess *proc = m_keyShell;
+    proc->setProgram(adbPath());
+    proc->setArguments({"-s", adbSerial(), "shell"});
+    proc->setProcessEnvironment(toolsEnvironment());
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+
+    connect(proc, &QProcess::readyRead, this, [this, proc]() {
+        const QString out = QString::fromUtf8(proc->readAll()).trimmed();
+        if (!out.isEmpty()) logToEmulatorFile("[Input] shell: " + out.left(300));
+    });
+    connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus) {
+        logToEmulatorFile("[Input] key shell finished, code " + QString::number(code));
+        if (m_keyShell == proc) m_keyShell = nullptr;
+        proc->deleteLater();
+    });
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        logToEmulatorFile("[Input] key shell failed to start: " + proc->errorString());
+        if (m_keyShell == proc) m_keyShell = nullptr;
+        proc->deleteLater();
+    });
+
+    // Запись до фактического старта буферизуется QProcess и уйдёт после запуска
+    proc->start();
+    logToEmulatorFile("[Input] key shell started");
+}
+
+void AndroidTVModule::stopKeyShell()
+{
+    if (!m_keyShell) return;
+    QProcess *proc = m_keyShell;
+    m_keyShell = nullptr;
+    proc->disconnect(this);
+    if (proc->state() != QProcess::NotRunning) {
+        proc->write("exit\n");
+        proc->closeWriteChannel();
+        if (!proc->waitForFinished(500)) {
+            proc->kill();
+            proc->waitForFinished(1000);
+        }
+    }
+    proc->deleteLater();
+}
+
+void AndroidTVModule::sendAndroidKey(int keyCode)
+{
+    logToEmulatorFile(QString("[Input] keyevent %1").arg(keyCode));
+
+    if (!m_keyShell) startKeyShell();
+    if (m_keyShell && m_keyShell->state() != QProcess::NotRunning) {
+        m_keyShell->write(QByteArray("input keyevent ") + QByteArray::number(keyCode) + '\n');
+        return;
+    }
+    // Запасной путь — разовый вызов
     adb({"shell", "input", "keyevent", QString::number(keyCode)});
 }
 

@@ -31,7 +31,8 @@ QString SteamAppList::normalizeKey(const QString &name) const
     for (QChar &ch : key) {
         if (ch.isSpace()) ch = QLatin1Char(' ');
     }
-    key.remove(QRegularExpression("[^a-z0-9 ]"));
+    static const QRegularExpression kNonKeyRe(QStringLiteral("[^a-z0-9 ]"));
+    key.remove(kNonKeyRe);
     return key.simplified();
 }
 
@@ -39,9 +40,12 @@ QString SteamAppList::normalizeKey(const QString &name) const
 
 void SteamAppList::loadIfNeeded()
 {
-    if (m_loaded || m_loading) return;
-    m_loading   = true;
-    m_cancelled = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_loaded || m_loading) return;
+        m_loading   = true;
+        m_cancelled = false;
+    }
 
     QtConcurrent::run([this]() { loadFromFile(); });
 }
@@ -50,8 +54,11 @@ void SteamAppList::loadIfNeeded()
 // Вызывать ТОЛЬКО из фонового потока — не из главного.
 void SteamAppList::waitUntilLoaded()
 {
+    // Ждём только пока загрузка реально идёт. Раньше условие не учитывало
+    // неудачную загрузку (нет tools/applicationslist/applications.json или
+    // битый JSON) — поток ждал вечно, и описание игры «висело» на этапе БД.
     QMutexLocker locker(&m_mutex);
-    while (!m_loaded && !m_cancelled)
+    while (m_loading && !m_loaded && !m_cancelled)
         m_loadedCond.wait(&m_mutex);
 }
 
