@@ -2,7 +2,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // KaraokeModule — IModule + QML-интерфейс для всего пайплайна.
 //
-// Пайплайн (выполняется в фоновом потоке через KaraokeWorker):
+// Этапы:
+//   0. Анализ имени (быстро): теги → имя файла → при необходимости нейросеть
+//      (SongNameResolver → локальная LLM). Результат — metaProposed(); пользователь проверяет /
+//      правит название и вызывает confirmSong(artist, title).
+//
+// Пайплайн (после подтверждения, в фоновом потоке через KaraokeWorker):
 //   1. Проверка кэша  (data/songs/Artist - Title/)
 //   2. ffmpeg         → temp WAV 44100 stereo
 //   3. DemucsWrapper  → vocals.wav + instrumental.wav
@@ -28,11 +33,15 @@
 #include <QString>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QHash>
+#include <QPair>
 #include <atomic>
 
 #include "core/IModule.h"
 #include "core/EventBus.h"
 #include "SongMeta.h"
+
+class SongNameResolver;
 
 class KaraokeModule : public QObject, public IModule
 {
@@ -54,7 +63,13 @@ public:
     /// Запускает пайплайн для указанного аудиофайла.
     /// Если кэш уже есть — сразу эмитирует ready().
     /// Если уже идёт обработка — игнорирует вызов.
+    /// Шаг 1: анализирует имя/теги файла и предлагает исполнителя и название
+    /// (сигнал metaProposed). Тяжёлая обработка НЕ стартует до confirmSong().
     Q_INVOKABLE void openSong(const QString &filePath);
+
+    /// Шаг 2: пользователь подтвердил (или поправил) исполнителя и название —
+    /// запускает пайплайн (или сразу отдаёт кэш). artist может быть пустым.
+    Q_INVOKABLE void confirmSong(const QString &artist, const QString &title);
 
     /// Отменяет текущую обработку (если идёт).
     Q_INVOKABLE void cancel();
@@ -70,8 +85,19 @@ public:
     /// true если пайплайн сейчас выполняется.
     Q_INVOKABLE bool isProcessing() const { return m_processing; }
 
+    // Читает текстовый файл (UTF-8) — QML XMLHttpRequest не умеет читать
+    // локальные файлы без QML_XHR_ALLOW_FILE_READ=1.
+    Q_INVOKABLE QString readTextFile(const QString &pathOrUrl) const;
+
 signals:
     // ── Сигналы в QML ─────────────────────────────────────────────────────────
+    // Анализ имени файла (до подтверждения)
+    void analysisStatus(const QString &message);
+    void analysisToken(const QString &token);          // потоковый вывод нейросети
+    /// source: "tags" | "ai" | "filename" | "manual" (не удалось — ввести вручную)
+    void metaProposed(const QString &artist, const QString &title,
+                      const QString &source, const QString &fileName);
+
     void progress(int percent, const QString &stage);
     void ready(const QString &lrcPath,
                const QString &vocalsPath,
@@ -89,9 +115,21 @@ private:
     /// Спецсимволы \ / : * ? " < > | заменяются на _
     QString songCacheDir(const QString &filePath) const;
 
-    /// Извлекает метаданные из ID3-тегов файла.
-    /// Если тегов нет — использует имя файла.
+    /// Метаданные с учётом подтверждённых пользователем названий (overrides).
     SongMeta readMeta(const QString &filePath) const;
+
+    /// Теги → имя файла, БЕЗ overrides. source: "tags" | "filename".
+    SongMeta readMetaRaw(const QString &filePath, QString *source) const;
+
+    /// Анализ имени (выполняется в фоновом потоке).
+    void analyzeSong(const QString &filePath);
+
+    void startPipeline(const SongMeta &meta);
+    void emitReady(const QString &filePath);
+
+    QString overridesFile() const;
+    void    loadOverrides();
+    void    saveOverrides() const;
 
     // ── Состояние ─────────────────────────────────────────────────────────────
     EventBus               *m_bus        = nullptr;
@@ -100,4 +138,12 @@ private:
     bool                    m_processing { false };
 
     QFutureWatcher<void>   *m_watcher    = nullptr;
+
+    // ── Анализ имени + нейросеть ──────────────────────────────────────────────
+    bool                    m_analyzing  { false };
+    QFuture<void>           m_analysisFuture;
+    SongNameResolver       *m_resolver   = nullptr;   // нейросеть для имён (логика модуля Karaoke)
+
+    // Подтверждённые пользователем исполнитель/название: путь файла → {artist, title}
+    QHash<QString, QPair<QString, QString>> m_overrides;
 };

@@ -177,6 +177,8 @@ private slots:
 private:
     void initServer();
     void initLogSender();
+    // Пишет в qDebug и дублирует в LoggerModule через EventBus
+    void log(const char *level, const QString &msg) const;
 
     void receiveArchiveData(QTcpSocket *socket, const QByteArray &data);
     void extractAndInstall(QTcpSocket *socket);

@@ -3,46 +3,21 @@
 
 #include <QFile>
 #include <QDebug>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Константы модели (из inspect onnx):
-//   input  "input": [1, 2, 343980]
-//   input  "x":     [1, 4, 2048, 336]   ← magnitude spectrogram, complex-as-channels
-//   output "add_67":[1, 4, 2, 343980]   ← 4 стема (drums/bass/other/vocals)
-//
-// nfft=4096, hop=1024 → nfreqs=2049, но модель ожидает 2048 (без DC+Nyquist)
-// frames = ceil(343980 / 1024) = 336
-// complex-as-channels: [re_L, im_L, re_R, im_R] → 4 канала × 2048 × 336
-// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor / Destructor
 // ─────────────────────────────────────────────────────────────────────────────
 
-DemucsWrapper::DemucsWrapper()
-{
-    // Окно Хэннинга длиной kNfft
-    m_window.resize(kNfft);
-    for (int i = 0; i < kNfft; ++i)
-        m_window[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / (kNfft - 1)));
-
-    m_fftCfg  = kiss_fftr_alloc(kNfft, 0, nullptr, nullptr);
-    m_ifftCfg = kiss_fftr_alloc(kNfft, 1, nullptr, nullptr);
-}
+DemucsWrapper::DemucsWrapper() = default;
 
 DemucsWrapper::~DemucsWrapper()
 {
     delete m_session;
     m_session = nullptr;
-    if (m_fftCfg)  { kiss_fft_free(m_fftCfg);  m_fftCfg  = nullptr; }
-    if (m_ifftCfg) { kiss_fft_free(m_ifftCfg); m_ifftCfg = nullptr; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,7 +42,15 @@ bool DemucsWrapper::load(const QString &/*onnxDllDir*/, const QString &modelPath
             modelPath.toStdWString().c_str(),
             m_sessionOptions);
 
-        qDebug() << "[DemucsWrapper] модель загружена:" << modelPath;
+        // Имена всех выходов — запрашиваем их все (временная + частотная ветки)
+        Ort::AllocatorWithDefaultOptions alloc;
+        m_outputNames.clear();
+        const size_t nOut = m_session->GetOutputCount();
+        for (size_t i = 0; i < nOut; ++i)
+            m_outputNames.emplace_back(m_session->GetOutputNameAllocated(i, alloc).get());
+
+        qDebug() << "[DemucsWrapper] модель загружена:" << modelPath
+                 << "| выходов:" << nOut;
         return true;
 
     } catch (const Ort::Exception &e) {
@@ -78,7 +61,8 @@ bool DemucsWrapper::load(const QString &/*onnxDllDir*/, const QString &modelPath
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// separate
+// separate — как demucs.apply_model: нормализация трека, чанки с перекрытием,
+// треугольные веса (transition_power=1), обратная денормализация.
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool DemucsWrapper::separate(const QString          &inputWavPath,
@@ -99,186 +83,189 @@ bool DemucsWrapper::separate(const QString          &inputWavPath,
         return false;
     }
 
-    const int totalSamples = leftIn.size();
-    QVector<float> outLeftVoc (totalSamples, 0.f), outRightVoc (totalSamples, 0.f);
-    QVector<float> outLeftInst(totalSamples, 0.f), outRightInst(totalSamples, 0.f);
+    const int total = leftIn.size();
+    if (total <= 0) { m_lastError = "Пустой входной WAV"; return false; }
 
-    // Модель работает с фиксированными чанками kChunkSamples=343980
-    // Overlap для crossfade на стыках
-    const int stride      = kChunkSamples - kOverlapSamples;
-    int       chunkStart  = 0;
-    int       chunkIdx    = 0;
-    const int totalChunks = (totalSamples + stride - 1) / stride;
+    // ── Нормализация по моно-миксу (как ref = wav.mean(0) в demucs) ──────────
+    double sum = 0.0, sumSq = 0.0;
+    for (int i = 0; i < total; ++i) {
+        const double m = 0.5 * (leftIn[i] + rightIn[i]);
+        sum += m; sumSq += m * m;
+    }
+    const double refMean = sum / total;
+    double refStd = std::sqrt(std::max(0.0, sumSq / total - refMean * refMean));
+    if (refStd < 1e-8) refStd = 1.0;
+    for (int i = 0; i < total; ++i) {
+        leftIn[i]  = static_cast<float>((leftIn[i]  - refMean) / refStd);
+        rightIn[i] = static_cast<float>((rightIn[i] - refMean) / refStd);
+    }
+    qDebug() << "[DemucsWrapper] вход:" << total << "сэмплов, mean" << refMean << "std" << refStd;
 
-    QVector<float> prevVocL, prevVocR, prevInstL, prevInstR;
-
-    while (chunkStart < totalSamples) {
-        if (cancelled && cancelled->load()) { m_lastError = "Отменено"; return false; }
-
-        const int chunkEnd = qMin(chunkStart + kChunkSamples, totalSamples);
-        const int chunkLen = chunkEnd - chunkStart;
-
-        // Паддинг нулями до kChunkSamples
-        QVector<float> chunkL(kChunkSamples, 0.f), chunkR(kChunkSamples, 0.f);
-        std::copy(leftIn.constData()  + chunkStart,
-                  leftIn.constData()  + chunkEnd, chunkL.data());
-        std::copy(rightIn.constData() + chunkStart,
-                  rightIn.constData() + chunkEnd, chunkR.data());
-
-        QVector<float> vocL, vocR, instL, instR;
-        if (!runOnnx(chunkL, chunkR, vocL, vocR, instL, instR)) return false;
-
-        // Crossfade с предыдущим чанком
-        if (!prevVocL.isEmpty()) {
-            applyCrossfade(prevVocL,  vocL,  kOverlapSamples);
-            applyCrossfade(prevVocR,  vocR,  kOverlapSamples);
-            applyCrossfade(prevInstL, instL, kOverlapSamples);
-            applyCrossfade(prevInstR, instR, kOverlapSamples);
-        }
-
-        const int writeLen = qMin(chunkLen, (int)vocL.size());
-        std::copy(vocL.constData(),  vocL.constData()  + writeLen, outLeftVoc.data()   + chunkStart);
-        std::copy(vocR.constData(),  vocR.constData()  + writeLen, outRightVoc.data()  + chunkStart);
-        std::copy(instL.constData(), instL.constData() + writeLen, outLeftInst.data()  + chunkStart);
-        std::copy(instR.constData(), instR.constData() + writeLen, outRightInst.data() + chunkStart);
-
-        prevVocL  = vocL;  prevVocR  = vocR;
-        prevInstL = instL; prevInstR = instR;
-
-        chunkStart += stride;
-        ++chunkIdx;
-
-        if (progressCb)
-            progressCb(chunkIdx * 100 / totalChunks);
+    // ── Веса перекрытия ───────────────────────────────────────────────────────
+    std::vector<float> weight(kChunkSamples);
+    {
+        const int half = kChunkSamples / 2;
+        for (int i = 0; i < kChunkSamples; ++i)
+            weight[i] = (i < half) ? float(i + 1) : float(kChunkSamples - i);
+        const float mx = *std::max_element(weight.begin(), weight.end());
+        for (float &w : weight) w /= mx;
     }
 
-    if (!writeWav(vocalsOutPath, outLeftVoc,  outRightVoc,  44100)) return false;
-    if (!writeWav(instrOutPath,  outLeftInst, outRightInst, 44100)) return false;
+    std::vector<float> accVocL(total, 0.f),  accVocR(total, 0.f);
+    std::vector<float> accInstL(total, 0.f), accInstR(total, 0.f);
+    std::vector<float> sumWeight(total, 0.f);
+
+    const int stride      = static_cast<int>((1.0f - kOverlap) * kChunkSamples);
+    const int totalChunks = (total + stride - 1) / stride;
+    int       chunkIdx    = 0;
+
+    std::vector<float> chunkL(kChunkSamples), chunkR(kChunkSamples);
+    std::vector<float> vocL, vocR, instL, instR;
+
+    for (int chunkStart = 0; chunkStart < total; chunkStart += stride, ++chunkIdx) {
+        if (cancelled && cancelled->load()) { m_lastError = "Отменено"; return false; }
+
+        const int chunkLen = std::min(kChunkSamples, total - chunkStart);
+
+        // Паддинг нулями до kChunkSamples
+        std::fill(chunkL.begin(), chunkL.end(), 0.f);
+        std::fill(chunkR.begin(), chunkR.end(), 0.f);
+        std::copy(leftIn.constData()  + chunkStart, leftIn.constData()  + chunkStart + chunkLen, chunkL.begin());
+        std::copy(rightIn.constData() + chunkStart, rightIn.constData() + chunkStart + chunkLen, chunkR.begin());
+
+        if (!runChunk(chunkL.data(), chunkR.data(), vocL, vocR, instL, instR)) return false;
+
+        for (int i = 0; i < chunkLen; ++i) {
+            const float w = weight[i];
+            const int   o = chunkStart + i;
+            accVocL[o]  += vocL[i]  * w;  accVocR[o]  += vocR[i]  * w;
+            accInstL[o] += instL[i] * w;  accInstR[o] += instR[i] * w;
+            sumWeight[o] += w;
+        }
+
+        if (progressCb)
+            progressCb(std::min(100, (chunkIdx + 1) * 100 / totalChunks));
+    }
+
+    // ── Нормировка весов + денормализация ────────────────────────────────────
+    QVector<float> outVocL(total), outVocR(total), outInstL(total), outInstR(total);
+    double rmsVoc = 0.0, rmsInst = 0.0;
+    for (int i = 0; i < total; ++i) {
+        const float sw = sumWeight[i] > 0.f ? sumWeight[i] : 1.f;
+        outVocL[i]  = static_cast<float>(accVocL[i]  / sw * refStd + refMean);
+        outVocR[i]  = static_cast<float>(accVocR[i]  / sw * refStd + refMean);
+        outInstL[i] = static_cast<float>(accInstL[i] / sw * refStd + refMean);
+        outInstR[i] = static_cast<float>(accInstR[i] / sw * refStd + refMean);
+        rmsVoc  += double(outVocL[i])  * outVocL[i];
+        rmsInst += double(outInstL[i]) * outInstL[i];
+    }
+    qDebug() << "[DemucsWrapper] RMS вокала:" << std::sqrt(rmsVoc / total)
+             << "| RMS инструментала:" << std::sqrt(rmsInst / total);
+
+    if (!writeWav(vocalsOutPath, outVocL,  outVocR,  44100)) return false;
+    if (!writeWav(instrOutPath,  outInstL, outInstR, 44100)) return false;
 
     qDebug() << "[DemucsWrapper] готово:" << vocalsOutPath;
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// computeMagnitudeSpectrogram
-//
-// Вычисляет magnitude spectrogram в формате complex-as-channels:
-// [re_L, im_L, re_R, im_R] × kSpecFreqs × kSpecFrames
-// Размер выхода: 4 * kSpecFreqs * kSpecFrames float'ов
+// runChunk
 // ─────────────────────────────────────────────────────────────────────────────
 
-void DemucsWrapper::computeMagnitudeSpectrogram(
-    const QVector<float> &leftIn,
-    const QVector<float> &rightIn,
-    std::vector<float>   &specOut)
-{
-    // frames = ceil(kChunkSamples / kHop)
-    specOut.assign(4 * kSpecFreqs * kSpecFrames, 0.f);
-
-    // Указатели на 4 плоскости: re_L, im_L, re_R, im_R
-    float *reL = specOut.data();
-    float *imL = reL + kSpecFreqs * kSpecFrames;
-    float *reR = imL + kSpecFreqs * kSpecFrames;
-    float *imR = reR + kSpecFreqs * kSpecFrames;
-
-    QVector<float> frameBuf(kNfft, 0.f);
-    QVector<kiss_fft_cpx> spectrum(kNfft / 2 + 1);
-
-    for (int frame = 0; frame < kSpecFrames; ++frame) {
-        const int offset = frame * kHop;
-
-        // Левый канал
-        for (int i = 0; i < kNfft; ++i) {
-            int idx = offset + i;
-            frameBuf[i] = (idx < leftIn.size()) ? leftIn[idx] * m_window[i] : 0.f;
-        }
-        kiss_fftr(m_fftCfg, frameBuf.constData(), spectrum.data());
-        // Берём бины 1..kSpecFreqs (пропускаем DC=0 и Nyquist)
-        for (int f = 0; f < kSpecFreqs; ++f) {
-            reL[frame + f * kSpecFrames] = spectrum[f + 1].r;
-            imL[frame + f * kSpecFrames] = spectrum[f + 1].i;
-        }
-
-        // Правый канал
-        for (int i = 0; i < kNfft; ++i) {
-            int idx = offset + i;
-            frameBuf[i] = (idx < rightIn.size()) ? rightIn[idx] * m_window[i] : 0.f;
-        }
-        kiss_fftr(m_fftCfg, frameBuf.constData(), spectrum.data());
-        for (int f = 0; f < kSpecFreqs; ++f) {
-            reR[frame + f * kSpecFrames] = spectrum[f + 1].r;
-            imR[frame + f * kSpecFrames] = spectrum[f + 1].i;
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// runOnnx
-// ─────────────────────────────────────────────────────────────────────────────
-
-bool DemucsWrapper::runOnnx(const QVector<float> &leftIn,  const QVector<float> &rightIn,
-                             QVector<float>       &leftVoc,  QVector<float>       &rightVoc,
-                             QVector<float>       &leftInst, QVector<float>       &rightInst)
+bool DemucsWrapper::runChunk(const float *left, const float *right,
+                             std::vector<float> &vocL,  std::vector<float> &vocR,
+                             std::vector<float> &instL, std::vector<float> &instR)
 {
     try {
         auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        const int N = kChunkSamples;
 
-        // ── Тензор 1: waveform "input" [1, 2, kChunkSamples] ─────────────────
-        // Формат: сначала все левые сэмплы, затем все правые
-        std::vector<float> waveData(2 * kChunkSamples);
-        std::copy(leftIn.constData(),  leftIn.constData()  + kChunkSamples, waveData.data());
-        std::copy(rightIn.constData(), rightIn.constData() + kChunkSamples, waveData.data() + kChunkSamples);
+        // ── Вход 1: waveform "input" [1, 2, N] ───────────────────────────────
+        std::vector<float> waveData(2 * static_cast<size_t>(N));
+        std::copy(left,  left  + N, waveData.begin());
+        std::copy(right, right + N, waveData.begin() + N);
 
-        const int64_t waveShape[] = { 1, 2, kChunkSamples };
+        const int64_t waveShape[] = { 1, 2, N };
         Ort::Value waveTensor = Ort::Value::CreateTensor<float>(
             memInfo, waveData.data(), waveData.size(), waveShape, 3);
 
-        // ── Тензор 2: spectrogram "x" [1, 4, kSpecFreqs, kSpecFrames] ────────
-        // complex-as-channels: [re_L, im_L, re_R, im_R]
+        // ── Вход 2: CaC-спектрограмма "x" [1, 4, 2048, frames] ───────────────
+        const int frames = DemucsDsp::numFrames(N);          // 336
         std::vector<float> specData;
-        computeMagnitudeSpectrogram(leftIn, rightIn, specData);
+        m_dsp.computeCac(left, right, N, specData);
 
-        const int64_t specShape[] = { 1, 4, kSpecFreqs, kSpecFrames };
+        const int64_t specShape[] = { 1, 4, DemucsDsp::kFreqs, frames };
         Ort::Value specTensor = Ort::Value::CreateTensor<float>(
             memInfo, specData.data(), specData.size(), specShape, 4);
 
-        // ── Инференс ──────────────────────────────────────────────────────────
-        const char *inputNames[]  = { "input", "x" };
-        const char *outputNames[] = { "add_67" };   // waveform выход [1,4,2,343980]
-
+        // ── Инференс (запрашиваем ВСЕ выходы) ────────────────────────────────
+        const char *inputNames[] = { "input", "x" };
         Ort::Value inputTensors[] = { std::move(waveTensor), std::move(specTensor) };
 
-        auto outputs = m_session->Run(
-            Ort::RunOptions{nullptr},
-            inputNames,  inputTensors, 2,
-            outputNames, 1);
+        std::vector<const char *> outNames;
+        for (const std::string &s : m_outputNames) outNames.push_back(s.c_str());
 
-        // ── Читаем выход [1, 4, 2, kChunkSamples] ────────────────────────────
-        // stems: 0=drums, 1=bass, 2=other, 3=vocals
-        const float *out   = outputs[0].GetTensorData<float>();
-        const int    nSamp = kChunkSamples;
-        const int    stemStride = 2 * nSamp;  // left+right за один стем
+        auto outputs = m_session->Run(Ort::RunOptions{nullptr},
+                                      inputNames, inputTensors, 2,
+                                      outNames.data(), outNames.size());
 
-        leftVoc.resize(nSamp);  rightVoc.resize(nSamp);
-        leftInst.resize(nSamp); rightInst.resize(nSamp);
+        // ── Классификация выходов по числу элементов ─────────────────────────
+        const size_t timeElems = size_t(kStems) * 2 * N;
+        const size_t freqElems = size_t(kStems) * 4 * DemucsDsp::kFreqs * frames;
 
-        // Вокал = стем 3
-        const float *vocL = out + 3 * stemStride;
-        const float *vocR = out + 3 * stemStride + nSamp;
-        std::copy(vocL, vocL + nSamp, leftVoc.data());
-        std::copy(vocR, vocR + nSamp, rightVoc.data());
-
-        // Инструментал = drums(0) + bass(1) + other(2)
-        std::fill(leftInst.data(),  leftInst.data()  + nSamp, 0.f);
-        std::fill(rightInst.data(), rightInst.data() + nSamp, 0.f);
-        for (int s = 0; s < 3; ++s) {
-            const float *sL = out + s * stemStride;
-            const float *sR = out + s * stemStride + nSamp;
-            for (int i = 0; i < nSamp; ++i) {
-                leftInst[i]  += sL[i];
-                rightInst[i] += sR[i];
+        const float *timeOut = nullptr;
+        const float *freqOut = nullptr;
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            const auto   info  = outputs[i].GetTensorTypeAndShapeInfo();
+            const size_t count = info.GetElementCount();
+            if (!m_loggedShapes) {
+                QString shape;
+                for (int64_t d : info.GetShape()) shape += QString::number(d) + " ";
+                qDebug() << "[DemucsWrapper] выход" << QString::fromStdString(m_outputNames[i])
+                         << "форма" << shape << "элементов" << count;
             }
+            if (count == timeElems)      timeOut = outputs[i].GetTensorData<float>();
+            else if (count == freqElems) freqOut = outputs[i].GetTensorData<float>();
         }
+        if (!timeOut && !freqOut) {
+            m_lastError = "Неожиданные выходы модели (ни временная, ни частотная ветка)";
+            qCritical() << "[DemucsWrapper]" << m_lastError;
+            return false;
+        }
+        if (!m_loggedShapes) {
+            if (!freqOut)
+                qWarning() << "[DemucsWrapper] частотная ветка не найдена — только временная,"
+                              " качество будет низким";
+            if (!timeOut)
+                qWarning() << "[DemucsWrapper] временная ветка не найдена";
+            m_loggedShapes = true;
+        }
+
+        // ── Сборка стемов: istft(freq) + time ────────────────────────────────
+        const size_t freqStem = size_t(4) * DemucsDsp::kFreqs * frames;   // один стем, 4 CaC-канала
+        std::vector<float> stemL(N), stemR(N);
+
+        auto buildStem = [&](int s, std::vector<float> &dstL, std::vector<float> &dstR, bool add) {
+            std::fill(stemL.begin(), stemL.end(), 0.f);
+            std::fill(stemR.begin(), stemR.end(), 0.f);
+            if (freqOut)
+                m_dsp.inverseCac(freqOut + s * freqStem, N, stemL.data(), stemR.data());
+            if (timeOut) {
+                const float *tL = timeOut + size_t(s) * 2 * N;
+                const float *tR = tL + N;
+                for (int i = 0; i < N; ++i) { stemL[i] += tL[i]; stemR[i] += tR[i]; }
+            }
+            if (!add) { dstL = stemL; dstR = stemR; return; }
+            for (int i = 0; i < N; ++i) { dstL[i] += stemL[i]; dstR[i] += stemR[i]; }
+        };
+
+        buildStem(kVocalsStem, vocL, vocR, false);
+
+        instL.assign(N, 0.f);
+        instR.assign(N, 0.f);
+        for (int s = 0; s < kStems; ++s)
+            if (s != kVocalsStem) buildStem(s, instL, instR, true);
 
         return true;
 
@@ -286,56 +273,6 @@ bool DemucsWrapper::runOnnx(const QVector<float> &leftIn,  const QVector<float> 
         m_lastError = QString("ONNX inference: %1").arg(e.what());
         qCritical() << "[DemucsWrapper]" << m_lastError;
         return false;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// STFT / iSTFT  (используются для LrcBuilder, не для Demucs)
-// ─────────────────────────────────────────────────────────────────────────────
-
-void DemucsWrapper::stft(const float *pcm, float *outReal, float *outImag)
-{
-    QVector<float> windowed(kNfft);
-    for (int i = 0; i < kNfft; ++i)
-        windowed[i] = pcm[i] * m_window[i];
-
-    QVector<kiss_fft_cpx> spectrum(kNfft / 2 + 1);
-    kiss_fftr(m_fftCfg, windowed.constData(), spectrum.data());
-
-    for (int i = 0; i < kNfreqs; ++i) {
-        outReal[i] = spectrum[i].r;
-        outImag[i] = spectrum[i].i;
-    }
-}
-
-void DemucsWrapper::istft(const float *inReal, const float *inImag, float *outPcm)
-{
-    QVector<kiss_fft_cpx> spectrum(kNfreqs);
-    for (int i = 0; i < kNfreqs; ++i) {
-        spectrum[i].r = inReal[i];
-        spectrum[i].i = inImag[i];
-    }
-
-    QVector<float> raw(kNfft);
-    kiss_fftri(m_ifftCfg, spectrum.constData(), raw.data());
-
-    const float norm = 1.0f / kNfft;
-    for (int i = 0; i < kNfft; ++i)
-        outPcm[i] = raw[i] * norm * m_window[i];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Crossfade
-// ─────────────────────────────────────────────────────────────────────────────
-
-void DemucsWrapper::applyCrossfade(QVector<float> &prev, const QVector<float> &curr,
-                                    int overlapSamples)
-{
-    const int prevSize = prev.size();
-    for (int i = 0; i < overlapSamples && i < prevSize && i < curr.size(); ++i) {
-        const float t = static_cast<float>(i) / overlapSamples;
-        prev[prevSize - overlapSamples + i] =
-            prev[prevSize - overlapSamples + i] * (1.f - t) + curr[i] * t;
     }
 }
 

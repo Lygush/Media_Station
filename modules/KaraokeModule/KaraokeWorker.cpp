@@ -11,6 +11,7 @@
 #include "WhisperWrapper.h"
 #include "LrcFetcher.h"
 #include "LrcBuilder.h"
+#include "LyricsAligner.h"
 #include "../../tools/AtomicFile.h"
 
 
@@ -171,6 +172,8 @@ bool KaraokeWorker::stepDemucs(const QString &inputWav,
 
 bool KaraokeWorker::stepLrc(const QString &vocalsWav, const QString &lrcOut)
 {
+    QString plainLyrics;   // текст без времени (lrclib) — выровняем по Whisper
+
     // ── Пробуем lrclib.net ────────────────────────────────────────────────────
     if (m_meta.hasEnoughMeta()) {
         reportProgress(66, "Поиск текста онлайн...");
@@ -187,8 +190,10 @@ bool KaraokeWorker::stepLrc(const QString &vocalsWav, const QString &lrcOut)
         }
 
         if (r.hasPlain) {
-            // Есть текст но без синхронизации — запустим Whisper для тайм-кодов
-            qDebug() << "[KaraokeWorker] lrclib: только plainLyrics, fallback на Whisper";
+            // Есть текст но без синхронизации: Whisper даст время слов,
+            // а текст и строки останутся эталонными (LyricsAligner)
+            plainLyrics = r.plainLyrics;
+            qDebug() << "[KaraokeWorker] lrclib: только plainLyrics — Whisper + выравнивание";
         } else if (r.networkError) {
             qDebug() << "[KaraokeWorker] lrclib: нет сети, fallback на Whisper";
         } else {
@@ -213,12 +218,18 @@ bool KaraokeWorker::stepLrc(const QString &vocalsWav, const QString &lrcOut)
         return false;
     }
 
+    // Словарь песни как подсказка декодеру (если текст известен)
+    const QString prompt = plainLyrics.isEmpty()
+                               ? QString()
+                               : LyricsAligner::promptVocabulary(plainLyrics);
+
     const TranscriptResult tr = whisper.transcribe(vocals16k,
         [this](int pct) -> bool {
             // Whisper занимает 70–97% общего прогресса
             reportProgress(70 + pct * 27 / 100, "Распознавание текста...");
             return !isCancelled();
-        }
+        },
+        prompt
     );
 
     if (!tr.success) {
@@ -228,6 +239,19 @@ bool KaraokeWorker::stepLrc(const QString &vocalsWav, const QString &lrcOut)
     if (isCancelled()) return false;
 
     reportProgress(97, "Сборка субтитров...");
+
+    // Известный текст: правильные слова и строки + время от Whisper
+    if (!plainLyrics.isEmpty()) {
+        const LyricsAligner::Result al = LyricsAligner::align(plainLyrics, tr.words);
+        qDebug() << "[KaraokeWorker] выравнивание: совпало" << al.matchedWords
+                 << "из" << al.refWords << "слов (" << int(al.matchedRatio * 100) << "% )";
+        if (al.matchedRatio >= 0.25) {
+            AtomicFile::writeBytes(lrcOut, LrcBuilder::buildFromLines(al.lines).toUtf8());
+            return true;
+        }
+        qWarning() << "[KaraokeWorker] совпадений слишком мало — используем распознанный текст";
+    }
+
     const QString lrc = LrcBuilder::build(tr.words);
     AtomicFile::writeBytes(lrcOut, lrc.toUtf8());
     return true;
@@ -283,6 +307,11 @@ QString KaraokeWorker::whisperDllDir() const
 
 QString KaraokeWorker::whisperModelPath() const
 {
+    // Полная large-v3 заметно точнее turbo на русском пении; если положить
+    // ggml-large-v3.bin рядом — он будет использован автоматически.
+    const QString full = m_appDir + "/tools/whisper/models/ggml-large-v3.bin";
+    if (QFile::exists(full))
+        return full;
     return m_appDir + "/tools/whisper/models/ggml-large-v3-turbo.bin";
 }
 

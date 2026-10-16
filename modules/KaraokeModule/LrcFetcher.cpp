@@ -7,6 +7,7 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QDebug>
+#include <QThread>
 
 #include "../../tools/HttpClient.h"
 
@@ -56,16 +57,21 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
 {
     LrcResult result;
 
-    if (artist.trimmed().isEmpty() || title.trimmed().isEmpty()) {
-        qDebug() << "[LrcFetcher] Пустой artist или title — пропускаем запрос";
+    if (title.trimmed().isEmpty()) {
+        qDebug() << "[LrcFetcher] Пустой title — пропускаем запрос";
         return result;
     }
+
+    // Нет тегов -> KaraokeModule подставляет артиста "Unknown". Такой артист
+    // ломает поиск, поэтому в этом случае ищем только по названию (q=).
+    const bool noArtist = artist.trimmed().isEmpty()
+                          || artist.trimmed().compare(QLatin1String("Unknown"), Qt::CaseInsensitive) == 0;
 
     // /api/get требует ВСЕ поля (артист, трек, альбом, длительность). Без TagLib
     // альбома и длительности нет → lrclib отвечает 400 и текст никогда не
     // находился. В этом случае сразу используем /api/search.
     QByteArray raw;
-    if (!album.trimmed().isEmpty() && durationSec > 0) {
+    if (!noArtist && !album.trimmed().isEmpty() && durationSec > 0) {
         const QString url = buildUrl(artist, title, album, durationSec);
         qDebug() << "[LrcFetcher] GET" << url;
         raw = HttpClient::get(url, HttpClient::kTimeoutDefault, cancelled);
@@ -74,15 +80,46 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
     }
 
     if (raw.isEmpty()) {
+        // Поиск с повторами: lrclib иногда отвечает 5xx (503)
+        auto search = [&](const QUrlQuery &q) -> QByteArray {
+            QUrl url("https://lrclib.net/api/search");
+            url.setQuery(q);
+            qDebug() << "[LrcFetcher] SEARCH" << url.toString();
+            QByteArray found;
+            for (int attempt = 0; attempt < 3 && found.isEmpty(); ++attempt) {
+                if (attempt > 0) {
+                    qDebug() << "[LrcFetcher] повтор запроса, попытка" << attempt + 1;
+                    for (int i = 0; i < 15; ++i) {            // пауза 1.5 с с проверкой отмены
+                        if (cancelled && cancelled->load()) return {};
+                        QThread::msleep(100);
+                    }
+                }
+                found = HttpClient::get(url.toString(), HttpClient::kTimeoutDefault, cancelled);
+                if (cancelled && cancelled->load()) return {};
+            }
+            return found;
+        };
+
         QUrlQuery q;
-        q.addQueryItem("artist_name", cleanTag(artist));
-        q.addQueryItem("track_name",  cleanTag(title));
-        QUrl url("https://lrclib.net/api/search");
-        url.setQuery(q);
-        qDebug() << "[LrcFetcher] SEARCH" << url.toString();
-        const QByteArray found = HttpClient::get(url.toString(), HttpClient::kTimeoutDefault, cancelled);
+        if (noArtist) {
+            q.addQueryItem("q", cleanTag(title));
+        } else {
+            q.addQueryItem("artist_name", cleanTag(artist));
+            q.addQueryItem("track_name",  cleanTag(title));
+        }
+        QByteArray found = search(q);
         if (cancelled && cancelled->load())
             return result;
+
+        // Точный поиск ничего не дал (опечатки, "feat.", иное написание) —
+        // пробуем свободный запрос "артист название"
+        if (!noArtist && QJsonDocument::fromJson(found).array().isEmpty() && !found.isEmpty()) {
+            QUrlQuery q2;
+            q2.addQueryItem("q", cleanTag(artist) + QLatin1Char(' ') + cleanTag(title));
+            found = search(q2);
+            if (cancelled && cancelled->load())
+                return result;
+        }
 
         const QJsonArray arr = QJsonDocument::fromJson(found).array();
         QJsonObject best;

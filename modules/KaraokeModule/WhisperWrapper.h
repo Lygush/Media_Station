@@ -40,8 +40,11 @@ public:
     void    unload();
     QString lastError() const { return m_lastError; }
 
+    /// initialPrompt — подсказка декодеру (например словарь слов песни из lrclib):
+    /// повышает точность на редких словах и именах. Может быть пустой.
     TranscriptResult transcribe(const QString &wav16kPath,
-                                WhisperProgressCb progressCb = nullptr);
+                                WhisperProgressCb progressCb = nullptr,
+                                const QString &initialPrompt = QString());
 
 private:
     bool resolveSymbols();

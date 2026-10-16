@@ -28,6 +28,9 @@ public:
     static QString build(const QVector<WhisperWord> &words,
                          qint64 pauseThresholdMs = kDefaultPauseThresholdMs);
 
+    /// Готовые строки (слова уже сгруппированы, например из LyricsAligner) → Enhanced LRC.
+    static QString buildFromLines(const QVector<QVector<WhisperWord>> &lines);
+
 private:
     /// Форматирует миллисекунды в [mm:ss.xx]
     static QString formatTimestamp(qint64 ms);

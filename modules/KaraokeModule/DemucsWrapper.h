@@ -5,10 +5,11 @@
 #include <QVector>
 #include <functional>
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include "onnxruntime_cxx_api.h"
-#include "kiss/kiss_fftr.h"
+#include "DemucsDsp.h"
 
 using DemucsProgressCb = std::function<void(int percent)>;
 
@@ -40,48 +41,32 @@ private:
                   const QVector<float> &right,
                   int sampleRate);
 
-    // ── STFT / iSTFT ──────────────────────────────────────────────────────────
-    // nfft=4096, hop=1024 совпадают с тем что использует HTDemucs
-    static constexpr int kNfft   = 4096;
-    static constexpr int kHop    = 1024;
-    static constexpr int kNfreqs = kNfft / 2 + 1;  // 2049 — для stft/istft
+    // ── Модель ────────────────────────────────────────────────────────────────
+    // Вход  "input": [1, 2, 343980]        — waveform
+    // Вход  "x":     [1, 4, 2048, 336]     — CaC-спектрограмма (см. DemucsDsp.h)
+    // Выход "add_67":[1, 4, 2, 343980]     — ВРЕМЕННАЯ ветка (xt)
+    // Выход частотной ветки [1, 4, 4, 2048, 336] — её нужно пропустить через iSTFT
+    //   и сложить с временной. Определяется по числу элементов (имя зависит от экспорта).
+    // Стемы: 0=drums 1=bass 2=other 3=vocals
+    static constexpr int kChunkSamples = 343980;
+    static constexpr int kStems        = 4;
+    static constexpr int kVocalsStem   = 3;
+    static constexpr float kOverlap    = 0.25f;   // как в demucs apply_model
 
-    void stft (const float *pcm,    float *outReal, float *outImag);
-    void istft(const float *inReal, const float *inImag, float *outPcm);
-
-    // ── Spectrogram для ONNX-входа "x" ───────────────────────────────────────
-    // Модель ожидает [1, 4, 2048, 336]:
-    //   4 канала = re_L, im_L, re_R, im_R (complex-as-channels)
-    //   2048 частотных бинов (без DC и Nyquist, т.е. бины 1..2048)
-    //   336 фреймов = ceil(343980 / 1024)
-    static constexpr int kSpecFreqs  = 2048;
-    static constexpr int kSpecFrames = 336;
-
-    void computeMagnitudeSpectrogram(const QVector<float> &leftIn,
-                                     const QVector<float> &rightIn,
-                                     std::vector<float>   &specOut);
-
-    // ── Чанковая обработка ────────────────────────────────────────────────────
-    // Длина чанка фиксирована моделью: вход "input" = [1, 2, 343980]
-    static constexpr int kChunkSamples   = 343980;
-    static constexpr int kOverlapSamples = 44100 / 4;  // 0.25 сек crossfade
-
-    bool runOnnx(const QVector<float> &leftIn,  const QVector<float> &rightIn,
-                 QVector<float>       &leftVoc,  QVector<float>       &rightVoc,
-                 QVector<float>       &leftInst, QVector<float>       &rightInst);
-
-    static void applyCrossfade(QVector<float> &prev, const QVector<float> &curr,
-                               int overlapSamples);
+    // Один чанк ровно kChunkSamples: результат — вокал и инструментал (L/R).
+    bool runChunk(const float *left, const float *right,
+                  std::vector<float> &vocL,  std::vector<float> &vocR,
+                  std::vector<float> &instL, std::vector<float> &instR);
 
     // ── ONNX ──────────────────────────────────────────────────────────────────
     Ort::Env            m_env { ORT_LOGGING_LEVEL_WARNING, "DemucsWrapper" };
     Ort::Session       *m_session = nullptr;
     Ort::SessionOptions m_sessionOptions;
 
-    // ── kiss_fft ──────────────────────────────────────────────────────────────
-    kiss_fftr_cfg  m_fftCfg  = nullptr;
-    kiss_fftr_cfg  m_ifftCfg = nullptr;
-    QVector<float> m_window;
+    std::vector<std::string> m_outputNames;
+    bool                     m_loggedShapes = false;
+
+    DemucsDsp::Stft m_dsp;
 
     QString m_lastError;
 };

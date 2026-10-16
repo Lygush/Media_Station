@@ -8,7 +8,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QRegularExpression>
-#include <QtConcurrent>
+#include <QThreadPool>
 #include <QDebug>
 
 SteamAppList &SteamAppList::instance()
@@ -47,7 +47,7 @@ void SteamAppList::loadIfNeeded()
         m_cancelled = false;
     }
 
-    QtConcurrent::run([this]() { loadFromFile(); });
+    QThreadPool::globalInstance()->start([this]() { loadFromFile(); });
 }
 
 // Блокирует вызывающий поток до завершения загрузки.

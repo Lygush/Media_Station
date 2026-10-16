@@ -78,6 +78,8 @@ SOURCES += \
     modules/KaraokeModule/DemucsWrapper.cpp                 \
     modules/KaraokeModule/LrcFetcher.cpp                    \
     modules/KaraokeModule/LrcBuilder.cpp                    \
+    modules/KaraokeModule/LyricsAligner.cpp                 \
+    modules/KaraokeModule/SongNameResolver.cpp              \
     modules/KaraokeModule/LrcParser.cpp                     \
     modules/KaraokeModule/WhisperWrapper.cpp                \
     modules/KaraokeModule/kiss/kiss_fft.c                        \
@@ -120,9 +122,13 @@ HEADERS += \
     modules/KaraokeModule/KaraokeModule.h                   \
     modules/KaraokeModule/KaraokeWorker.h                   \
     modules/KaraokeModule/DemucsWrapper.h                   \
+    modules/KaraokeModule/DemucsDsp.h                       \
+    modules/KaraokeModule/VoiceActivity.h                   \
     modules/KaraokeModule/SongMeta.h                        \
     modules/KaraokeModule/LrcFetcher.h                      \
     modules/KaraokeModule/LrcBuilder.h                      \
+    modules/KaraokeModule/LyricsAligner.h                   \
+    modules/KaraokeModule/SongNameResolver.h                \
     modules/KaraokeModule/LrcParser.h                       \
     modules/KaraokeModule/WhisperWrapper.h                  \
     modules/KaraokeModule/kiss/kiss_fft.h                        \
