@@ -4,6 +4,7 @@ CONFIG -= app_bundle
 
 TARGET = tst_g72battery_mock
 TEMPLATE = app
+include($$PWD/../../common.pri)
 
 DEFINES += TEST_MODE  # отключаем реальный WinRT
 
@@ -15,6 +16,4 @@ SOURCES += \
     ../../../modules/AirMouseModule/G72BatteryModule.cpp
 
 HEADERS += \
-    ../../../modules/AirMouseModule/G72BatteryModule.h \
-    ../../../core/IModule.h \
-    ../../../core/EventBus.h
+    ../../../modules/AirMouseModule/G72BatteryModule.h

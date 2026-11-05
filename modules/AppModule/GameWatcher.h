@@ -76,13 +76,18 @@ private:
     static quint64 launchPs1(const QString &ps1Path, const QString &pidFilePath);
 
     /// Читает PID из файла, ожидая его появления не более timeoutMs мс.
-    static quint32  readPidFile(const QString &pidFilePath, int timeoutMs);
+    /// Прерывается, как только running становится 0 (выход из программы).
+    static quint32  readPidFile(const QString &pidFilePath, int timeoutMs,
+                                const QAtomicInt &running);
 
     /// Находит главный HWND процесса по его PID.
     static quintptr findMainWindowByPid(quint32 pid);
 
     /// Проверяет, занимает ли окно весь монитор без рамки (exclusive/borderless FS).
     static bool hasOwnFullscreen(quintptr hwnd);
+
+    /// Окно занимает не меньше половины монитора (игра в окне, а не заставка/лаунчер).
+    static bool isLargeGameWindow(quintptr hwnd);
 
     /// Переводит окно в режим borderless fullscreen на мониторе, где оно находится.
     static void applyBorderlessFullscreen(quintptr hwnd);

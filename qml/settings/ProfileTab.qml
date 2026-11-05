@@ -18,7 +18,9 @@ Item {
     signal addClicked()
 
     width:  parent ? parent.width : 0
-    height: Settings.us(38)
+    height: Math.max(Settings.us(38), Math.ceil(tabHeightMetrics.height) + Settings.us(18))
+
+    TextMetrics { id: tabHeightMetrics; font.pixelSize: Settings.fs(13); text: "Ag" }
 
     ListView {
         id: profileTabsList
@@ -36,8 +38,12 @@ Item {
         delegate: Item {
             id: tabDelegate
             property string tabLabel:    model.name || ""
-            property int    desiredWidth: tabLabelMetrics.width + Settings.us(32)
-            width:  Math.max(Settings.us(60), Math.min(Settings.us(240), desiredWidth))
+            property int    desiredWidth: tabLabelMetrics.advanceWidth + Settings.us(32)
+            // Вкладки делят доступную ширину; полоса прокручивается, если не влезают
+            readonly property real fairShare: profileTabsList.count > 0
+                ? (profileTabsList.width - profileTabsList.spacing * (profileTabsList.count - 1)) / profileTabsList.count
+                : profileTabsList.width
+            width:  Math.round(Math.max(Settings.us(60), Math.min(Math.max(Settings.us(240), fairShare), desiredWidth)))
             height: parent ? parent.height - Settings.us(4) : 0
             y:      Settings.us(2)
             property bool isActive: model.profileId === root.currentProfileId
@@ -56,12 +62,7 @@ Item {
                 anchors.centerIn: parent
                 text: tabDelegate.tabLabel
                 color: "white"
-                font.pixelSize: {
-                    var maxWidth = parent.width - Settings.us(10)
-                    if (tabLabelMetrics.width > maxWidth)
-                        return Math.max(Settings.us(10), Settings.fs(13) * maxWidth / tabLabelMetrics.width)
-                    return Settings.fs(13)
-                }
+                font.pixelSize: Settings.fs(13)
                 font.bold: isActive
                 width: parent.width - Settings.us(10)
                 horizontalAlignment: Text.AlignHCenter
@@ -71,7 +72,7 @@ Item {
             TextMetrics {
                 id: tabLabelMetrics
                 font.pixelSize: Settings.fs(13)
-                font.family:    profileTabText.font.family
+                font.bold:      true
                 text:           tabDelegate.tabLabel
             }
             MouseArea {
@@ -79,8 +80,7 @@ Item {
                 onClicked: root.currentProfileId = model.profileId
             }
             ToolTip {
-                visible: tabMA.containsMouse
-                         && tabLabelMetrics.width > parent.width - Settings.us(10)
+                visible: tabMA.containsMouse && profileTabText.truncated
                 text:  tabDelegate.tabLabel
                 delay: 500
             }

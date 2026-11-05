@@ -113,8 +113,12 @@ private:
     bool  m_fetchingTrailer = false;
     qreal m_trailerProgress = 0.0;
 
-    CoverFetcher   *m_coverFetcher   = nullptr;
-    TrailerFetcher *m_trailerFetcher = nullptr;
+    // QPointer: загрузчик удаляется в своём потоке сразу по завершении, а
+    // обработчик в GUI-потоке срабатывает позже. С сырыми указателями отмена
+    // (кнопка или выход из программы) в этот промежуток обращалась к уже
+    // удалённому объекту.
+    QPointer<CoverFetcher>   m_coverFetcher;
+    QPointer<TrailerFetcher> m_trailerFetcher;
     // Рабочие потоки фетчеров — нужно дождаться их в shutdown(), иначе
     // QThread уничтожается работающим (аварийное завершение при выходе)
     QPointer<QThread> m_coverThread;

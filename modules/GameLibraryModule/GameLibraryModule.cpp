@@ -11,6 +11,7 @@
 #include "NotificationModule.h"
 #include "tools/AtomicFile.h"
 #include "tools/SevenZip.h"
+#include "InstallUtils.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -31,6 +32,7 @@
 #include <QFutureWatcher>
 #include <QPointer>
 #include <QThreadPool>
+#include <QSet>
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Конструктор / деструктор
@@ -355,6 +357,21 @@ void GameLibraryModule::scanLibrary()
         }
 
         if (self) QMetaObject::invokeMethod(self.data(), [this, results]() {
+            // Игры, которых больше нет на диске (удалены вручную, сменён путь
+            // установки), раньше оставались в m_entries навсегда и появлялись
+            // в currentEntries() и подсчёте плиток.
+            QSet<QString> seen;
+            for (const QVariant &v : results)
+                seen.insert(v.toMap().value("id").toString());
+            for (auto it = m_entries.begin(); it != m_entries.end(); ) {
+                const bool busy = m_archiveTasks.contains(it.key())
+                               || m_extractTasks.contains(it.key());
+                if (!busy && !seen.contains(it.key()))
+                    it = m_entries.erase(it);
+                else
+                    ++it;
+            }
+
             m_scanning = false;
             emit scanningChanged();
             emit scanFinished(results);
@@ -528,6 +545,19 @@ void GameLibraryModule::archiveGame(const QString &gameId)
     }
     if (m_archiveTasks.contains(gameId) || m_extractTasks.contains(gameId)) return;
 
+    // Проверяем архиватор ДО удаления плиток — иначе при его отсутствии
+    // плитки пропадали, а игра оставалась неархивированной.
+    if (!SevenZip::isAvailable()) {
+        qWarning() << "GameLibraryModule::archiveGame: 7zr.exe not found";
+        if (m_bus)
+            emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
+                                    Notifications::makeEvent(
+                                        "Архиватор 7zr.exe не найден в папке tools",
+                                        NotificationLevel::Error, true, 5000));
+        emit archiveFinished(gameId, false);
+        return;
+    }
+
     QVariantMap entry         = m_entries[gameId];
     const QString installPath = QDir::fromNativeSeparators(
         entry.value("installPath").toString());
@@ -569,23 +599,7 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                 if (cancelled) {
                     QFile::remove(archiveFinal);
                     QDir(archiveDir).rmdir(".");
-
-                    if (m_entries.contains(gameId)) {
-                        const QStringList locs = m_entries[gameId].value("_savedTileLocs")
-                        .toStringList();
-                        if (!locs.isEmpty()) {
-                            QVariantList locsVar;
-                            for (const QString &l : locs) locsVar << l;
-                            m_entries[gameId]["tileLocations"] = locsVar;
-                            writeGameInfo(m_entries[gameId].value("installPath").toString(),
-                                          m_entries[gameId]);
-                            for (const QString &sk : locs)
-                                createTile(gameId, sk, false);
-                        }
-                        m_entries[gameId].remove("_archiveProgress");
-                        m_entries[gameId].remove("_archiveCurrentFile");
-                        m_entries[gameId].remove("_savedTileLocs");
-                    }
+                    restoreTilesAfterArchive(gameId);
                     qDebug() << "GameLibraryModule: archive cancelled, tiles restored:" << gameId;
                     if (m_bus) {
                         const QString name = m_entries.contains(gameId)
@@ -628,6 +642,9 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                 } else {
                     QFile::remove(archiveFinal);
                     QDir(archiveDir).rmdir(".");
+                    // Игра осталась на месте — возвращаем её плитки (раньше
+                    // они восстанавливались только при отмене).
+                    restoreTilesAfterArchive(gameId);
                     qWarning() << "GameLibraryModule: archive failed:" << gameId;
                     if (m_bus) {
                         const QString name = m_entries.contains(gameId)
@@ -684,6 +701,23 @@ void GameLibraryModule::archiveGame(const QString &gameId)
         });
 
     watcher->setFuture(future);
+}
+
+void GameLibraryModule::restoreTilesAfterArchive(const QString &gameId)
+{
+    if (!m_entries.contains(gameId)) return;
+    const QStringList locs = m_entries[gameId].value("_savedTileLocs").toStringList();
+    if (!locs.isEmpty()) {
+        QVariantList locsVar;
+        for (const QString &l : locs) locsVar << l;
+        m_entries[gameId]["tileLocations"] = locsVar;
+        writeGameInfo(m_entries[gameId].value("installPath").toString(), m_entries[gameId]);
+        for (const QString &sk : locs)
+            createTile(gameId, sk, false);
+    }
+    m_entries[gameId].remove("_archiveProgress");
+    m_entries[gameId].remove("_archiveCurrentFile");
+    m_entries[gameId].remove("_savedTileLocs");
 }
 
 void GameLibraryModule::cancelArchive(const QString &gameId)
@@ -752,6 +786,12 @@ void GameLibraryModule::extractGame(const QString &gameId,
         const bool cancelled = (r == SevenZip::Cancelled);
         const bool ok        = (r == SevenZip::Ok);
 
+        // Недораспакованная game/ бесполезна, архив остаётся на месте.
+        // Удаляем здесь, а не в GUI-потоке: при выходе из программы
+        // обработчик ниже уже не вызывается, и мусор оставался на диске.
+        if (!ok)
+            QDir(installPath + "/game").removeRecursively();
+
         if (self) QMetaObject::invokeMethod(self.data(),
                                   [this, gameId, ok, cancelled, installPath, archivePath,
                                    keepArchive, storageKey, isFolder]()
@@ -760,8 +800,6 @@ void GameLibraryModule::extractGame(const QString &gameId,
                                       m_extractProgress.remove(gameId);
 
                                       if (cancelled) {
-                                          // Удаляем частично восстановленную папку game/.
-                                          QDir(installPath + "/game").removeRecursively();
                                           qDebug() << "GameLibraryModule: extract cancelled:" << gameId;
                                           if (m_bus) {
                                               emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
@@ -800,6 +838,16 @@ void GameLibraryModule::extractGame(const QString &gameId,
                                                                           NotificationLevel::Info, true, 4000));
                                           }
                                           emit libraryEntryChanged(gameId, m_entries[gameId]);
+                                      } else if (!ok) {
+                                          qWarning() << "GameLibraryModule: extract failed:" << gameId;
+                                          if (m_bus) {
+                                              const QString name = m_entries.contains(gameId)
+                                                  ? m_entries[gameId].value("name").toString() : gameId;
+                                              emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
+                                                                      Notifications::makeEvent(
+                                                                          QString("Ошибка распаковки «%1». Проверьте место на диске.").arg(name),
+                                                                          NotificationLevel::Error, true, 5000));
+                                          }
                                       }
                                       emit extractFinished(gameId, ok);
                                   }, Qt::QueuedConnection);
@@ -850,8 +898,13 @@ void GameLibraryModule::deleteGame(const QString &gameId)
         locs << v.toString();
     removeTilesFromStructure(locs, gameId);
 
-    // Удаляем всю папку игры (для всех типов, включая external)
-    QDir(QDir::fromNativeSeparators(installPath)).removeRecursively();
+    // Удаляем всю папку игры (для всех типов, включая external).
+    // Только если это действительно папка игры MediaStation.
+    const QString folder = QDir::fromNativeSeparators(installPath);
+    if (InstallUtils::isManagedGameFolder(folder))
+        QDir(folder).removeRecursively();
+    else
+        qWarning() << "GameLibraryModule::deleteGame: refusing to delete" << folder;
 
     m_entries.remove(gameId);
 

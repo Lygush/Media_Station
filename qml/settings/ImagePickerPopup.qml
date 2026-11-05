@@ -39,6 +39,7 @@ Popup {
         border.color: Settings.accent(0.6); border.width: 1.5
         layer.enabled: true
         layer.effect: DropShadow {
+            cached: true
             radius: 28; samples: 40; color: "#CC000000"; verticalOffset: 8
         }
     }
@@ -121,7 +122,13 @@ Popup {
                 visible: parent.parent.scannedImages.length === 0
                 anchors.centerIn: parent
                 spacing: Settings.us(10)
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "📂"; font.pixelSize: Settings.fs(30) }
+                Image {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    source: "qrc:/assets/icons/ic_folder.png"
+                    width: Settings.us(40); height: width
+                    sourceSize.width: 128; sourceSize.height: 128
+                    opacity: 0.7
+                }
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: Settings.safeTr("no_images_found"); color: Settings.accent(0.7)
@@ -217,7 +224,12 @@ Popup {
                 }
                 Row {
                     anchors.centerIn: parent; spacing: Settings.us(6)
-                    Text { text: "📁"; font.pixelSize: Settings.fs(13) }
+                    Image {
+                        source: "qrc:/assets/icons/ic_folder.png"
+                        width: Settings.us(16); height: width
+                        sourceSize.width: 64; sourceSize.height: 64
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
                     Text { text: Settings.safeTr("browse"); color: "white"; font.pixelSize: Settings.fs(13) }
                 }
                 MouseArea {

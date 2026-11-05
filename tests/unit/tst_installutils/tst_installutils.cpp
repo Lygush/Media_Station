@@ -1,24 +1,12 @@
-// tst_InstallUtils.cpp
+// tst_installutils.cpp
 // ─────────────────────────────────────────────────────────────────────────────
-// Unit-тесты для InstallUtils::parseDependencyAnalyzerOutput.
-//
-// Как подключить к проекту:
-//   1. Создать папку tests/tst_InstallUtils/
-//   2. Положить этот файл туда
-//   3. Добавить в MediaStation.pro (или создать отдельный .pro):
-//
-//      QT += testlib
-//      CONFIG += c++20 console testcase
-//      TARGET = tst_InstallUtils
-//      INCLUDEPATH += ../../modules/TileModule
-//      SOURCES += tst_InstallUtils.cpp \
-//                 ../../modules/TileModule/InstallUtils.cpp
-//
-// Запуск: ./tst_InstallUtils -v2
+// Unit-тесты для InstallUtils: разбор вывода PEDependencyAnalyzer,
+// имена папок игр, защита от удаления чужих папок, копирование с отменой.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <QtTest/QtTest>
 #include "InstallUtils.h"
+#include <QTemporaryDir>
 
 class TstInstallUtils : public QObject
 {
@@ -36,6 +24,11 @@ private slots:
     void summarySection_ignored();
     void emptyOutput_emptyResult();
     void realWorldOutput_universeSandbox();
+
+    void sanitizeFolderName_data();
+    void sanitizeFolderName();
+    void managedGameFolder();
+    void copyFileCancelable_copiesAndCancels();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,5 +209,57 @@ Total: 4
     QVERIFY(r.inputTypes.isEmpty());  // нет xinput/dinput
 }
 
+void TstInstallUtils::sanitizeFolderName_data()
+{
+    QTest::addColumn<QString>("title");
+    QTest::addColumn<QString>("expected");
+    QTest::newRow("plain")        << "Half-Life 2"     << "Half-Life 2";
+    QTest::newRow("invalid")      << "Game: Part?*2"   << "Game_ Part__2";
+    QTest::newRow("trailing dot") << "Game. "          << "Game";
+    QTest::newRow("reserved")     << "nul"             << "_nul";
+    QTest::newRow("reserved ext") << "COM1.txt"        << "_COM1.txt";
+    QTest::newRow("empty")        << "  "              << "Game_abcdefgh";
+    QTest::newRow("cyrillic")     << "Ведьмак 3"       << "Ведьмак 3";
+    QTest::newRow("control char") << QString("A\tB") << "A_B";
+}
+
+void TstInstallUtils::sanitizeFolderName()
+{
+    QFETCH(QString, title);
+    QFETCH(QString, expected);
+    QCOMPARE(InstallUtils::sanitizeFolderName(title, "abcdefghijk"), expected);
+}
+
+void TstInstallUtils::managedGameFolder()
+{
+    QTemporaryDir tmp;
+    QVERIFY(!InstallUtils::isManagedGameFolder(""));
+    QVERIFY(!InstallUtils::isManagedGameFolder(tmp.path()));          // пустая папка
+    QVERIFY(!InstallUtils::isManagedGameFolder(tmp.path() + "/nope"));// нет папки
+    QDir(tmp.path()).mkpath("launcher");
+    QFile f(tmp.path() + "/launcher/launch.ps1");
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.close();
+    QVERIFY(InstallUtils::isManagedGameFolder(tmp.path()));
+}
+
+void TstInstallUtils::copyFileCancelable_copiesAndCancels()
+{
+    QTemporaryDir tmp;
+    const QString src = tmp.filePath("src.bin");
+    QFile f(src);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(QByteArray(3 * 1024 * 1024 + 17, 'z'));
+    f.close();
+
+    auto flag = std::make_shared<std::atomic<bool>>(false);
+    QVERIFY(InstallUtils::copyFileCancelable(src, tmp.filePath("dst.bin"), flag, 1024 * 1024));
+    QCOMPARE(QFileInfo(tmp.filePath("dst.bin")).size(), QFileInfo(src).size());
+
+    flag->store(true);
+    QVERIFY(!InstallUtils::copyFileCancelable(src, tmp.filePath("dst2.bin"), flag));
+    QVERIFY(!QFile::exists(tmp.filePath("dst2.bin")));   // недокопированное удалено
+}
+
 QTEST_MAIN(TstInstallUtils)
-#include "tst_InstallUtils.moc"
+#include "tst_installutils.moc"

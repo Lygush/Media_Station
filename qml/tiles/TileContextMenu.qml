@@ -32,7 +32,17 @@ Item {
     signal detailsRequested()   // Фаза 2: открыть страницу игры
 
 
-    width:   Settings.us(200)
+    // Ширина — по самой длинной видимой строке (кегль настраивается отдельно
+    // от масштаба, фиксированная ширина обрезала «Редактировать»)
+    width: {
+        var w = Settings.us(180)
+        for (var i = 0; i < menuCol.children.length; ++i) {
+            var c = menuCol.children[i]
+            if (c.visible && c.neededWidth !== undefined)
+                w = Math.max(w, c.neededWidth + 2 * Settings.us(8))
+        }
+        return Math.ceil(w)
+    }
     height:  menuCol.implicitHeight + Settings.us(18)
     visible: false
     z:       300
@@ -96,6 +106,7 @@ Item {
         transformOrigin: Item.Center
 
         DropShadow {
+            cached: true
             anchors.fill: menuBg; source: menuBg
             radius: 20; samples: 32; color: "#99000000"
             horizontalOffset: 0; verticalOffset: 4
@@ -105,9 +116,9 @@ Item {
             id: menuBg
             anchors.fill: parent; radius: 16
             gradient: Gradient {
-                GradientStop { position: 0.0; color: "#E8134A6E" }
-                GradientStop { position: 0.5; color: "#F00A2D4A" }
-                GradientStop { position: 1.0; color: "#E8134A6E" }
+                GradientStop { position: 0.0; color: "#F5134A6E" }
+                GradientStop { position: 0.5; color: "#FA0A2D4A" }
+                GradientStop { position: 1.0; color: "#F5134A6E" }
             }
         }
 
@@ -201,7 +212,9 @@ Item {
     component MenuButton: Item {
         id: menuBtn
         width:  parent ? parent.width : 0
-        height: Settings.us(40)
+        height: Math.max(Settings.us(40), Math.ceil(btnRow.implicitHeight) + Settings.us(14))
+        // Ширина содержимого с отступами: слева us(10), справа — us(18)
+        readonly property real neededWidth: btnRow.implicitWidth + Settings.us(10) + Settings.us(18)
 
         property string iconSrc:   ""
         property string iconText:  ""
@@ -219,13 +232,14 @@ Item {
         }
 
         Row {
+            id: btnRow
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left; anchors.leftMargin: Settings.us(10)
             spacing: Settings.us(8)
 
             Image {
                 source: menuBtn.iconSrc
-                width: 18; height: 18
+                width: Settings.us(18); height: Settings.us(18)
                 sourceSize.width: 100; sourceSize.height: 100
                 fillMode: Image.PreserveAspectFit
                 anchors.verticalCenter: parent.verticalCenter

@@ -6,7 +6,9 @@
 
 #include <QDateTime>
 #include <QDir>
+#include <QFileInfo>
 #include <QDebug>
+#include <QRegularExpression>
 
 QString AndroidTVModule::emulatorLogPath() const
 {
@@ -27,10 +29,20 @@ void AndroidTVModule::openEmulatorLogFile()
     if (m_emulatorLogFile.isOpen()) return;
     // Первый раз за сессию — перезаписываем файл, дальше только дописываем
     // (иначе запись в лог после closeEmulatorLogFile() стирала весь лог сессии).
-    static bool s_truncatedThisSession = false;
-    QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Text;
-    mode |= s_truncatedThisSession ? QIODevice::Append : QIODevice::Truncate;
-    s_truncatedThisSession = true;
+    // Лог прошлой сессии не стираем, а сохраняем как Android_TV.prev.log:
+    // раньше после неудачного запуска и перезапуска приложения подробности
+    // пропадали.
+    static bool s_rotatedThisSession = false;
+    if (!s_rotatedThisSession) {
+        s_rotatedThisSession = true;
+        const QString cur  = emulatorLogPath();
+        const QString prev = QFileInfo(cur).absolutePath() + "/Android_TV.prev.log";
+        if (QFileInfo(cur).size() > 0) {
+            QFile::remove(prev);
+            QFile::rename(cur, prev);
+        }
+    }
+    const QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append;
 
     m_emulatorLogFile.setFileName(emulatorLogPath());
     if (!m_emulatorLogFile.open(mode)) {
@@ -58,27 +70,35 @@ void AndroidTVModule::logToEmulatorFile(const QString &msg, bool fromEmulator)
     if (!m_emulatorLogFile.isOpen()) openEmulatorLogFile();
     if (!m_emulatorLogFile.isOpen()) return;
 
-    const char *prefix = fromEmulator ? "[EMULATOR] " : "[DETAIL] ";
+    const char *prefix = fromEmulator ? "[EMULATOR] " : "[DETAIL]   ";
     const QString profileStr = m_profileManager && m_profileManager->activeProfile()
-                                   ? " [" + m_profileManager->activeProfile()->avdName + "]"
+                                   ? "[" + m_profileManager->activeProfile()->avdName + "] "
                                    : QString();
     m_emulatorLogStream << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")
                         << " " << prefix << profileStr << msg << "\n";
     m_emulatorLogStream.flush();
+
+    // Ошибки самого эмулятора дублируем в основной журнал (с ограничением),
+    // чтобы причину неудачного запуска было видно без Android_TV.log.
+    if (fromEmulator && m_emulatorLinesForwarded < 40) {
+        // Только настоящие ошибки эмулятора («ERROR | …», «FATAL», «PANIC»);
+        // «Failed to load snapshot» при холодном старте и предупреждения Qt
+        // внутри эмулятора — штатные, им место только в Android_TV.log
+        static const QRegularExpression re(QStringLiteral("\\b(ERROR|FATAL|PANIC)\\b"));
+        for (const QString &line : msg.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+            if (!re.match(line).hasMatch()) continue;
+            Logger::write(Logger::kLevelWarning, "AndroidTV", "emulator: " + line.trimmed().left(300));
+            if (++m_emulatorLinesForwarded >= 40) {
+                Logger::write(Logger::kLevelWarning, "AndroidTV",
+                              "emulator: further errors only in logs/Android_TV.log");
+                break;
+            }
+        }
+    }
 }
 
 void AndroidTVModule::logImportant(const char *level, const QString &msg)
 {
-    if (qstrcmp(level, Logger::kLevelError) == 0 ||
-        qstrcmp(level, Logger::kLevelWarning) == 0)
-        qWarning() << "[AndroidTV]" << msg;
-    else
-        qDebug()   << "[AndroidTV]" << msg;
-
-    if (!m_bus) return;
-    QVariantMap data;
-    data["level"]   = QString(level);
-    data["source"]  = QStringLiteral("androidtv");
-    data["message"] = msg;
-    emit m_bus->moduleEvent(QStringLiteral("logger"), QStringLiteral("log"), data);
+    // Один путь записи (раньше — дважды: qDebug/qWarning и шина)
+    Logger::write(level, "AndroidTV", msg);
 }

@@ -19,6 +19,8 @@ Item {
 
     property string screenTitle:    Settings.safeTr("settings")
     property string activeCategory: ""
+    // Загруженный раздел (для перехода к подстраницам, напр. профили Android TV)
+    readonly property alias sectionItem: detailLoader.item
 
     function forceHoverCheck() {}
     function closeDialogs() {

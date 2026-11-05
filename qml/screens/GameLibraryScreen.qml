@@ -40,6 +40,24 @@ Item {
         "processing":  "qrc:/assets/icons/ic_folder.png"
     })
 
+    // Ширина колонок «Статус» и «Размер» — по самым длинным подписям при
+    // текущем кегле (иначе «Архивирование…» наезжало на размер)
+    TextMetrics {
+        id: statusMetrics
+        font.pixelSize: Settings.fs(13)
+        text: {
+            var l = [Settings.tr("lib_status_archiving"), Settings.tr("lib_status_extracting"),
+                     Settings.tr("lib_status_archive"), Settings.tr("lib_status_unavailable"),
+                     Settings.tr("lib_status_no_tile"), Settings.tr("lib_status_external"),
+                     Settings.tr("lib_status_installed")]
+            l.sort(function(a, b) { return b.length - a.length })
+            return l[0]
+        }
+    }
+    TextMetrics { id: sizeMetrics; font.pixelSize: Settings.fs(13); text: "999.99 GB" }
+    readonly property int _colStatusW: Math.max(Settings.us(180), Math.ceil(statusMetrics.advanceWidth) + Settings.us(36))
+    readonly property int _colSizeW:   Math.max(Settings.us(120), Math.ceil(sizeMetrics.advanceWidth) + Settings.us(16))
+
     function statusInfo(type, available, tileCount, archiving, extracting) {
         if (archiving)          return { key: "processing", label: Settings.tr("lib_status_archiving") }
         if (extracting)         return { key: "processing", label: Settings.tr("lib_status_extracting") }
@@ -314,11 +332,11 @@ Item {
                     width: parent.width; leftPadding: Settings.us(8); spacing: 0
                     Text { width: Settings.us(56); text: ""; color: Settings.accent(0.7); font.pixelSize: Settings.fs(12); font.bold: true }
                     Text {
-                        width: parent.width - Settings.us(56) - Settings.us(180) - Settings.us(120) - Settings.us(16)
+                        width: parent.width - Settings.us(56) - libScreen._colStatusW - libScreen._colSizeW - Settings.us(16)
                         text: Settings.tr("lib_col_name"); color: Settings.accent(0.7); font.pixelSize: Settings.fs(12); font.bold: true
                     }
-                    Text { width: Settings.us(180); text: Settings.tr("lib_col_status"); color: Settings.accent(0.7); font.pixelSize: Settings.fs(12); font.bold: true }
-                    Text { width: Settings.us(120); text: Settings.tr("lib_col_size"); color: Settings.accent(0.7); font.pixelSize: Settings.fs(12); font.bold: true; horizontalAlignment: Text.AlignRight }
+                    Text { width: libScreen._colStatusW; text: Settings.tr("lib_col_status"); color: Settings.accent(0.7); font.pixelSize: Settings.fs(12); font.bold: true }
+                    Text { width: libScreen._colSizeW; text: Settings.tr("lib_col_size"); color: Settings.accent(0.7); font.pixelSize: Settings.fs(12); font.bold: true; horizontalAlignment: Text.AlignRight }
                 }
 
                 Rectangle { width: parent.width; height: 1; color: Settings.accent(0.15) }
@@ -416,7 +434,7 @@ Item {
                                 }
 
                                 Item {
-                                    width: parent.parent.width - Settings.us(56) - Settings.us(180) - Settings.us(120) - Settings.us(16)
+                                    width: parent.parent.width - Settings.us(56) - libScreen._colStatusW - libScreen._colSizeW - Settings.us(16)
                                     height: Settings.us(56)
                                     Column {
                                         anchors.verticalCenter: parent.verticalCenter; spacing: 2
@@ -443,7 +461,7 @@ Item {
                                 }
 
                                 Item {
-                                    width: Settings.us(180); height: Settings.us(56)
+                                    width: libScreen._colStatusW; height: Settings.us(56)
                                     StatusBadge {
                                         anchors.verticalCenter: parent.verticalCenter
                                         readonly property var si: libScreen.statusInfo(
@@ -455,7 +473,7 @@ Item {
                                 }
 
                                 Item {
-                                    width: Settings.us(120); height: Settings.us(56)
+                                    width: libScreen._colSizeW; height: Settings.us(56)
                                     Text {
                                         anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                                         visible: model.type !== "external"

@@ -75,7 +75,8 @@ Column {
         Text {
             text:  root.profileData.displayName || ""
             color: "white"; font.pixelSize: Settings.fs(13)
-            elide: Text.ElideRight; width: Settings.us(260)
+            elide: Text.ElideRight
+            width: Math.min(implicitWidth, Settings.us(420))
         }
     }
     SectionDivider {}
@@ -121,29 +122,20 @@ Column {
         Row {
             spacing: Settings.us(8)
 
-            Item {
-                width: Settings.us(70); height: Settings.us(34)
+            PillButton {
                 readonly property bool autoRes: (root.profileData.resolution || "auto") === "auto"
-                Rectangle {
-                    anchors.fill: parent; radius: 9
-                    color: parent.autoRes ? Settings.accent(0.4) : Settings.accent(0.1)
-                    border.color: parent.autoRes ? Settings.accent(1.0) : Settings.accent(0.3)
-                    border.width: 1.5
-                    Behavior on color { ColorAnimation { duration: 150 } }
-                }
-                Text {
-                    anchors.centerIn: parent; text: "Auto"
-                    color: "white"; font.pixelSize: Settings.fs(12)
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: root.saveAndRefresh(root.currentProfileId, "resolution", "auto")
-                }
+                text: "Auto"
+                role: autoRes ? "strong" : "accent"
+                bold: autoRes
+                height: resField.height
+                onClicked: root.saveAndRefresh(root.currentProfileId, "resolution", "auto")
             }
 
             TextField {
                 id: resField
-                width: Settings.us(120); height: Settings.us(34)
+                width: Math.max(Settings.us(120), resMetrics.advanceWidth + Settings.us(24))
+                height: Math.max(Settings.us(34), Math.ceil(resMetrics.height) + Settings.us(12))
+                TextMetrics { id: resMetrics; font.pixelSize: Settings.fs(13); text: "2560x1440" }
                 text: {
                     var res = root.profileData.resolution
                     return (typeof res === "string" && res !== "auto") ? res : ""
@@ -266,7 +258,6 @@ Column {
         label: Settings.safeTr("used_space")
         Row {
             spacing: Settings.us(10)
-            anchors.verticalCenter: parent ? parent.verticalCenter : undefined
 
             Column {
                 spacing: Settings.us(2)
@@ -308,73 +299,47 @@ Column {
             }
 
             // Кнопка «Очистить данные»
-            Item {
-                width: Settings.us(145); height: Settings.us(32)
+            PillButton {
                 anchors.verticalCenter: parent.verticalCenter
-                enabled: AndroidTV && !(AndroidTV.profileManager && AndroidTV.profileManager.locked
-                                        && root.currentProfileId === AndroidTV.profileManager.activeProfileId)
-                Rectangle {
-                    anchors.fill: parent; radius: 9
-                    color: clearMA.containsMouse && parent.enabled ? "#55FF4444" : "#33FF4444"
-                    border.color: "#88FF4444"; border.width: 1.5
-                    opacity: parent.enabled ? 1.0 : 0.35
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: Settings.safeTr("clear_data"); color: "#FF8888"
-                    font.pixelSize: Settings.fs(12); opacity: parent.enabled ? 1.0 : 0.35
-                }
-                MouseArea {
-                    id: clearMA; anchors.fill: parent; hoverEnabled: true
-                    enabled: parent.enabled
-                    onClicked: {
-                        var pd = Window.window ? Window.window.promptDialog : null
-                        if (pd) {
-                            pd.show({
-                                title:   Settings.safeTr("clear_data"),
-                                message: Settings.safeTr("confirm_clear_data"),
-                                buttons: [
-                                    { label: Settings.safeTr("delete"), role: "danger",
-                                      action: function() {
-                                          AndroidTV.profileManager.clearProfileData(root.currentProfileId)
-                                          root._sizeRev++
-                                      }
-                                    },
-                                    { label: Settings.safeTr("cancel"), role: "primary",
-                                      action: function() {}
-                                    }
-                                ]
-                            })
-                        }
+                text: Settings.safeTr("clear_data")
+                role: "danger"
+                fontSize: Settings.fs(12)
+                enabled: !!AndroidTV && !(AndroidTV.profileManager && AndroidTV.profileManager.locked
+                                          && root.currentProfileId === AndroidTV.profileManager.activeProfileId)
+                onClicked: {
+                    var pd = Window.window ? Window.window.promptDialog : null
+                    if (pd) {
+                        pd.show({
+                            title:   Settings.safeTr("clear_data"),
+                            message: Settings.safeTr("confirm_clear_data"),
+                            buttons: [
+                                { label: Settings.safeTr("delete"), role: "danger",
+                                  action: function() {
+                                      AndroidTV.profileManager.clearProfileData(root.currentProfileId)
+                                      root._sizeRev++
+                                  }
+                                },
+                                { label: Settings.safeTr("cancel"), role: "primary",
+                                  action: function() {}
+                                }
+                            ]
+                        })
                     }
                 }
             }
 
             // Кнопка «Удалить профиль»
-            Item {
-                width: Settings.us(145); height: Settings.us(32)
+            PillButton {
                 anchors.verticalCenter: parent.verticalCenter
-                enabled: AndroidTV && AndroidTV.profileManager
-                         && AndroidTV.profileManager.count > 1
-                         && root.currentProfileId !== AndroidTV.profileManager.activeProfileId
-                Rectangle {
-                    anchors.fill: parent; radius: 9
-                    color: delMA.containsMouse && parent.enabled ? "#55FF4444" : "#33FF4444"
-                    border.color: "#88FF4444"; border.width: 1.5
-                    opacity: parent.enabled ? 1.0 : 0.4
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: Settings.safeTr("delete_profile"); color: "#FF8888"
-                    font.pixelSize: Settings.fs(12); opacity: parent.enabled ? 1.0 : 0.4
-                }
-                MouseArea {
-                    id: delMA; anchors.fill: parent; hoverEnabled: true
-                    enabled: parent.enabled
-                    onClicked: {
-                        if (AndroidTV.profileManager.removeProfile(root.currentProfileId))
-                            root.currentProfileId = AndroidTV.profileManager.activeProfileId
-                    }
+                text: Settings.safeTr("delete_profile")
+                role: "danger"
+                fontSize: Settings.fs(12)
+                enabled: !!(AndroidTV && AndroidTV.profileManager
+                            && AndroidTV.profileManager.count > 1
+                            && root.currentProfileId !== AndroidTV.profileManager.activeProfileId)
+                onClicked: {
+                    if (AndroidTV.profileManager.removeProfile(root.currentProfileId))
+                        root.currentProfileId = AndroidTV.profileManager.activeProfileId
                 }
             }
         }

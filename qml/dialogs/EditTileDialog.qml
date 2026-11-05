@@ -230,7 +230,10 @@ Item {
     // ── BaseDialog ────────────────────────────────────────────────────────────
     BaseDialog {
         id: base
-        dialogWidth:  Settings.us(580)
+        // Три кнопки типа ярлыка должны помещаться с полями при любом кегле
+        dialogWidth:  Math.max(Settings.us(580),
+                               3 * (Math.ceil(kindMetrics.advanceWidth) + Settings.us(20) + 6 + Settings.us(36))
+                               + 2 * 8 + 2 * Settings.us(28))
         dialogHeight: mainCol.implicitHeight + Settings.us(60)
         closeOnClickOutside: false
         onVisibleChanged: if (!visible) dialog.visible = false
@@ -264,7 +267,20 @@ Item {
 
                 Text { width: parent.width; color: Settings.accent(1.0); font.pixelSize: Settings.fs(14); text: Settings.safeTr("shortcut_type") }
 
+                TextMetrics {
+                    id: kindMetrics
+                    font.pixelSize: Settings.fs(16); font.bold: true
+                    text: {
+                        var l = [Settings.safeTr("internet"), Settings.safeTr("application"),
+                                 Settings.safeTr("playstation1")]
+                        l.sort(function(a, b) { return b.length - a.length })
+                        return l[0]
+                    }
+                }
+
                 Row {
+                    id: kindRow
+                    width: parent.width
                     spacing: 8
                     Repeater {
                         model: [
@@ -273,7 +289,9 @@ Item {
                             { key: "playstation1", label: Settings.safeTr("playstation1"),icon: "qrc:/assets/icons/ic_label.png"    }
                         ]
                         delegate: Item {
-                            width: Settings.us(170); height: Settings.us(48)
+                            // Кнопки делят ширину поровну, подпись — с полями
+                            width: Math.floor((kindRow.width - 2 * kindRow.spacing) / 3)
+                            height: Settings.us(48)
                             scale: kindMA.containsMouse ? 1.04 : 1.0
                             Behavior on scale { NumberAnimation { duration: 130 } }
 
@@ -291,6 +309,8 @@ Item {
                                 border.width: 1.5
                             }
                             Glow {
+                                cached: true
+                                visible: opacity > 0   // невидимое свечение не считать каждый кадр
                                 anchors.fill: kindBorder; source: kindBorder
                                 radius: 14; samples: 20; color: Settings.accent(0.4)
                                 opacity: (dialog.shortcutKind === modelData.key || kindMA.containsMouse) ? 1.0 : 0.0
@@ -298,8 +318,18 @@ Item {
                             }
                             Row {
                                 anchors.centerIn: parent; spacing: 6
-                                Image { source: modelData.icon; sourceSize.width: 20; sourceSize.height: 20; anchors.verticalCenter: parent.verticalCenter }
-                                Text  { text: modelData.label; color: "white"; font.pixelSize: Settings.fs(16); font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                                Image {
+                                    source: modelData.icon
+                                    width: Settings.us(20); height: Settings.us(20)
+                                    sourceSize.width: 64; sourceSize.height: 64
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Text  {
+                                    text: modelData.label; color: "white"; font.pixelSize: Settings.fs(16); font.bold: true
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: Math.min(implicitWidth, kindRow.width / 3 - Settings.us(20) - 6 - Settings.us(24))
+                                    elide: Text.ElideRight
+                                }
                             }
                             MouseArea {
                                 id: kindMA; anchors.fill: parent; hoverEnabled: true
@@ -444,26 +474,26 @@ Item {
                 spacing: 16; bottomPadding: 4
 
                 Item {
-                    width: Settings.us(160); height: Settings.us(52)
+                    width: Math.max(Settings.us(160), btnLbl0.implicitWidth + Settings.us(32)); height: Settings.us(52)
                     Rectangle {
                         anchors.fill: parent; radius: 12
                         color: cancelMA.containsMouse ? Settings.accent(0.267) : Settings.accent(0.133)
                         border.color: Settings.accent(0.4); border.width: 1
                         Behavior on color { ColorAnimation { duration: 120 } }
                     }
-                    Text { anchors.centerIn: parent; text: Settings.safeTr("cancel"); color: "white"; font.pixelSize: Settings.fs(16) }
+                    Text { id: btnLbl0; anchors.centerIn: parent; text: Settings.safeTr("cancel"); color: "white"; font.pixelSize: Settings.fs(16) }
                     MouseArea { id: cancelMA; anchors.fill: parent; hoverEnabled: true; onClicked: dialog.cancel() }
                 }
 
                 Item {
-                    width: Settings.us(160); height: Settings.us(52)
+                    width: Math.max(Settings.us(160), btnLbl1.implicitWidth + Settings.us(32)); height: Settings.us(52)
                     Rectangle {
                         anchors.fill: parent; radius: 12
                         color: saveMA.containsMouse ? Settings.accent(0.533) : Settings.accent(0.333)
                         border.color: Settings.accent(0.667); border.width: 1
                         Behavior on color { ColorAnimation { duration: 120 } }
                     }
-                    Text { anchors.centerIn: parent; text: Settings.safeTr("save"); color: "white"; font.pixelSize: Settings.fs(16); font.bold: true }
+                    Text { id: btnLbl1; anchors.centerIn: parent; text: Settings.safeTr("save"); color: "white"; font.pixelSize: Settings.fs(16); font.bold: true }
                     MouseArea {
                         id: saveMA; anchors.fill: parent; hoverEnabled: true
                         onClicked: {

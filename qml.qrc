@@ -53,5 +53,6 @@
         <file>qml/base/ProgressBar.qml</file>
         <file>qml/base/NavTreeView.qml</file>
         <file>qml/base/StatusBadge.qml</file>
+        <file>qml/base/PillButton.qml</file>
     </qresource>
 </RCC>

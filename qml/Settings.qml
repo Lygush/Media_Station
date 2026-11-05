@@ -7,9 +7,10 @@ import "../translation/i18n.js" as I18n
 QtObject {
     // ── Проксируемые свойства ─────────────────────────────────────────────
     property color  accentColor:     SettingsManager.accentColor
+    readonly property string defaultBackground: "qrc:/assets/background.png"
     property string backgroundImage: SettingsManager.backgroundImage !== ""
                                      ? SettingsManager.backgroundImage
-                                     : "qrc:/assets/background.png"
+                                     : defaultBackground
     property bool   fullscreen:      SettingsManager.fullscreen
     property string language:        SettingsManager.language
     property string installPath:     SettingsManager.installPath
@@ -23,7 +24,13 @@ QtObject {
 
     // ── Синхронизация → C++ ───────────────────────────────────────────────
     onAccentColorChanged:     SettingsManager.accentColor     = accentColor
-    onBackgroundImageChanged: SettingsManager.backgroundImage = backgroundImage
+    // Фон по умолчанию хранится как пустая строка. Раньше он записывался в
+    // настройки как выбор пользователя (цикл привязки при старте).
+    onBackgroundImageChanged: {
+        var stored = (backgroundImage === defaultBackground) ? "" : backgroundImage
+        if (SettingsManager.backgroundImage !== stored)
+            SettingsManager.backgroundImage = stored
+    }
     onFullscreenChanged:      SettingsManager.fullscreen      = fullscreen
     onLanguageChanged:        SettingsManager.language        = language
     onInstallPathChanged:     SettingsManager.installPath     = installPath

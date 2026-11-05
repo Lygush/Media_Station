@@ -177,6 +177,14 @@ void AndroidTVModule::shutdown()
     if (m_shutdownDone) return;
     m_shutdownDone = true;
 
+    if (m_booting)
+        logImportant(Logger::kLevelWarning,
+                     QString("application closing while Android TV is still booting "
+                             "(%1 s, status \"%2\", last adb: %3)")
+                         .arg(m_launchTimer.isValid() ? m_launchTimer.elapsed() / 1000 : 0)
+                         .arg(m_status,
+                              m_lastBootPollOut.isEmpty() ? QStringLiteral("-") : m_lastBootPollOut.simplified()));
+
     // 1. Таймеры — они могут запускать новые операции
     stopKeepTopmostTimer();
     stopBootPolling();

@@ -29,8 +29,12 @@ Item {
     opacity: isVisible ? 1.0 : 0.0
     Behavior on opacity { NumberAnimation { duration: 180 } }
 
-    width:  Settings.us(300)
+    // Ширина растёт с кеглем, чтобы названия не рубились на 3–4 строки
+    property real maxWidth: 100000
+    width:  Math.min(maxWidth, Math.max(Settings.us(300), Settings.us(140) + Settings.fs(13) * 16))
     height: dbBubble.height
+
+    TextMetrics { id: pctMetrics; font.pixelSize: Settings.fs(11); text: "100%" }
 
     // Y-координата куда должен указывать хвостик (в системе координат попапа)
     property real tipY: Settings.us(26)
@@ -50,7 +54,7 @@ Item {
             ctx.lineTo(0, height / 2)
             ctx.lineTo(width, height)
             ctx.closePath()
-            ctx.fillStyle = Qt.rgba(0.09, 0.09, 0.13, 0.97)
+            ctx.fillStyle = Qt.rgba(0.09, 0.09, 0.13, 1.0)
             ctx.fill()
         }
     }
@@ -62,7 +66,7 @@ Item {
         anchors.top:   parent.top
         height:        dbBubbleCol.implicitHeight + Settings.us(16)
         radius:        Settings.us(10)
-        color:         Qt.rgba(0.09, 0.09, 0.13, 0.97)
+        color:         Qt.rgba(0.09, 0.09, 0.13, 1.0)
         border.color:  Qt.rgba(1, 1, 1, 0.12)
         border.width:  1
 
@@ -121,7 +125,7 @@ Item {
                         text: Math.round((modelData.score || 0) * 100) + "%"
                         color: Settings.accent(0.7)
                         font.pixelSize: Settings.fs(11)
-                        width: Settings.us(32)
+                        width: Math.ceil(pctMetrics.advanceWidth) + 2
                         horizontalAlignment: Text.AlignRight
                     }
 
@@ -152,7 +156,7 @@ Item {
                 Rectangle {
                     visible: dbPopup._hasNext
                     width:  visible ? (parent.width - Settings.us(6)) / 2 : 0
-                    height: Settings.us(30)
+                    height: Math.max(Settings.us(30), Math.ceil(Settings.fs(12) * 1.4) + Settings.us(10))
                     radius: Settings.us(6)
                     color:  nextMA.containsMouse ? Qt.rgba(1,1,1,0.12) : Qt.rgba(1,1,1,0.06)
                     border.color: Qt.rgba(1,1,1,0.15); border.width: 1
@@ -161,6 +165,7 @@ Item {
                         anchors.centerIn: parent
                         text: Settings.tr("gamedetail_next")
                         color: "white"; font.pixelSize: Settings.fs(12)
+                        width: Math.min(implicitWidth, parent.width - Settings.us(12)); elide: Text.ElideRight
                     }
                     MouseArea {
                         id: nextMA; anchors.fill: parent; hoverEnabled: true
@@ -172,7 +177,7 @@ Item {
                     width:  dbPopup._hasNext
                             ? (parent.width - Settings.us(6)) / 2
                             : parent.width
-                    height: Settings.us(30)
+                    height: Math.max(Settings.us(30), Math.ceil(Settings.fs(12) * 1.4) + Settings.us(10))
                     radius: Settings.us(6)
                     color:  skipMA.containsMouse ? Qt.rgba(1,1,1,0.12) : Qt.rgba(1,1,1,0.06)
                     border.color: Qt.rgba(1,1,1,0.15); border.width: 1
@@ -181,6 +186,7 @@ Item {
                         anchors.centerIn: parent
                         text: Settings.tr("gamedetail_skip")
                         color: Qt.rgba(1, 1, 1, 0.6); font.pixelSize: Settings.fs(12)
+                        width: Math.min(implicitWidth, parent.width - Settings.us(12)); elide: Text.ElideRight
                     }
                     MouseArea {
                         id: skipMA; anchors.fill: parent; hoverEnabled: true

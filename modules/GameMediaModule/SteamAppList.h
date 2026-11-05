@@ -1,6 +1,8 @@
 // modules/GameMediaModule/SteamAppList.h
 #pragma once
 
+#include <atomic>
+
 #include <QObject>
 #include <QString>
 #include <QHash>
@@ -66,9 +68,11 @@ private:
     QHash<int, QString>         m_appName;   // appid -> original name
     QHash<int, LocalAppInfo>    m_appInfo;
 
-    bool m_loaded    = false;
-    bool m_loading   = false;
-    bool m_cancelled = false;
+    // m_loaded и m_cancelled читаются из разных потоков без мьютекса
+    // (isLoaded(), цикл разбора) — поэтому атомарные.
+    std::atomic<bool> m_loaded    { false };
+    bool              m_loading   = false;     // только под m_mutex
+    std::atomic<bool> m_cancelled { false };
 
     mutable QMutex     m_mutex;
     QWaitCondition     m_loadedCond;

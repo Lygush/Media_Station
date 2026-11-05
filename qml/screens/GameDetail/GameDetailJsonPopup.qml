@@ -12,7 +12,8 @@ Item {
     opacity: isVisible ? 1.0 : 0.0
     Behavior on opacity { NumberAnimation { duration: 180 } }
 
-    width:  Settings.us(320)
+    property real maxWidth: 100000
+    width:  Math.min(maxWidth, Math.max(Settings.us(320), Settings.us(140) + Settings.fs(11) * 18))
     height: jsonBubble.height
 
     // Y-координата куда должен указывать хвостик (в системе координат попапа)
@@ -33,7 +34,7 @@ Item {
             ctx.lineTo(0, height / 2)
             ctx.lineTo(width, height)
             ctx.closePath()
-            ctx.fillStyle = Qt.rgba(0.05, 0.10, 0.07, 0.97)
+            ctx.fillStyle = Qt.rgba(0.05, 0.10, 0.07, 1.0)
             ctx.fill()
         }
     }
@@ -45,7 +46,7 @@ Item {
         anchors.top:   parent.top
         height:        jsonCol.implicitHeight + Settings.us(16)
         radius:        Settings.us(10)
-        color:         Qt.rgba(0.05, 0.10, 0.07, 0.97)
+        color:         Qt.rgba(0.05, 0.10, 0.07, 1.0)
         border.color:  Settings.accent(0.30)
         border.width:  1
 
@@ -84,17 +85,32 @@ Item {
                 }
             }
 
-            // JSON текст
-            Text {
-                id: jsonTextItem
+            // JSON текст — видны последние строки (генерация идёт потоком),
+            // высота ограничена, чтобы попап не уходил за край экрана
+            Item {
                 width: parent.width
-                text:  jsonPopup.jsonText
-                color: "#AAFFCC"
-                font.pixelSize: Settings.fs(11)
-                font.family:    "Consolas, monospace"
-                wrapMode:       Text.WrapAnywhere
-                maximumLineCount: 20
-                elide:          Text.ElideRight
+                height: Math.min(jsonTextItem.implicitHeight, Settings.us(320))
+                clip: true
+
+                Text {
+                    id: jsonTextItem
+                    anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+                    text:  jsonPopup.jsonText
+                    color: "#AAFFCC"
+                    font.pixelSize: Settings.fs(11)
+                    font.family:    "Consolas, monospace"
+                    wrapMode:       Text.WrapAnywhere
+                }
+                // Верхняя строка срезана — плавно растворяем её, а не рубим пополам
+                Rectangle {
+                    visible: jsonTextItem.implicitHeight > parent.height
+                    anchors { left: parent.left; right: parent.right; top: parent.top }
+                    height: Math.round(Settings.fs(11) * 2.4)
+                    gradient: Gradient {
+                        GradientStop { position: 0.0; color: Qt.rgba(0.05, 0.10, 0.07, 1.0) }
+                        GradientStop { position: 1.0; color: Qt.rgba(0.05, 0.10, 0.07, 0.0) }
+                    }
+                }
             }
         }
     }

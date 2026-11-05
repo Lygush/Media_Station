@@ -100,18 +100,38 @@ void AndroidTVModule::startKeyShell()
     proc->setProcessChannelMode(QProcess::MergedChannels);
 
     connect(proc, &QProcess::readyRead, this, [this, proc]() {
-        const QString out = QString::fromUtf8(proc->readAll()).trimmed();
-        if (!out.isEmpty()) logToEmulatorFile("[Input] shell: " + out.left(300));
+        static const QString kMarker = QStringLiteral("__MS_KEYS_DONE__");
+        m_keyShellBuf += QString::fromUtf8(proc->readAll());
+        const int markerPos = m_keyShellBuf.lastIndexOf(kMarker);
+        if (markerPos >= 0) {
+            const QString before = m_keyShellBuf.left(markerPos);
+            m_keyShellBuf = m_keyShellBuf.mid(markerPos + kMarker.size());
+            const QString out = QString(before).remove(kMarker).trimmed();
+            if (!out.isEmpty()) logToEmulatorFile("[Input] shell: " + out.left(300));
+            m_keyBatchInFlight = false;
+            flushPendingKeys();            // отправляем накопленное за это время
+        } else if (m_keyShellBuf.size() > 4096) {
+            logToEmulatorFile("[Input] shell: " + m_keyShellBuf.left(300).trimmed());
+            m_keyShellBuf = m_keyShellBuf.right(kMarker.size());   // хвост может быть началом маркера
+        }
     });
     connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus) {
         logToEmulatorFile("[Input] key shell finished, code " + QString::number(code));
-        if (m_keyShell == proc) m_keyShell = nullptr;
+        if (m_keyShell == proc) {
+            m_keyShell = nullptr;
+            m_keyBatchInFlight = false;
+            m_keyShellBuf.clear();
+        }
         proc->deleteLater();
     });
     connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError e) {
         if (e != QProcess::FailedToStart) return;
         logToEmulatorFile("[Input] key shell failed to start: " + proc->errorString());
-        if (m_keyShell == proc) m_keyShell = nullptr;
+        if (m_keyShell == proc) {
+            m_keyShell = nullptr;
+            m_keyBatchInFlight = false;
+            m_keyShellBuf.clear();
+        }
         proc->deleteLater();
     });
 
@@ -122,6 +142,9 @@ void AndroidTVModule::startKeyShell()
 
 void AndroidTVModule::stopKeyShell()
 {
+    m_pendingKeys.clear();
+    m_keyBatchInFlight = false;
+    m_keyShellBuf.clear();
     if (!m_keyShell) return;
     QProcess *proc = m_keyShell;
     m_keyShell = nullptr;
@@ -141,13 +164,45 @@ void AndroidTVModule::sendAndroidKey(int keyCode)
 {
     logToEmulatorFile(QString("[Input] keyevent %1").arg(keyCode));
 
+    if (m_pendingKeys.size() >= kMaxPendingKeys) {
+        // Удержание кнопки быстрее, чем Android успевает обрабатывать:
+        // отбрасываем самые старые нажатия, а не копим «хвост».
+        m_pendingKeys.removeFirst();
+    }
+    m_pendingKeys.append(keyCode);
+    flushPendingKeys();
+}
+
+void AndroidTVModule::flushPendingKeys()
+{
+    if (m_pendingKeys.isEmpty()) return;
+
+    if (m_keyBatchInFlight) {
+        if (m_keyBatchSent.isValid() && m_keyBatchSent.elapsed() < kKeyBatchStuckMs)
+            return;                         // предыдущая команда ещё выполняется
+        logToEmulatorFile("[Input] previous key batch did not confirm, sending anyway");
+        m_keyBatchInFlight = false;
+    }
+
+    QStringList codes;
+    for (int k : std::as_const(m_pendingKeys))
+        codes << QString::number(k);
+    m_pendingKeys.clear();
+
     if (!m_keyShell) startKeyShell();
     if (m_keyShell && m_keyShell->state() != QProcess::NotRunning) {
-        m_keyShell->write(QByteArray("input keyevent ") + QByteArray::number(keyCode) + '\n');
+        // Несколько кодов в одной команде — одна JVM на всю пачку; маркер
+        // сообщает, что команда выполнена и можно отправлять следующую.
+        m_keyShell->write("input keyevent " + codes.join(QLatin1Char(' ')).toLatin1()
+                          // кавычки разбивают маркер в тексте команды (на случай эха
+                          // терминала), а в выводе echo он склеивается целиком
+                          + "; echo __MS_KEYS_\"\"DONE__\n");
+        m_keyBatchInFlight = true;
+        m_keyBatchSent.start();
         return;
     }
     // Запасной путь — разовый вызов
-    adb({"shell", "input", "keyevent", QString::number(keyCode)});
+    adb(QStringList{"shell", "input", "keyevent"} + codes);
 }
 
 // ── Уведомление G72KeysModule о смене режима ─────────────────────────────────

@@ -8,6 +8,7 @@ Item {
     default property alias content: contentArea.children
 
     DropShadow {
+        cached: true
         anchors.fill: bg
         source: bg
         radius: 30
@@ -37,6 +38,7 @@ Item {
     }
 
     Glow {
+        cached: true
         anchors.fill: bg
         source: bg
         radius: 20

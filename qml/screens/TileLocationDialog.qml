@@ -179,7 +179,7 @@ Item {
 
                 StyledButton {
                     text: Settings.tr("cancel")
-                    width: Settings.us(160); height: Settings.us(52)
+                    width: Math.max(Settings.us(160), naturalWidth); height: Settings.us(52)
                     onClicked: root.close()
                 }
                 StyledButton {
@@ -187,7 +187,7 @@ Item {
                           ? Settings.tr("lib_menu_extract")
                           : Settings.tr("lib_create_tile_btn")
                     role: "primary"
-                    width: Settings.us(160); height: Settings.us(52)
+                    width: Math.max(Settings.us(160), naturalWidth); height: Settings.us(52)
                     onClicked: {
                         var gid    = root.targetGameId
                         var sk     = root.targetStorageKey

@@ -71,7 +71,8 @@ void TrailerFetcher::setFfmpegPath(const QString &path)
 
 void TrailerFetcher::fetch(const QString &mediaDir, const QString &steamAppId)
 {
-    m_cancelled = false;
+    m_cancelled   = false;
+    m_writeFailed = false;
     m_destPath  = QDir::cleanPath(mediaDir + "/trailer.mp4");
     m_tmpPath   = m_destPath + ".tmp";
 
@@ -252,7 +253,6 @@ void TrailerFetcher::onFfmpegProgress()
 
 void TrailerFetcher::onFfmpegFinished(int exitCode, QProcess::ExitStatus status)
 {
-    Q_UNUSED(status)
     if (!m_ffmpegProcess) return;
 
     m_ffmpegProcess->deleteLater();
@@ -264,7 +264,8 @@ void TrailerFetcher::onFfmpegFinished(int exitCode, QProcess::ExitStatus status)
         return;
     }
 
-    if (exitCode == 0 && QFile::exists(m_destPath)) {
+    // Падение ffmpeg (CrashExit) — брак, даже если exitCode() вернул 0
+    if (status == QProcess::NormalExit && exitCode == 0 && QFile::exists(m_destPath)) {
         qDebug() << "TrailerFetcher: ffmpeg conversion completed →" << m_destPath;
         emit finished(m_destPath);
     } else {
@@ -278,8 +279,14 @@ void TrailerFetcher::onFfmpegFinished(int exitCode, QProcess::ExitStatus status)
 
 void TrailerFetcher::onTrailerReadyRead()
 {
-    if (m_trailerReply && m_tmpFile.isOpen())
-        m_tmpFile.write(m_trailerReply->readAll());
+    if (!m_trailerReply || !m_tmpFile.isOpen() || m_writeFailed) return;
+    const QByteArray chunk = m_trailerReply->readAll();
+    if (m_tmpFile.write(chunk) != chunk.size()) {
+        // Нет места на диске: раньше обрезанный файл сохранялся как трейлер
+        qWarning() << "TrailerFetcher: write failed:" << m_tmpFile.errorString();
+        m_writeFailed = true;
+        m_trailerReply->abort();
+    }
 }
 
 void TrailerFetcher::onTrailerProgress(qint64 received, qint64 total)
@@ -291,7 +298,7 @@ void TrailerFetcher::onTrailerFinished()
 {
     if (!m_trailerReply) return;
 
-    const bool ok = !m_cancelled
+    const bool ok = !m_cancelled && !m_writeFailed
                     && m_trailerReply->error() == QNetworkReply::NoError;
 
     if (!ok) {

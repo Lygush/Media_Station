@@ -50,6 +50,20 @@ void UpdateManager::initialize(EventBus *bus, SettingsManager *)
             });
 
     qDebug() << "[UpdateManager] Initialized, current version:" << currentVersion();
+
+    // Updater не может удалить свою же временную папку (внутри лежит его
+    // запущенный exe), поэтому там копились копии Updater от каждого обновления.
+    // Чистим устаревшие (старше суток) в фоне.
+    (void)QtConcurrent::run([]() {
+        const QDir base(QDir::temp().absoluteFilePath("MediaStationUpdater"));
+        if (!base.exists()) return;
+        const QDateTime limit = QDateTime::currentDateTime().addDays(-1);
+        const QFileInfoList dirs = base.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QFileInfo &d : dirs) {
+            if (d.lastModified() < limit)
+                QDir(d.absoluteFilePath()).removeRecursively();
+        }
+    });
 }
 
 void UpdateManager::onUpdateReceived(const QString &version,
@@ -83,12 +97,9 @@ void UpdateManager::onUpdateReceived(const QString &version,
     emit updateReadyChanged();
     emit downloadingChanged();
 
-    qDebug() << "[UpdateManager] Update ready:" << version
-             << "archive:" << archivePath;
-
     if (m_bus) {
         emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                Logger::makeEvent(Logger::kLevelInfo, "updater",
+                                Logger::makeEvent(Logger::kLevelInfo, "UpdateManager",
                                                   qPrintable(QString("Update available: %1").arg(version))));
     }
 }
@@ -272,7 +283,9 @@ void UpdateManager::acceptUpdate()
                 // Не удалось подготовить временную папку
                 if (res.tempDir.isEmpty()) {
                     m_preparing = false;
+                    m_updateReady = true;   // архив цел — даём возможность повторить
                     emit preparingChanged();
+                    emit updateReadyChanged();
                     if (m_bus) {
                         emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
                                                 Notifications::makeEvent(
@@ -286,7 +299,9 @@ void UpdateManager::acceptUpdate()
                 if (!QFile::exists(updaterExe)) {
                     qWarning() << "[UpdateManager] Updater.exe not found after copy to" << updaterExe;
                     m_preparing = false;
+                    m_updateReady = true;
                     emit preparingChanged();
+                    emit updateReadyChanged();
                     if (m_bus) {
                         emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
                                                 Notifications::makeEvent(
@@ -297,7 +312,10 @@ void UpdateManager::acceptUpdate()
                     return;
                 }
 
-                // Меняем рабочий каталог, чтобы не держать блокировку на папке приложения
+                // Меняем рабочий каталог, чтобы не держать блокировку на папке приложения.
+                // Запоминаем прежний: если Updater не запустится, приложение продолжит
+                // работать, и его относительные пути не должны сломаться.
+                const QString prevCwd = QDir::currentPath();
                 QDir::setCurrent(QDir::tempPath());
 
                 const QStringList args = {
@@ -311,10 +329,13 @@ void UpdateManager::acceptUpdate()
 
                 qDebug() << "[UpdateManager] Launching Updater from temp:" << updaterExe << args;
 
-                if (!QProcess::startDetached(updaterExe, args)) {
+                if (!QProcess::startDetached(updaterExe, args, QDir::tempPath())) {
                     qWarning() << "[UpdateManager] startDetached failed for:" << updaterExe;
+                    QDir::setCurrent(prevCwd);
                     m_preparing = false;
+                    m_updateReady = true;
                     emit preparingChanged();
+                    emit updateReadyChanged();
                     if (m_bus) {
                         emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
                                                 Notifications::makeEvent(
@@ -327,7 +348,7 @@ void UpdateManager::acceptUpdate()
 
                 if (m_bus) {
                     emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                            Logger::makeEvent(Logger::kLevelInfo, "updater",
+                                            Logger::makeEvent(Logger::kLevelInfo, "UpdateManager",
                                                               "Updater launched from temp dir, quitting MediaStation"));
                 }
 

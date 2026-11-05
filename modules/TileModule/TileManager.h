@@ -105,10 +105,6 @@ public:
     Q_INVOKABLE void  deleteInstalledGame(const QString &folderPath)
     { Q_ASSERT(m_installer); m_installer->deleteInstalledGame(folderPath); }
 
-    Q_INVOKABLE QString resolveInstallFolder(const QString &installFolder,
-                                             const QString &installBasePath) const
-    { Q_ASSERT(m_installer); return m_installer->resolveInstallFolder(installFolder, installBasePath); }
-
     Q_INVOKABLE bool installedGameExists(const QString &installFolder,
                                          const QString &installBasePath) const
     { Q_ASSERT(m_installer); return m_installer->installedGameExists(installFolder, installBasePath); }
@@ -173,6 +169,16 @@ private:
     static QVariantList stripChildren   (const QJsonArray &arr);
 
     void removeTileFromStructure(const QString &tileId);
+    // Результат установки пишется в structure.json напрямую: раньше это делал
+    // только открытый экран, и при уходе с экрана во время установки плитка
+    // оставалась без пути (игра на диске есть, а запускать нечем).
+    void persistInstallResult(const QString &tileId, bool success,
+                              const QString &ps1Path, const QString &iconPath,
+                              const QString &installFolder);
+    // Применяет fields ко всем узлам с данным id; возвращает число изменённых
+    static int  updateNodesById(QJsonArray &arr, const QString &id,
+                                const QJsonObject &fields);
+    static bool nodeHasEmptyPath(const QJsonArray &arr, const QString &id, bool &found);
 
     int countTilesById(const QString &tileId) const;
     static int countTilesByIdInArray(const QJsonArray &arr, const QString &tileId);

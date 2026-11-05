@@ -178,6 +178,7 @@ var ru = {
 
     // Android TV (AndroidTVScreen.qml)
     "android_tv":    "Android TV",
+    "karaoke":       "Караоке",
     "atv_booting":   "Загрузка Android TV…",
     "atv_idle":      "Android TV не запущен",
     "atv_running":   "Android TV запущен",
@@ -221,6 +222,7 @@ var ru = {
     "gamedetail_stage_generating": "Генерация",
     "gamedetail_stage_media":      "Загрузка медиа",
     "gamedetail_cancel_trailer":   "Отменить загрузку",
+    "gamedetail_trailer":          "Трейлер",
     "gamedetail_select_app":       "Выберите приложение",
     "gamedetail_next":             "Далее",
     "gamedetail_skip":             "Пропустить",
@@ -413,6 +415,7 @@ var en = {
 
     // Android TV (AndroidTVScreen.qml)
     "android_tv":    "Android TV",
+    "karaoke":       "Karaoke",
     "atv_booting":   "Loading Android TV…",
     "atv_idle":      "Android TV is not running",
     "atv_running":   "Android TV is running",
@@ -456,6 +459,7 @@ var en = {
     "gamedetail_stage_generating": "Generating",
     "gamedetail_stage_media":      "Downloading media",
     "gamedetail_cancel_trailer":   "Cancel download",
+    "gamedetail_trailer":          "Trailer",
     "gamedetail_select_app":       "Select application",
     "gamedetail_next":             "Next",
     "gamedetail_skip":             "Skip",

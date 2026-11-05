@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <iterator>
 
 #ifdef Q_OS_WIN
 #  include <windows.h>
@@ -22,12 +23,66 @@
 #  include <psapi.h>
 #endif
 
+#ifdef Q_OS_WIN
 // Таймауты (мс)
 static constexpr int kPidFileWaitMs = 30'000; ///< максимальное ожидание PID-файла
 static constexpr int kPidPollMs     =    100; ///< интервал опроса PID-файла
 static constexpr int kInputIdleMs   = 30'000; ///< максимальное ожидание WaitForInputIdle
 static constexpr int kHwndPollMs    =    100; ///< интервал опроса HWND
 static constexpr int kHwndMaxTries  =    300; ///< максимальное число попыток найти HWND (30 сек)
+static constexpr int kSuccessorWaitStartMs = 20'000; ///< ожидание «настоящей» игры, если exe-запускатор вышел при старте
+static constexpr int kSuccessorWaitExitMs  =  8'000; ///< то же после закрытия отслеживаемого процесса
+static constexpr int kMaxSuccessors        =      5; ///< защита от бесконечной смены процессов
+
+// ── Поиск процессов игры по папке ────────────────────────────────────────────
+// Многие игры запускаются в несколько процессов: exe-запускатор стартует
+// настоящую игру и выходит (Steam-версии перезапускают себя через Steam,
+// лаунчеры издателей, «game.exe → game_x64.exe»). Раньше выход первого
+// процесса считался закрытием игры: медиацентр всплывал поверх запущенной
+// игры или запуск считался неудачным. Теперь следим за любым процессом,
+// чей exe лежит в папке игры.
+
+static QString processImagePath(DWORD pid)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return {};
+    wchar_t buf[MAX_PATH * 2];
+    DWORD len = static_cast<DWORD>(std::size(buf));
+    QString path;
+    if (QueryFullProcessImageNameW(h, 0, buf, &len))
+        path = QDir::cleanPath(QDir::fromNativeSeparators(QString::fromWCharArray(buf, int(len))));
+    CloseHandle(h);
+    return path;
+}
+
+static bool isInDir(const QString &path, const QString &dir)
+{
+    if (path.isEmpty() || dir.isEmpty()) return false;
+    const QString d = dir.endsWith('/') ? dir : dir + '/';
+    return path.startsWith(d, Qt::CaseInsensitive);
+}
+
+/// Живой процесс из папки игры (кроме exclude).
+static DWORD findProcessInDir(const QString &dir, DWORD exclude)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    DWORD found = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == exclude || pe.th32ProcessID == 0) continue;
+            if (isInDir(processImagePath(pe.th32ProcessID), dir)) {
+                found = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -40,7 +95,14 @@ void GameWatcher::stopAll()
     m_running.storeRelease(0);
     if (m_thread) {
         m_thread->quit();
-        m_thread->wait(5000);
+        // Все ожидания в monitorGame идут короткими шагами и проверяют
+        // m_running, поэтому поток завершается за доли секунды.
+        if (!m_thread->wait(5000)) {
+            qWarning() << "[GameWatcher] monitor thread did not stop in time";
+            // Не даём родителю удалить работающий QThread — это abort().
+            // Сам объект удалится по finished (подключено в launch()).
+            m_thread->setParent(nullptr);
+        }
         m_thread = nullptr;
     }
 }
@@ -70,7 +132,12 @@ void GameWatcher::launch(const QString &ps1Path, const QString &tileId)
     }, Qt::DirectConnection);
 
     connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-    connect(thread, &QThread::finished, this,   [this]() { m_thread = nullptr; });
+    // Обнуляем только если это всё ещё текущий поток: отложенный finished
+    // старой сессии раньше затирал указатель на новую, и при выходе новая
+    // не дожидалась → QThread уничтожался работающим (аварийное завершение).
+    connect(thread, &QThread::finished, this, [this, thread]() {
+        if (m_thread == thread) m_thread = nullptr;
+    });
 
     thread->start();
 }
@@ -145,9 +212,13 @@ void GameWatcher::monitorGame(const QString &ps1Path, const QString &tileId)
     }
 
     // ── 3. Чтение PID игрового процесса ───────────────────────────────────────
-    const quint32 gamePid = readPidFile(pidFile, kPidFileWaitMs);
+    quint32 gamePid = readPidFile(pidFile, kPidFileWaitMs, m_running);
     QFile::remove(pidFile);
 
+    if (m_running.loadAcquire() == 0) {   // программа закрывается
+        QThread::currentThread()->quit();
+        return;
+    }
     if (gamePid == 0) {
         m_running.storeRelease(0);
         emit launchFailed(tileId, "Game process did not start (no PID received)");
@@ -169,16 +240,61 @@ void GameWatcher::monitorGame(const QString &ps1Path, const QString &tileId)
 
     // ── 5. Ожидание готовности процесса ───────────────────────────────────────
     // WaitForInputIdle возвращает WAIT_FAILED для консольных приложений — это нормально.
-    WaitForInputIdle(hGame, kInputIdleMs);
+    // Ждём короткими шагами, чтобы выход из программы не блокировался до 30 с.
+    for (int waited = 0; waited < kInputIdleMs; waited += 250) {
+        if (m_running.loadAcquire() == 0) {
+            CloseHandle(hGame);
+            QThread::currentThread()->quit();
+            return;
+        }
+        if (WaitForInputIdle(hGame, 250) != WAIT_TIMEOUT)
+            break;
+    }
+
+    // Папка игры — по exe запущенного процесса (для внешних ярлыков это не
+    // папка launcher); в ней ищем процессы-преемники
+    // Для установленных игр — вся папка <корень>/game (запускатор и игра могут
+    // лежать в разных подпапках), для внешних ярлыков — папка exe.
+    const QString installedDir = QDir::cleanPath(QFileInfo(ps1Path).absolutePath() + "/../game");
+    const QString exePath      = processImagePath(static_cast<DWORD>(gamePid));
+    QString gameDir = isInDir(exePath, installedDir) ? installedDir : QFileInfo(exePath).absolutePath();
+    if (exePath.isEmpty()) gameDir = installedDir;
+    qInfo().noquote() << "[GameWatcher] started PID" << gamePid << "in" << QDir::toNativeSeparators(gameDir);
+
+    // Ждём процесс-преемник из той же папки. Возвращает новый HANDLE или nullptr.
+    int successors = 0;
+    auto waitSuccessor = [&](DWORD exitedPid, int timeoutMs) -> HANDLE {
+        if (successors >= kMaxSuccessors) return nullptr;
+        for (int waited = 0; waited < timeoutMs; waited += 500) {
+            if (m_running.loadAcquire() == 0) return nullptr;
+            const DWORD next = findProcessInDir(gameDir, exitedPid);
+            if (next) {
+                HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, next);
+                if (h) {
+                    ++successors;
+                    qInfo().noquote() << "[GameWatcher] process" << exitedPid << "exited, following"
+                                      << next << QFileInfo(processImagePath(next)).fileName();
+                    gamePid = next;
+                    return h;
+                }
+            }
+            QThread::msleep(500);
+        }
+        return nullptr;
+    };
 
     DWORD exitCode = STILL_ACTIVE;
     GetExitCodeProcess(hGame, &exitCode);
     if (exitCode != STILL_ACTIVE) {
         CloseHandle(hGame);
-        m_running.storeRelease(0);
-        emit launchFailed(tileId, "Game process exited during startup");
-        QThread::currentThread()->quit();
-        return;
+        hGame = waitSuccessor(static_cast<DWORD>(gamePid), kSuccessorWaitStartMs);
+        if (!hGame) {
+            if (m_running.loadAcquire() == 0) { QThread::currentThread()->quit(); return; }
+            m_running.storeRelease(0);
+            emit launchFailed(tileId, "Game process exited during startup");
+            QThread::currentThread()->quit();
+            return;
+        }
     }
 
     // ── 6. Поиск главного окна игры ───────────────────────────────────────────
@@ -190,23 +306,51 @@ void GameWatcher::monitorGame(const QString &ps1Path, const QString &tileId)
             return;
         }
         hwnd = findMainWindowByPid(gamePid);
-        if (hwnd == 0) QThread::msleep(kHwndPollMs);
+        if (hwnd == 0 && attempt % 10 == 9) {
+            // Окно может принадлежать другому процессу игры (запускатор ещё жив)
+            const DWORD other = findProcessInDir(gameDir, static_cast<DWORD>(gamePid));
+            if (other) hwnd = findMainWindowByPid(other);
+        }
+        if (hwnd == 0) {
+            // Отслеживаемый процесс вышел, пока ждали окно — переключаемся
+            if (WaitForSingleObject(hGame, 0) == WAIT_OBJECT_0) {
+                CloseHandle(hGame);
+                hGame = waitSuccessor(static_cast<DWORD>(gamePid), kSuccessorWaitStartMs);
+                if (!hGame) break;
+                continue;
+            }
+            QThread::msleep(kHwndPollMs);
+        }
+    }
+    if (!hGame) {
+        if (m_running.loadAcquire() == 0) { QThread::currentThread()->quit(); return; }
+        m_running.storeRelease(0);
+        emit launchFailed(tileId, "Game process exited during startup");
+        QThread::currentThread()->quit();
+        return;
     }
 
     // ── 7. Применение borderless fullscreen ───────────────────────────────────
-    if (hwnd != 0 && !hasOwnFullscreen(hwnd))
+    // Только для большого окна (оконный режим игры). Раньше растягивалось любое
+    // первое окно — заставки и окна настроек лаунчеров тоже.
+    if (hwnd != 0 && !hasOwnFullscreen(hwnd) && isLargeGameWindow(hwnd))
         applyBorderlessFullscreen(hwnd);
 
     // ── 8. Сигнал: игра готова ────────────────────────────────────────────────
     emit gameWindowAppeared(tileId, hwnd != 0);
 
     // ── 9. Ожидание завершения игры ───────────────────────────────────────────
+    // Если процесс закрылся, но из папки игры работает другой (перезапуск
+    // через лаунчер, отдельный процесс игры), следим за ним.
     while (m_running.loadAcquire() != 0) {
-        if (WaitForSingleObject(hGame, 500) == WAIT_OBJECT_0)
-            break;
+        if (WaitForSingleObject(hGame, 500) != WAIT_OBJECT_0) continue;
+        CloseHandle(hGame);
+        hGame = waitSuccessor(static_cast<DWORD>(gamePid), kSuccessorWaitExitMs);
+        if (!hGame) break;
     }
 
-    CloseHandle(hGame);
+    if (hGame) CloseHandle(hGame);
+    qInfo().noquote() << "[GameWatcher] game closed:" << tileId;
     m_running.storeRelease(0);
     emit gameClosed(tileId);
 
@@ -278,11 +422,12 @@ quint64 GameWatcher::launchPs1(const QString &ps1Path, const QString &pidFilePat
 // ─────────────────────────────────────────────────────────────────────────────
 // readPidFile
 // ─────────────────────────────────────────────────────────────────────────────
-quint32 GameWatcher::readPidFile(const QString &pidFilePath, int timeoutMs)
+quint32 GameWatcher::readPidFile(const QString &pidFilePath, int timeoutMs,
+                                 const QAtomicInt &running)
 {
 #ifdef Q_OS_WIN
     const quint64 deadline = GetTickCount64() + static_cast<quint64>(timeoutMs);
-    while (GetTickCount64() < deadline) {
+    while (GetTickCount64() < deadline && running.loadAcquire() != 0) {
         QFile f(pidFilePath);
         if (f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text)) {
             const QString content = QString::fromUtf8(f.readAll()).trimmed();
@@ -298,6 +443,7 @@ quint32 GameWatcher::readPidFile(const QString &pidFilePath, int timeoutMs)
 #else
     Q_UNUSED(pidFilePath)
     Q_UNUSED(timeoutMs)
+    Q_UNUSED(running)
     return 0;
 #endif
 }
@@ -355,6 +501,29 @@ bool GameWatcher::hasOwnFullscreen(quintptr hwndRaw)
     const bool noCaption     = !(GetWindowLong(hwnd, GWL_STYLE) & WS_CAPTION);
 
     return coversMonitor && atOrigin && noCaption;
+#else
+    Q_UNUSED(hwndRaw)
+    return false;
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isLargeGameWindow — окно занимает не меньше половины монитора
+// ─────────────────────────────────────────────────────────────────────────────
+bool GameWatcher::isLargeGameWindow(quintptr hwndRaw)
+{
+#ifdef Q_OS_WIN
+    HWND hwnd = reinterpret_cast<HWND>(hwndRaw);
+    RECT rc = {};
+    GetWindowRect(hwnd, &rc);
+    HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(hMon, &mi);
+    const double winArea = double(rc.right - rc.left) * double(rc.bottom - rc.top);
+    const double monArea = double(mi.rcMonitor.right - mi.rcMonitor.left)
+                         * double(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    return monArea > 0 && winArea >= monArea * 0.5;
 #else
     Q_UNUSED(hwndRaw)
     return false;

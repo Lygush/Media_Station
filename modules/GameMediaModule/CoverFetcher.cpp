@@ -130,23 +130,12 @@ void CoverFetcher::fetch(const QString &mediaDir, const QString &steamAppId)
 
 bool CoverFetcher::saveFile(const QByteArray &data, const QString &destPath)
 {
-    const QString tmpPath = destPath + ".tmp";
-
-    QFile f(tmpPath);
-    if (!f.open(QIODevice::WriteOnly)) {
-        qWarning() << "CoverFetcher: cannot open for writing:" << tmpPath;
-        return false;
-    }
-    f.write(data);
-    f.close();
-
-    // Атомарное переименование
-    if (QFile::exists(destPath))
-        QFile::remove(destPath);
-
-    if (!QFile::rename(tmpPath, destPath)) {
-        qWarning() << "CoverFetcher: rename failed:" << tmpPath << "→" << destPath;
-        QFile::remove(tmpPath);
+    // Раньше: запись без проверки + remove() + rename() — при нехватке места
+    // сохранялась обрезанная картинка, а сбой между remove и rename терял
+    // старую обложку. AtomicFile (QSaveFile) проверяет запись и меняет файл
+    // атомарно.
+    if (!AtomicFile::writeBytes(destPath, data)) {
+        qWarning() << "CoverFetcher: cannot save" << destPath;
         return false;
     }
 

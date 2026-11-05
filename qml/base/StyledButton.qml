@@ -13,7 +13,9 @@ Item {
 
     signal clicked()
 
-    width: Math.max(Settings.us(120), buttonContent.implicitWidth + Settings.us(32))
+    // Естественная ширина по тексту; контейнер может растянуть кнопку (width)
+    readonly property int naturalWidth: Math.max(Settings.us(120), buttonContent.implicitWidth + Settings.us(32))
+    width: naturalWidth
     height: Settings.us(52)
 
     scale: buttonMouse.containsMouse ? 1.04 : 1.0
@@ -49,6 +51,8 @@ Item {
 
         // Глоу-эффект только для primary (можно расширить)
         Glow {
+            cached: true
+            visible: opacity > 0   // невидимое свечение не считать каждый кадр
             anchors.fill: parent
             radius: 16
             samples: 24

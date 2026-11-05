@@ -53,8 +53,11 @@ private slots:
     void fontOffsetClamping() {
         mgr->setFontOffset(-10);
         QCOMPARE(mgr->fontOffset(), -4);
+        // Диапазон −4…12 — совпадает с кнопками в AppearanceSection.qml
+        mgr->setFontOffset(20);
+        QCOMPARE(mgr->fontOffset(), 12);
         mgr->setFontOffset(9);
-        QCOMPARE(mgr->fontOffset(), 8);
+        QCOMPARE(mgr->fontOffset(), 9);
     }
 
 private:

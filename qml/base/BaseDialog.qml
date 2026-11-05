@@ -64,7 +64,18 @@ Item {
     // ── Карточка ──────────────────────────────────────────────────────────────
     Item {
         id: dialogBox
-        anchors.centerIn: parent
+        // По центру, но не выше нижней границы шапки (часы + заголовок экрана),
+        // если по высоте хватает места: диалоги внутри экранов (редактирование
+        // плитки) упирались верхом в заголовок, который рисуется поверх стека.
+        // Формула высоты шапки — как Main.qml::headerHeight.
+        readonly property int _headerBottom: Settings.us(100) + Math.ceil(Settings.fs(36) * 1.4) + Settings.us(16)
+        readonly property int _edge: Settings.us(16)
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: {
+            var centered = Math.round((parent.height - height) / 2)
+            var lowest   = parent.height - height - _edge
+            return Math.max(_edge, Math.min(Math.max(centered, _headerBottom), lowest))
+        }
         width:  root.dialogWidth
         height: root.dialogHeight
 
@@ -78,6 +89,7 @@ Item {
         transformOrigin: Item.Center
 
         DropShadow {
+            cached: true
             anchors.fill: bg
             source: bg
             radius: 30; samples: 40
@@ -105,6 +117,7 @@ Item {
         }
 
         Glow {
+            cached: true
             anchors.fill: bg
             source: bg
             radius: 20; samples: 28

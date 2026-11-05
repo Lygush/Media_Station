@@ -1,5 +1,6 @@
 // modules/KaraokeModule/DemucsWrapper.cpp
 #include "DemucsWrapper.h"
+#include "tools/AtomicFile.h"
 
 #include <QFile>
 #include <QDebug>
@@ -374,12 +375,13 @@ bool DemucsWrapper::writeWav(const QString &path,
         out[i * 2 + 1] = static_cast<int16_t>(qBound(-32768.f, right[i] * 32767.f, 32767.f));
     }
 
-    QFile f(path);
-    if (!f.open(QIODevice::WriteOnly)) {
-        m_lastError = "Не удалось записать WAV: " + path;
+    // Атомарно и с проверкой: обрезанный при нехватке места WAV раньше
+    // считался готовым кэшем (isCached проверяет только наличие файлов),
+    // и караоке для песни оставалось сломанным навсегда.
+    if (!AtomicFile::writeBytes(path, buf)) {
+        m_lastError = "Не удалось записать WAV (нет места на диске?): " + path;
         qCritical() << "[DemucsWrapper]" << m_lastError;
         return false;
     }
-    f.write(buf);
     return true;
 }

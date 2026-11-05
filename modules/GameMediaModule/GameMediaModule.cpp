@@ -62,9 +62,9 @@ void GameMediaModule::shutdown()
     // Отменяем фоновое скачивание списка приложений
     SteamAppList::instance().cancel();
     // Отменяем загрузки, потоки сами завершатся через quit/wait
-    if (m_coverFetcher)
+    if (m_coverFetcher && m_coverThread && m_coverThread->isRunning())
         m_coverFetcher->cancel();
-    if (m_trailerFetcher)
+    if (m_trailerFetcher && m_trailerThread && m_trailerThread->isRunning())
         m_trailerFetcher->cancel();
 
     // Дожидаемся потоков (HttpClient реагирует на отмену за ~100 мс, ffmpeg убивается)
@@ -101,7 +101,7 @@ void GameMediaModule::requestFetch(const QString &tileId,
 
 void GameMediaModule::cancelTrailer()
 {
-    if (m_trailerFetcher)
+    if (m_trailerFetcher && m_trailerThread && m_trailerThread->isRunning())
         m_trailerFetcher->cancel();
 }
 

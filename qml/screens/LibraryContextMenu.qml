@@ -50,10 +50,12 @@ Item {
         tileCount    = entry.tileCount
         activeLegacy = entry.legacyNoMetadata
 
-        var mw = menuBox.implicitWidth
-        var mh = menuBox.implicitHeight
-        menuBox.x = (gx + mw > root.width)  ? root.width  - mw : gx
-        menuBox.y = (gy + mh > root.height) ? root.height - mh : gy
+        // Размер меню зависит от видимых пунктов — считаем после их обновления
+        var mw = menuBox.width
+        var mh = menuBox.height
+        var m  = Settings.us(8)
+        menuBox.x = Math.max(m, Math.min(gx, root.width  - mw - m))
+        menuBox.y = Math.max(m, Math.min(gy, root.height - mh - m))
 
         visible = true
         openMenuAnim.start()
@@ -83,11 +85,21 @@ Item {
 
     Rectangle {
         id: menuBox
-        width: Settings.us(260)
-        implicitHeight: menuCol.implicitHeight + Settings.us(16)
+        // Ширина — по самому длинному видимому пункту (раньше 260 при любом
+        // кегле, «Управление ярлыками» упиралось в рамку)
+        width: {
+            var w = Settings.us(220)
+            for (var i = 0; i < menuCol.children.length; ++i) {
+                var c = menuCol.children[i]
+                if (c.visible && c.neededWidth !== undefined)
+                    w = Math.max(w, c.neededWidth)
+            }
+            return Math.min(Math.ceil(w), root.width - Settings.us(16))
+        }
+        height: menuCol.implicitHeight + Settings.us(16)
         radius: 12; transformOrigin: Item.TopLeft
         layer.enabled: true
-        layer.effect: DropShadow { radius: 20; samples: 28; color: "#AA000000"; verticalOffset: 6 }
+        layer.effect: DropShadow { cached: true;  radius: 20; samples: 28; color: "#AA000000"; verticalOffset: 6 }
         gradient: Gradient {
             GradientStop { position: 0.0; color: "#FF0D3060" }
             GradientStop { position: 1.0; color: "#FF0A2248" }
@@ -100,6 +112,7 @@ Item {
             spacing: 0
 
             Text {
+                readonly property real neededWidth: Math.min(implicitWidth, Settings.us(420))
                 width: parent.width; text: root.activeName
                 color: Settings.accent(1.0); font.pixelSize: Settings.fs(13); font.bold: true
                 horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight
@@ -194,8 +207,10 @@ Item {
         signal clicked()
 
         width: parent ? parent.width : 0
-        height: Settings.us(44)
+        height: Math.max(Settings.us(44), Math.ceil(miRow.implicitHeight) + Settings.us(16))
         opacity: enabled ? 1.0 : 0.45
+        // Отступ слева us(14) + содержимое + отступ справа us(20)
+        readonly property real neededWidth: Settings.us(14) + miRow.implicitWidth + Settings.us(20)
 
         Rectangle {
             anchors.fill: parent
@@ -204,6 +219,7 @@ Item {
             Behavior on color { ColorAnimation { duration: 100 } }
         }
         Row {
+            id: miRow
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left; anchors.leftMargin: Settings.us(14)
             spacing: Settings.us(10)

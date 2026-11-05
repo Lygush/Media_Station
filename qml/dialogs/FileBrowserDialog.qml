@@ -206,13 +206,13 @@ Item {
 
                 StyledButton {
                     text: Settings.tr("cancel")
-                    width: Settings.us(150); height: Settings.us(48)
+                    width: Math.max(Settings.us(150), naturalWidth); height: Settings.us(48)
                     onClicked: dialog.close()
                 }
                 StyledButton {
                     text: Settings.tr("select")
                     role: "primary"
-                    width: Settings.us(150); height: Settings.us(48)
+                    width: Math.max(Settings.us(150), naturalWidth); height: Settings.us(48)
                     enabled: dialog.selectedFile !== ""
                     onClicked: {
                         if (dialog.selectedFile !== "") {

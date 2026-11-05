@@ -102,7 +102,6 @@ Item {
         Column {
             visible: root.subView === "common"
             anchors.fill: parent
-            anchors.margins: Settings.us(24)
             spacing: 0
 
             SettingsRow {
@@ -203,14 +202,24 @@ Item {
                 }
             }
 
-            // Детали профиля
-            ProfileDetails {
+            // Детали профиля — прокручиваются, если не влезают (крупный масштаб)
+            Flickable {
+                id: profileFlick
                 width: parent.width
                 height: parent.height - profileTabBar.height
-                currentProfileId: root.currentProfileId
-                profileData:      root.profileData
-                onSaveAndRefresh: function(profileId, field, value) {
-                    root._doSaveAndRefresh(profileId, field, value)
+                contentHeight: profileDetails.height
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+
+                ProfileDetails {
+                    id: profileDetails
+                    width: profileFlick.width
+                    currentProfileId: root.currentProfileId
+                    profileData:      root.profileData
+                    onSaveAndRefresh: function(profileId, field, value) {
+                        root._doSaveAndRefresh(profileId, field, value)
+                    }
                 }
             }
         }

@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QThread>
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QtConcurrent/QtConcurrentRun>
@@ -89,15 +90,30 @@ void JoystickModule::initialize(EventBus *bus, SettingsManager *)
                 if (mod != "game") return;
                 if (ev == "inputType")
                     onGameInputType(data["inputTypes"].toStringList());
-                else if (ev == "closed")
-                    onGameClosed();
+                else if (ev == "appeared")
+                    m_gameRunning = true;   // опрос на паузе — см. onPollTimer
+                else if (ev == "closed" || ev == "failed") {
+                    m_gameRunning = false;
+                    if (ev == "closed") onGameClosed();
+                }
             });
 }
 
 void JoystickModule::shutdown()
 {
     m_activated = false;
+    m_stopping.store(true);
     m_pollTimer->stop();
+
+    // cancel() у QtConcurrent::run НЕ останавливает уже запущенную задачу, а она
+    // держит `this` (пути, сигналы, m_weStartedDs4). Раньше при выходе в первые
+    // секунды (запуск DS4Windows) задача обращалась к уже удалённому модулю.
+    // Теперь: флаг m_stopping заставляет циклы ожидания и IPC-вызовы выйти
+    // быстро, а ниже мы дожидаемся их завершения (до долей секунды).
+    QFuture<QList<ControllerInfo>> pendingStartup;
+    QFuture<QList<ControllerInfo>> pendingPoll;
+    if (m_startupWatcher) pendingStartup = m_startupWatcher->future();
+    if (m_pollWatcher)    pendingPoll    = m_pollWatcher->future();
 
     // Отменяем фоновые задачи без блокирующего ожидания.
     // QFutureWatcher::cancel() помечает future как отменённую,
@@ -118,6 +134,8 @@ void JoystickModule::shutdown()
         m_pollWatcher->deleteLater();
         m_pollWatcher = nullptr;
     }
+    pendingStartup.waitForFinished();
+    pendingPoll.waitForFinished();
 
     // Если мы запустили DS4Windows — останавливаем его асинхронно.
     // QThreadPool::globalInstance() живёт до конца приложения,
@@ -266,11 +284,12 @@ bool JoystickModule::startupSync()
     if (isProcessRunning("DS4Windows.exe")) {
         qDebug() << "[Joystick] External DS4Windows found, waiting for IPC...";
         const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + 10'000;
-        while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+        while (!m_stopping.load() && QDateTime::currentMSecsSinceEpoch() < deadline) {
             QThread::msleep(500);
             if (runCmdSync("Query.1.AppRunning").compare("True", Qt::CaseInsensitive) == 0)
                 return true;
         }
+        if (m_stopping.load()) return false;
         qWarning() << "[Joystick] Cannot reach running DS4Windows via IPC.";
         emit ds4LaunchFailed("DS4Windows already running but not responding");
         return false;
@@ -294,7 +313,7 @@ bool JoystickModule::startupSync()
     // Ждём, пока процесс ответит на IPC-запросы
     const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + kDs4StartupTimeoutMs;
     int attempt = 0;
-    while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+    while (!m_stopping.load() && QDateTime::currentMSecsSinceEpoch() < deadline) {
         QThread::msleep(500);
         ++attempt;
         if (runCmdSync("Query.1.AppRunning").compare("True", Qt::CaseInsensitive) == 0) {
@@ -304,6 +323,7 @@ bool JoystickModule::startupSync()
         }
     }
 
+    if (m_stopping.load()) return false;   // выходим — не шумим ошибкой
     qWarning() << "[Joystick] DS4Windows did not respond in" << kDs4StartupTimeoutMs << "ms";
     emit ds4LaunchFailed("DS4Windows did not respond in time");
     return false;
@@ -314,14 +334,50 @@ bool JoystickModule::startupSync()
 QList<ControllerInfo> JoystickModule::scanControllersSync() const
 {
     QList<ControllerInfo> result;
-    for (int slot = 1; slot <= 4; ++slot) {
+    const bool refreshDynamic = (m_pollCycle++ % kDynamicRefreshCycles) == 0;
+
+    for (int slot = 1; slot <= 4 && !m_stopping.load(); ++slot) {
         const QString bound = runCmdSync(
                                   QString("Query.%1.OutputSlotInputBound").arg(slot)).trimmed();
-        if (bound.compare("Bound", Qt::CaseInsensitive) == 0) {
-            auto info = querySlotSync(slot);
-            if (info.has_value())
-                result.append(info.value());
+        if (bound.compare("Bound", Qt::CaseInsensitive) != 0) {
+            QMutexLocker lock(&m_slotCacheMutex);
+            m_slotCache.remove(slot);
+            continue;
         }
+
+        ControllerInfo info;
+        bool cached = false;
+        {
+            QMutexLocker lock(&m_slotCacheMutex);
+            auto it = m_slotCache.constFind(slot);
+            if (it != m_slotCache.constEnd()) { info = it.value(); cached = true; }
+        }
+
+        if (cached && refreshDynamic) {
+            const QString pfx = QString("Query.%1.").arg(slot);
+            // Другой контроллер в том же слоте между опросами — перечитываем всё
+            const QString mac = runCmdSync(pfx + "MacAddress").trimmed().toUpper();
+            if (!mac.isEmpty() && mac != info.macAddress) {
+                cached = false;
+            } else {
+                bool ok = false;
+                const int bat = runCmdSync(pfx + "Battery").trimmed().toInt(&ok);
+                info.battery  = ok ? bat : -1;
+                info.charging = runCmdSync(pfx + "Charging").trimmed()
+                                    .compare("True", Qt::CaseInsensitive) == 0;
+            }
+        }
+        if (!cached) {
+            const auto fresh = querySlotSync(slot);
+            if (!fresh.has_value()) continue;
+            info = fresh.value();
+        }
+
+        {
+            QMutexLocker lock(&m_slotCacheMutex);
+            m_slotCache.insert(slot, info);
+        }
+        result.append(info);
     }
     return result;
 }
@@ -360,14 +416,27 @@ QString JoystickModule::runCmdSync(const QString &cmd) const
         return {};
     }
 
+    if (m_stopping.load()) return {};
+
     QProcess proc;
     proc.setProgram(m_ds4CmdPath);
     proc.setArguments({ "-command", cmd });
     proc.start();
 
-    if (!proc.waitForFinished(kCmdTimeoutMs)) {
-        proc.kill();
+    // Ждём короткими кусками, чтобы shutdown() не зависал на подвисшем
+    // DS4WindowsCmd.exe (раньше — до kCmdTimeoutMs на каждый вызов).
+    if (!proc.waitForStarted(kCmdTimeoutMs))
         return {};
+    QElapsedTimer waited;
+    waited.start();
+    while (!proc.waitForFinished(100)) {
+        if (proc.state() == QProcess::NotRunning)
+            break;                                   // завершился/упал
+        if (m_stopping.load() || waited.elapsed() > kCmdTimeoutMs) {
+            proc.kill();
+            proc.waitForFinished(500);
+            return {};
+        }
     }
 
     if (proc.exitCode() == 1000) return {};
@@ -414,6 +483,9 @@ void JoystickModule::applyControllers(const QList<ControllerInfo> &list, bool ds
 void JoystickModule::onPollTimer()
 {
     if (m_pollWatcher && m_pollWatcher->isRunning()) return;
+    // Пока идёт игра, панель геймпадов не видна, а каждый опрос — это 4+
+    // запуска DS4WindowsCmd.exe (.NET) раз в 5 с, отнимающих процессор у игры
+    if (m_gameRunning) return;
 
     m_pollWatcher = new QFutureWatcher<QList<ControllerInfo>>(this);
     connect(m_pollWatcher, &QFutureWatcher<QList<ControllerInfo>>::finished,

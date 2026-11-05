@@ -21,7 +21,9 @@ Item {
 
                 ComboBox {
                     id: serverCombo
-                    width: Settings.us(180); height: Settings.us(34)
+                    width: Math.max(Settings.us(180), comboMetrics.advanceWidth + Settings.us(44))
+                    height: Math.max(Settings.us(34), Math.ceil(comboMetrics.height) + Settings.us(12))
+                    TextMetrics { id: comboMetrics; font.pixelSize: Settings.fs(13); text: "255.255.255.255" }
                     model: {
                         var s = NetworkListener && NetworkListener.logSender ? NetworkListener.logSender : null
                         return (s && s.foundServers && s.foundServers.length > 0) ? s.foundServers : ["—"]
@@ -81,39 +83,16 @@ Item {
                     Component.onCompleted: logRoot.currentServerText = currentText
                 }
 
-                Item {
-                    width: Settings.us(165); height: Settings.us(34)
+                PillButton {
+                    height: serverCombo.height
+                    iconSource: "qrc:/assets/icons/ic_search.png"
+                    text: Settings.safeTr("search_servers")
+                    fontSize: Settings.fs(12)
                     enabled: !(NetworkListener && NetworkListener.logSender && NetworkListener.logSender.busy)
-                    Rectangle {
-                        anchors.fill: parent; radius: 8
-                        color: discoverMA.containsMouse && parent.enabled
-                               ? Settings.accent(0.4) : Settings.accent(0.18)
-                        border.color: Settings.accent(0.5); border.width: 1.5
-                        Behavior on color { ColorAnimation { duration: 120 } }
-                        opacity: parent.enabled ? 1.0 : 0.4
-                    }
-                    Row {
-                        anchors.centerIn: parent; spacing: Settings.us(6)
-                        Image {
-                            source: "qrc:/assets/icons/ic_search.png"
-                            width: Settings.us(16); height: Settings.us(16)
-                            sourceSize.width: 64; sourceSize.height: 64
-                            fillMode: Image.PreserveAspectFit
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            text: Settings.safeTr("search_servers"); color: "white"
-                            font.pixelSize: Settings.fs(12); anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                    MouseArea {
-                        id: discoverMA; anchors.fill: parent; hoverEnabled: true
-                        enabled: parent.enabled
-                        onClicked: {
-                            var sender = NetworkListener && NetworkListener.logSender
-                                         ? NetworkListener.logSender : null
-                            if (sender) sender.discoverServers()
-                        }
+                    onClicked: {
+                        var sender = NetworkListener && NetworkListener.logSender
+                                     ? NetworkListener.logSender : null
+                        if (sender) sender.discoverServers()
                     }
                 }
             }
@@ -149,73 +128,41 @@ Item {
 
         // Кнопки «Отправить» / «Отмена»
         Item {
-            width: parent.width; height: Settings.us(52)
+            width: parent.width
+            height: Math.max(Settings.us(52), sendBtn.height + Settings.us(14))
             Row {
                 anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                 spacing: Settings.us(10)
 
-                Item {
-                    width: Settings.us(165); height: Settings.us(38)
+                PillButton {
+                    id: sendBtn
+                    iconSource: "qrc:/assets/icons/ic_upload.png"
+                    text: Settings.safeTr("send_logs")
+                    role: "strong"; bold: true
+                    minWidth: Settings.us(140)
                     enabled: {
                         var s = NetworkListener && NetworkListener.logSender ? NetworkListener.logSender : null
-                        return s && !s.busy && s.foundServers && s.foundServers.length > 0
+                        return !!(s && !s.busy && s.foundServers && s.foundServers.length > 0)
                     }
-                    Rectangle {
-                        anchors.fill: parent; radius: 10
-                        color: sendMA.containsMouse && parent.enabled
-                               ? Settings.accent(0.55) : Settings.accent(0.28)
-                        border.color: Settings.accent(0.7); border.width: 1.5
-                        Behavior on color { ColorAnimation { duration: 130 } }
-                        opacity: parent.enabled ? 1.0 : 0.35
-                    }
-                    Row {
-                        anchors.centerIn: parent; spacing: Settings.us(8)
-                        Image {
-                            source: "qrc:/assets/icons/ic_upload.png"
-                            width: Settings.us(16); height: Settings.us(16)
-                            sourceSize.width: 64; sourceSize.height: 64
-                            fillMode: Image.PreserveAspectFit
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            text: Settings.safeTr("send_logs"); color: "white"
-                            font.pixelSize: Settings.fs(13); font.bold: true
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                    MouseArea {
-                        id: sendMA; anchors.fill: parent; hoverEnabled: true
-                        enabled: parent.enabled
-                        onClicked: {
-                            var ip = logRoot.currentServerText
-                            if (ip === "—" || ip === "") return
-                            var sender = NetworkListener && NetworkListener.logSender
-                                         ? NetworkListener.logSender : null
-                            if (sender) sender.sendLogs(ip)
-                        }
+                    onClicked: {
+                        var ip = logRoot.currentServerText
+                        if (ip === "—" || ip === "") return
+                        var sender = NetworkListener && NetworkListener.logSender
+                                     ? NetworkListener.logSender : null
+                        if (sender) sender.sendLogs(ip)
                     }
                 }
 
-                Item {
-                    width: Settings.us(80); height: Settings.us(38)
-                    visible: NetworkListener && NetworkListener.logSender && NetworkListener.logSender.busy
-                    Rectangle {
-                        anchors.fill: parent; radius: 10
-                        color: cancelMA.containsMouse ? "#55FF4444" : "#33FF4444"
-                        border.color: "#88FF4444"; border.width: 1.5
-                        Behavior on color { ColorAnimation { duration: 120 } }
-                    }
-                    Text {
-                        anchors.centerIn: parent; text: Settings.safeTr("cancel")
-                        color: "#FF8888"; font.pixelSize: Settings.fs(12); font.bold: true
-                    }
-                    MouseArea {
-                        id: cancelMA; anchors.fill: parent; hoverEnabled: true
-                        onClicked: {
-                            var sender = NetworkListener && NetworkListener.logSender
-                                         ? NetworkListener.logSender : null
-                            if (sender) sender.cancelSend()
-                        }
+                PillButton {
+                    visible: !!(NetworkListener && NetworkListener.logSender && NetworkListener.logSender.busy)
+                    height: sendBtn.height
+                    text: Settings.safeTr("cancel")
+                    role: "danger"; bold: true
+                    fontSize: Settings.fs(12)
+                    onClicked: {
+                        var sender = NetworkListener && NetworkListener.logSender
+                                     ? NetworkListener.logSender : null
+                        if (sender) sender.cancelSend()
                     }
                 }
             }
@@ -254,11 +201,13 @@ Item {
             anchors.fill: parent; color: "#AA000000"
             Rectangle {
                 anchors.centerIn: parent
-                width: Settings.us(300); height: Settings.us(150); radius: 16
+                width: Math.min(logRoot.width - Settings.us(40), Settings.us(420))
+                height: popupCol.implicitHeight + Settings.us(40); radius: 16
                 color: "#F0051528"
                 border.color: resultPopup.success ? Settings.accent(0.7) : "#88FF4444"
                 border.width: 1.5
                 Column {
+                    id: popupCol
                     anchors.centerIn: parent; spacing: Settings.us(14)
                     width: parent.width - Settings.us(32)
                     Text {
@@ -268,6 +217,8 @@ Item {
                               : Settings.safeTr("log_send_error")
                         color: resultPopup.success ? Settings.accent(1.0) : "#FF8888"
                         font.pixelSize: Settings.fs(16); font.bold: true
+                        width: Math.min(implicitWidth, parent.width)
+                        elide: Text.ElideRight
                     }
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
@@ -275,23 +226,10 @@ Item {
                         font.pixelSize: Settings.fs(12); wrapMode: Text.WordWrap
                         width: parent.width; horizontalAlignment: Text.AlignHCenter
                     }
-                    Item {
-                        width: parent.width; height: Settings.us(32)
-                        Rectangle {
-                            anchors.centerIn: parent
-                            width: Settings.us(70); height: Settings.us(28); radius: 8
-                            color: okMA.containsMouse ? Settings.accent(0.4) : Settings.accent(0.2)
-                            border.color: Settings.accent(0.6); border.width: 1.5
-                            Behavior on color { ColorAnimation { duration: 120 } }
-                            Text {
-                                anchors.centerIn: parent; text: Settings.safeTr("ok")
-                                color: "white"; font.pixelSize: Settings.fs(13); font.bold: true
-                            }
-                            MouseArea {
-                                id: okMA; anchors.fill: parent; hoverEnabled: true
-                                onClicked: resultPopup.visible = false
-                            }
-                        }
+                    PillButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: Settings.safeTr("ok"); bold: true
+                        onClicked: resultPopup.visible = false
                     }
                 }
             }

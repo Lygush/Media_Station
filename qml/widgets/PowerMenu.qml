@@ -32,6 +32,8 @@ Item {
         }
         Rectangle { id: powerBorder; anchors.fill: parent; radius: 10; color: "transparent"; border.color: "#80FFFFFF"; border.width: 2 }
         Glow {
+            cached: true
+            visible: opacity > 0   // невидимое свечение не считать каждый кадр
             anchors.fill: powerBorder; source: powerBorder
             radius: 16; samples: 24; color: Settings.accent(1.0)
             opacity: powerMA.containsMouse ? 1.0 : 0.0
@@ -58,7 +60,14 @@ Item {
     Item {
         id: powerMenu
         anchors.top: powerBtn.bottom; anchors.topMargin: Settings.us(10); anchors.right: powerBtn.right
-        width: Settings.us(250); height: menuColumn.height
+        // Ширина по подписям: при крупном шрифте «Выключение» обрезалось
+        // до «Выключен…» в фиксированных us(250).
+        width: Math.max(Settings.us(250),
+                        Settings.us(64) + Settings.us(20)
+                        + Math.ceil(Math.max(exitMetrics.advanceWidth, shutdownMetrics.advanceWidth)))
+        height: menuColumn.height
+        TextMetrics { id: exitMetrics;     font.family: appFont.name; font.pixelSize: Settings.fs(20); text: Settings.tr("exit") }
+        TextMetrics { id: shutdownMetrics; font.family: appFont.name; font.pixelSize: Settings.fs(20); text: Settings.tr("shutdown") }
         transformOrigin: Item.TopRight
         visible: false
 
@@ -122,7 +131,7 @@ Item {
                         }
                     }
                     Rectangle { id: exitBorder; anchors.fill: parent; radius: 10; color: "transparent"; border.color: "#80FFFFFF"; border.width: 2 }
-                    Glow { anchors.fill: exitBorder; source: exitBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: exitMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
+                    Glow { cached: true; visible: opacity > 0;  anchors.fill: exitBorder; source: exitBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: exitMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
                     Image { anchors.centerIn: parent; width: Settings.us(40); height: Settings.us(40); source: "qrc:/assets/icons/ic_exit.png"; sourceSize.width: 100; sourceSize.height: 100; smooth: true; fillMode: Image.PreserveAspectFit }
                     MouseArea {
                         id: exitMA; anchors.fill: parent; hoverEnabled: true
@@ -158,7 +167,7 @@ Item {
                         }
                     }
                     Rectangle { id: shutdownBorder; anchors.fill: parent; radius: 10; color: "transparent"; border.color: "#80FFFFFF"; border.width: 2 }
-                    Glow { anchors.fill: shutdownBorder; source: shutdownBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: shutdownMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
+                    Glow { cached: true; visible: opacity > 0;  anchors.fill: shutdownBorder; source: shutdownBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: shutdownMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
                     Image { anchors.centerIn: parent; width: Settings.us(40); height: Settings.us(40); source: "qrc:/assets/icons/ic_power.png"; sourceSize.width: 100; sourceSize.height: 100; smooth: true; fillMode: Image.PreserveAspectFit }
                     MouseArea {
                         id: shutdownMA; anchors.fill: parent; hoverEnabled: true

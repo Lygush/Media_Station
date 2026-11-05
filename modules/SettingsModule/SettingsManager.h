@@ -38,6 +38,7 @@ public:
     bool    fullscreen()      const;
     QString language()        const;
     QString installPath()     const;
+    static QString defaultInstallPath();   ///< <appDir>/data/games
     double  uiScale()         const;
     int     fontOffset()      const;
     bool    enableFogShader() const;

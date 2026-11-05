@@ -27,6 +27,8 @@
 #pragma once
 
 #include <QObject>
+#include <QHash>
+#include <QMutex>
 #include <QTimer>
 #include <QVariantList>
 #include <QFutureWatcher>
@@ -96,7 +98,9 @@ private:
 
     bool  m_ds4Running = false;
     bool  m_activated  = false;
+    bool  m_gameRunning = false;   ///< игра на экране — опрос DS4Windows приостановлен
     std::atomic<bool> m_weStartedDs4 { false };
+    std::atomic<bool> m_stopping     { false };   ///< true после shutdown(): фоновые задачи обязаны быстро выйти
 
     QTimer *m_pollTimer = nullptr;
 
@@ -128,6 +132,15 @@ private:
     QList<ControllerInfo> scanControllersSync() const;
     void stopDs4Sync() const;
     std::optional<ControllerInfo> querySlotSync(int slot) const;
+
+    // Кэш неизменных полей контроллера по слоту. Раньше каждый опрос (раз в
+    // 5 с) запускал до 21 процесса DS4WindowsCmd.exe: имя, MAC и тип
+    // подключения перечитывались каждый раз. Теперь они берутся из кэша,
+    // а батарея/зарядка/MAC обновляются раз в kDynamicRefreshCycles опросов.
+    mutable QMutex                    m_slotCacheMutex;
+    mutable QHash<int, ControllerInfo> m_slotCache;
+    mutable int                       m_pollCycle = 0;
+    static constexpr int kDynamicRefreshCycles = 6;   // 6 × 5 с = 30 с
     QString runCmdSync(const QString &cmd) const;
 
     // ── Главный поток ─────────────────────────────────────────────────────────

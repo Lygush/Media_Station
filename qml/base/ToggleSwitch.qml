@@ -31,6 +31,7 @@ Item {
 
             layer.enabled: true
             layer.effect: DropShadow {
+                cached: true
                 radius: 6
                 samples: 12
                 color: "#40000000"

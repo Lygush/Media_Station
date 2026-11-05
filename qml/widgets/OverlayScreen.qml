@@ -12,10 +12,9 @@ Item {
     visible: OverlayModule?.visible ?? false
 
     property int focusIndex: 0
-    readonly property int buttonCount: {
-        if (!visible) return 0
-        return (OverlayModule?.context === "androidtv") ? 2 : 0
-    }
+    // Две кнопки в обоих контекстах (раньше для «game» было 0 — стрелки
+    // уводили фокус в −1)
+    readonly property int buttonCount: visible ? 2 : 0
 
     Connections {
         target: OverlayModule ?? null
@@ -34,7 +33,11 @@ Item {
 
             if (key === "select") {
                 if (focusIndex === 0)      _dismissAction()
-                else if (focusIndex === 1) _exitAction()
+                else if (focusIndex === 1) {
+                    // «Выйти» на оверлее игры не должно останавливать Android TV
+                    if (OverlayModule?.context === "androidtv") _exitAction()
+                    else _dismissAction()
+                }
             }
         }
     }
@@ -91,6 +94,9 @@ Item {
         }
 
         Component.onCompleted: _updatePos()
+        // Размер панели меняется с кеглем/языком — пересчитываем позицию
+        onWidthChanged:  _updatePos()
+        onHeightChanged: _updatePos()
 
         Connections {
             target: mainWindow
@@ -103,7 +109,10 @@ Item {
         // Панель с кнопками
         Rectangle {
             id: panel
-            width: Settings.us(420)
+            // По содержимому: кнопки с подписями при крупном кегле не влезали в 420
+            width: Math.max(Settings.us(420), titleRow.implicitWidth + Settings.us(48),
+                            (OverlayModule?.context === "game" ? gameRow.implicitWidth : atvRow.implicitWidth)
+                            + Settings.us(48))
             height: panelColumn.implicitHeight + Settings.us(48)
             radius: Settings.us(20)
             gradient: Gradient {
@@ -137,6 +146,7 @@ Item {
                 width: parent.width - Settings.us(48)
 
                 Row {
+                    id: titleRow
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: Settings.us(10)
                     Image {
@@ -175,6 +185,7 @@ Item {
                 Item { width: 1; height: Settings.us(20) }
 
                 Row {
+                    id: atvRow
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: Settings.us(16)
                     visible: OverlayModule?.context === "androidtv"
@@ -196,6 +207,7 @@ Item {
                 }
 
                 Row {
+                    id: gameRow
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: Settings.us(16)
                     visible: OverlayModule?.context === "game"
@@ -239,7 +251,9 @@ Item {
         signal clicked()
         readonly property bool hasFocus: root.focusIndex === buttonIndex
 
-        width: Settings.us(186); height: Settings.us(52); radius: Settings.us(12)
+        width: Math.max(Settings.us(186), btnContent.implicitWidth + Settings.us(40))
+        height: Math.max(Settings.us(52), Math.ceil(btnContent.implicitHeight) + Settings.us(22))
+        radius: Settings.us(12)
         gradient: Gradient {
             GradientStop {
                 position: 0.0
@@ -271,6 +285,7 @@ Item {
         }
 
         Row {
+            id: btnContent
             anchors.centerIn: parent
             spacing: Settings.us(8)
             Image {

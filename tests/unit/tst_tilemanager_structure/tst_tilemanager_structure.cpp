@@ -34,6 +34,9 @@ private slots:
         // В реальном тесте нужно модифицировать TileManager, добавив возможность задать путь.
         // Ниже – логика, которая будет работать после добавления конструктора.
         // manager = new TileManager(tempDir->path());
+        // TileManager пишет в <папка теста>/data/structure.json — чистим перед
+        // каждым тестом, иначе повторный запуск видит данные прошлого
+        QFile::remove(QCoreApplication::applicationDirPath() + "/data/structure.json");
         manager = new TileManager(); // заглушка
     }
     void cleanup() {

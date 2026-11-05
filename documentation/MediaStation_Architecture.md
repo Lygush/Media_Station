@@ -82,7 +82,7 @@ MediaStation/
 │   │   └── SettingsManager.h / .cpp
 │   ├── NotificationModule/
 │   │   └── NotificationModule.h / .cpp
-│   ├── BatteryModule/
+│   ├── AirMouseModule/
 │   │   └── G72BatteryModule.h / .cpp
 │   └── GameLibraryModule/
 │       ├── GameLibraryModule.h
@@ -338,7 +338,7 @@ emit bus->moduleEvent(
 
 ---
 
-### G72BatteryModule (`modules/BatteryModule/`)
+### G72BatteryModule (`modules/AirMouseModule/`)
 
 Чтение заряда пульта G72 по BLE (WinRT), фоновый поток с синхронными `.get()` вызовами.
 

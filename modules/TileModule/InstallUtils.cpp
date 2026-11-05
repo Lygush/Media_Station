@@ -136,7 +136,15 @@ bool copyFileCancelable(const QString &src,
             return false;
         }
         const qint64 bytesRead = in.read(buffer.data(), chunkSize);
-        if (bytesRead <= 0) break;
+        if (bytesRead < 0) {
+            // Ошибка чтения (битый сектор, отключённый диск). Раньше цикл просто
+            // завершался, и недокопированный файл считался успешно скопированным.
+            qWarning() << "InstallUtils::copyFileCancelable: read error on:" << src;
+            out.close();
+            QFile::remove(dst);
+            return false;
+        }
+        if (bytesRead == 0) break;
         const qint64 written = out.write(buffer.constData(), bytesRead);
         if (written != bytesRead) {
             qWarning() << "InstallUtils::copyFileCancelable: write error on:" << dst;
@@ -145,13 +153,50 @@ bool copyFileCancelable(const QString &src,
             return false;
         }
     }
-    out.flush();
+    if (!out.flush()) {
+        out.close();
+        QFile::remove(dst);
+        return false;
+    }
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // generateUniqueFolderName
 // ─────────────────────────────────────────────────────────────────────────────
+
+QString sanitizeFolderName(const QString &title, const QString &fallbackId)
+{
+    static const QRegularExpression kInvalid("[<>:\"/\\\\|?*\\x00-\\x1f]");
+    QString s = title;
+    s.replace(kInvalid, "_");
+    s = s.simplified();
+    while (s.endsWith('.') || s.endsWith(' '))
+        s.chop(1);
+    if (s.size() > 100)
+        s = s.left(100).trimmed();
+
+    static const QRegularExpression kReserved(
+        "^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\..*)?$",
+        QRegularExpression::CaseInsensitiveOption);
+    if (kReserved.match(s).hasMatch())
+        s.prepend('_');
+
+    if (s.isEmpty())
+        s = fallbackId.isEmpty() ? QStringLiteral("Game")
+                                 : QStringLiteral("Game_") + fallbackId.left(8);
+    return s;
+}
+
+bool isManagedGameFolder(const QString &folderPath)
+{
+    if (folderPath.trimmed().isEmpty()) return false;
+    const QDir d(folderPath);
+    if (!d.exists() || d.isRoot()) return false;
+    return QFile::exists(d.filePath("launcher/launch.ps1"))
+        || QFile::exists(d.filePath("tile_id.txt"))
+        || QFile::exists(d.filePath("game_info.json"));
+}
 
 QString generateUniqueFolderName(const QString &baseName, const QString &gamesDirPath)
 {

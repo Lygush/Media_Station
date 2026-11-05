@@ -62,8 +62,16 @@ Row {
     }
 
     // ── Отображение значения ─────────────────────────────────────────────────
+    // valueWidth — минимум; поле растёт под самое длинное значение диапазона
+    // («1000 ms»), чтобы текст не вылезал за рамку при любом кегле
+    TextMetrics {
+        id: valueMetrics
+        font.pixelSize: Settings.fs(13)
+        text: Math.max(Math.abs(root.maxValue), Math.abs(root.minValue)) + root.displaySuffix
+    }
     Item {
-        width: root.valueWidth; height: Settings.us(34)
+        width: Math.max(root.valueWidth, Math.ceil(valueMetrics.advanceWidth) + Settings.us(16))
+        height: Settings.us(34)
 
         Rectangle {
             anchors.fill: parent; radius: 8

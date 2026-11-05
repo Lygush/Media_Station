@@ -77,6 +77,7 @@ Window {
     }
 
     FastBlur {
+        cached: true
         anchors.fill: parent
         source: bgImage
         radius: 20
@@ -96,9 +97,14 @@ Window {
         property real speed: 0.35
 
         // ~30 fps, медленное накопление времени
+        // Дымка анимируется только когда её видно: раньше таймер 30 кадров/с
+        // работал и под запущенной игрой / Android TV, и при выключенной дымке —
+        // окно медиацентра перерисовывалось целиком без остановки
         Timer {
             interval: 33
-            running:  true
+            running:  mistEffect.visible && !root.gameRunning
+                      && Qt.application.state === Qt.ApplicationActive
+                      && !(typeof AndroidTV !== "undefined" && AndroidTV && AndroidTV.active)
             repeat:   true
             onTriggered: mistEffect.time += 0.033
         }
@@ -106,17 +112,11 @@ Window {
         vertexShader:   "qrc:/assets/shaders/mist/mist.vert.qsb"
         fragmentShader: "qrc:/assets/shaders/mist/mist.frag.qsb"
 
-        Component.onCompleted: {
-            if (mistEffect.status === ShaderEffect.Error)
-                console.error("ShaderEffect failed to load shaders!")
-            else
-                console.log("ShaderEffect initialized, status:", mistEffect.status)
-        }
-
+        // В журнал — только ошибка шейдера (раньше при каждом запуске три
+        // отладочные строки «status: 0»)
         onStatusChanged: {
-            console.log("ShaderEffect status:", mistEffect.status)
             if (mistEffect.status === ShaderEffect.Error)
-                console.error("ShaderEffect error!")
+                console.error("ShaderEffect error:", mistEffect.log)
         }
     }
 
@@ -132,8 +132,13 @@ Window {
         onTriggered: currentTime = new Date().toLocaleTimeString(Qt.locale(), "hh:mm")
     }
 
+    // Часы по центру; если правая панель (геймпады, кнопки) до них дотягивается
+    // (узкое окно, крупный масштаб) — сдвигаются влево, не наезжая на неё
     Text {
-        anchors.horizontalCenter: parent.horizontalCenter
+        id: clockText
+        x: Math.max(Settings.us(20),
+                    Math.min(Math.round((parent.width - width) / 2),
+                             topRightPanel.x - width - Settings.us(24)))
         anchors.top: parent.top
         anchors.topMargin: Settings.us(20)
         text: currentTime
@@ -143,6 +148,7 @@ Window {
     }
 
     Item {
+        id: topRightPanel
         anchors.top: parent.top; anchors.right: parent.right
         anchors.topMargin: Settings.us(20); anchors.rightMargin: Settings.us(20)
         width: topRow.width; height: topRow.height; z: 10
@@ -197,6 +203,10 @@ Window {
         MouseArea { id: backMA; anchors.fill: parent; hoverEnabled: true; onClicked: root.goBack() }
     }
 
+    // Нижняя граница шапки (часы + заголовок экрана). Экраны начинают контент
+    // ниже неё — раньше сетка плиток заезжала под часы и заголовок.
+    readonly property int headerHeight: Settings.us(100) + Math.ceil(Settings.fs(36) * 1.4) + Settings.us(16)
+
     property string currentScreenTitle: stack.currentItem ? stack.currentItem.screenTitle : qsTr("Home")
     onCurrentScreenTitleChanged: updateTitleWithAnimation(currentScreenTitle)
 
@@ -239,7 +249,10 @@ Window {
         var hiddenTitles = [
             qsTr("Home"), Settings.tr("settings"), Settings.tr("library")
         ]
-        if (hiddenTitles.indexOf(newTitle) !== -1) {
+        // Экран может сам показывать своё название (карточка игры) — тогда в
+        // шапке его не дублируем: длинное название налезало на значки справа.
+        var selfTitled = stack.currentItem && stack.currentItem.hideHeaderTitle === true
+        if (selfTitled || hiddenTitles.indexOf(newTitle) !== -1) {
             if (screenTitle.opacity > 0) hideAnim.start()
         } else {
             if (screenTitle.opacity > 0) { replaceAnim.newTitle = newTitle; replaceAnim.start() }
@@ -249,6 +262,7 @@ Window {
 
     StackView {
         id: stack
+        objectName: "mainStack"   // для сторожа отзывчивости в main.cpp
         anchors.fill: parent
         initialItem: HomeScreen {}
         background: Item {}
@@ -271,9 +285,16 @@ Window {
             NumberAnimation { property: "opacity"; from: 1; to: 0;               duration: 250 }
         }}
 
-        onBusyChanged:        if (!busy) Qt.callLater(forceHoverCheckOnCurrent)
+        onBusyChanged: {
+            if (!busy) {
+                Qt.callLater(forceHoverCheckOnCurrent)
+                Qt.callLater(root._destroyRemovedScreens)
+            }
+        }
+        onDepthChanged: if (!busy) Qt.callLater(root._destroyRemovedScreens)
         onCurrentItemChanged: {
             if (currentItem) {
+                console.debug("[UI] screen:", currentItem.screenTitle || "home", "depth", depth)
                 root.settingsOpen = (currentItem.screenTitle === Settings.tr("settings"))
                 root.libraryOpen  = (currentItem.screenTitle === Settings.tr("library"))
             }
@@ -400,21 +421,25 @@ Window {
         target: G72Keys
 
         function onHomePressed() {
+            if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
             if (stack.depth > 1) {
                 stack.pop(null)
             }
         }
 
         function onBackPressed() {
+            if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
             root.goBack()
         }
 
         function onSearchPressed() {
+            if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
             // Кнопка «Поиск» на пульте — быстрый переход в библиотеку игр
             if (!root.settingsOpen && !root.libraryOpen) root.openLibraryScreen()
         }
 
         function onMenuPressed() {
+            if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
             if (powerMenu && typeof powerMenu.open === "function") {
                 powerMenu.open()
             } else {
@@ -422,8 +447,17 @@ Window {
             }
         }
 
-        function onUpPressed()    {}
-        function onDownPressed()  {}
+        // Стрелки пульта прокручивают текущий экран (если он это умеет)
+        function onUpPressed() {
+            if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
+            if (stack.currentItem && typeof stack.currentItem.scrollBy === "function")
+                stack.currentItem.scrollBy(-1)
+        }
+        function onDownPressed() {
+            if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
+            if (stack.currentItem && typeof stack.currentItem.scrollBy === "function")
+                stack.currentItem.scrollBy(1)
+        }
         function onLeftPressed()  {}
         function onRightPressed() {}
         function onSelectPressed(){}
@@ -449,6 +483,32 @@ Window {
         if (cur && typeof cur.forceHoverCheck === "function") cur.forceHoverCheck()
     }
 
+    // ── Владение экранами ────────────────────────────────────────────────────
+    // Экраны создаются createObject() и кладутся в StackView готовыми.
+    // StackView уничтожает только то, что создал сам, поэтому раньше каждый
+    // закрытый экран оставался жить скрытым: со своими MediaPlayer (трейлер на
+    // странице игры продолжал крутиться по таймеру), таймерами и подписками на
+    // модули. С каждым открытием караоке/страницы игры интерфейс тормозил всё
+    // сильнее. Теперь экран уничтожается после того, как ушёл со стека.
+    property var _ownedScreens: []
+    function _own(item) {
+        if (item) _ownedScreens.push(item)
+        return item
+    }
+    function _destroyRemovedScreens() {
+        if (stack.busy) return
+        var inStack = []
+        for (var d = 0; d < stack.depth; d++) inStack.push(stack.get(d, StackView.DontLoad))
+        var keep = []
+        for (var i = 0; i < _ownedScreens.length; i++) {
+            var it = _ownedScreens[i]
+            if (!it) continue
+            if (inStack.indexOf(it) >= 0) keep.push(it)
+            else it.destroy()
+        }
+        _ownedScreens = keep
+    }
+
     function openScreen(title, storageKey, isFolder) {
         var screen = dynamicScreenComponent.createObject(stack, {
             storageKey:      storageKey,
@@ -460,7 +520,7 @@ Window {
             launchingTileId: Qt.binding(function() { return root.launchingTileId }),
             gameLaunching:   Qt.binding(function() { return root.gameLaunching })
         })
-        stack.push(screen)
+        stack.push(_own(screen))
     }
 
     // Фаза 2: открыть страницу игры
@@ -469,21 +529,21 @@ Window {
             gameData:   gameData,
             launchGame: root.launchGame
         })
-        stack.push(screen)
+        stack.push(_own(screen))
     }
 
     function openSettingsScreen() {
         if (root.settingsOpen) return
         root.settingsOpen = true
-        stack.push(settingsScreenComponent.createObject(stack, {
+        stack.push(_own(settingsScreenComponent.createObject(stack, {
             appWindow: root
-        }))
+        })))
     }
 
     function openLibraryScreen() {
         if (root.libraryOpen) return
         root.libraryOpen = true
-        stack.push(libraryScreenComponent.createObject(stack, {}))
+        stack.push(_own(libraryScreenComponent.createObject(stack, {})))
     }
 
     function goBack() {
@@ -627,9 +687,9 @@ Window {
     }
 
     function openKaraokeScreen() {
-        if (stack.currentItem && stack.currentItem.screenTitle === "Karaoke")
+        if (stack.currentItem && stack.currentItem.screenTitle === Settings.tr("karaoke"))
             return
-        stack.push(karaokeScreenComponent.createObject(stack))
+        stack.push(_own(karaokeScreenComponent.createObject(stack)))
     }
 
     function openAndroidTVScreen() {
@@ -688,6 +748,8 @@ Window {
             border.color: parent.active ? Settings.accent(1.0) : "#80FFFFFF"; border.width: 2
         }
         Glow {
+            cached: true
+            visible: opacity > 0   // невидимое свечение не считать каждый кадр
             anchors.fill: ibBorder; source: ibBorder
             radius: 16; samples: 24; color: Settings.accent(1.0)
             opacity: (ibMA.containsMouse || parent.active) ? 1.0 : 0.0

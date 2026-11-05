@@ -59,6 +59,18 @@ bool copyFileCancelable(const QString &src,
                         const std::shared_ptr<std::atomic<bool>> &cancelFlag,
                         qint64 chunkSize = 1 * 1024 * 1024);
 
+/// Безопасное имя папки из названия игры (Windows): заменяет недопустимые и
+/// управляющие символы, убирает точки/пробелы в конце, обходит
+/// зарезервированные имена (CON, NUL, COM1…). Пустой результат заменяется на
+/// "Game_<первые 8 символов fallbackId>" — иначе игра ставилась бы прямо в
+/// корень каталога игр.
+QString sanitizeFolderName(const QString &title, const QString &fallbackId = {});
+
+/// true, если папка похожа на папку игры, созданную MediaStation
+/// (есть launcher/launch.ps1, tile_id.txt или game_info.json).
+/// Используется как защита перед рекурсивным удалением.
+bool isManagedGameFolder(const QString &folderPath);
+
 /// Возвращает уникальное имя папки внутри gamesDirPath на основе baseName.
 /// Если baseName уже занят — добавляет " (1)", " (2)" и т.д.
 QString generateUniqueFolderName(const QString &baseName,

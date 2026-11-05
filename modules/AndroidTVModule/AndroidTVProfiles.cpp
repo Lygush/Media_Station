@@ -4,6 +4,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QDateTime>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -437,7 +438,10 @@ void AndroidTVProfileManager::load(const QString &baseDir)
         if (!doc.isObject()) {
             qWarning() << "[AndroidTV] profiles.json is corrupted:" << err.errorString()
                        << "— recreating default profile";
-            QFile::rename(path, path + ".bak");
+            // Имя с отметкой времени: раньше rename в существующий .bak молча
+            // не удавался, и повреждённый файл затирался профилем по умолчанию.
+            QFile::rename(path, path + ".corrupted_"
+                          + QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
         } else {
             const QJsonObject root = doc.object();
             activeId = root["activeProfileId"].toString();

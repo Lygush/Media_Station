@@ -1,6 +1,7 @@
 QT += core testlib
 CONFIG += c++20 console testcase
 TEMPLATE = app
+include($$PWD/../../common.pri)
 
 PROJECT_ROOT = $$PWD/../../..
 INCLUDEPATH += $$PROJECT_ROOT \

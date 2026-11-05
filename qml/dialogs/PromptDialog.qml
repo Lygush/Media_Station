@@ -39,7 +39,10 @@ Item {
     BaseDialog {
         id: base
         dialogWidth:  dialog._contentW
-        dialogHeight: Settings.us(320)
+        // Высота по содержимому (раньше фиксированные us(320): при длинном
+        // тексте или кнопках столбиком содержимое не помещалось).
+        dialogHeight: Math.min(dialog.parent ? dialog.parent.height - Settings.us(40) : Settings.us(600),
+                               Math.max(Settings.us(220), contentColumn.implicitHeight + 2 * Settings.us(28)))
 
         closeOnClickOutside: true
 
@@ -49,6 +52,7 @@ Item {
         }
 
         Column {
+            id: contentColumn
             width: parent.width   // parent = contentArea, заполняет dialogBox минус margins
             spacing: Settings.us(18)
 
@@ -94,14 +98,37 @@ Item {
             }
 
             // ── Кнопки ────────────────────────────────────────────────────────
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: Settings.us(12)
+            // В ряд, если помещаются; иначе столбиком на всю ширину. Раньше три
+            // длинные кнопки («Удалить вместе с файлами» и т.п.) выходили за
+            // край диалога.
+            Item {
+                id: buttonsBox
+                width: parent.width
+                height: buttonsGrid.height
                 visible: dialog.buttons.length > 0
+
+                // Невидимый ряд для измерения естественной ширины кнопок
+                Row {
+                    id: measureRow
+                    visible: false
+                    spacing: Settings.us(12)
+                    Repeater {
+                        model: dialog.buttons
+                        delegate: StyledButton { text: modelData.label }
+                    }
+                }
+                readonly property bool stacked: measureRow.implicitWidth > width
+
+            Grid {
+                id: buttonsGrid
+                anchors.horizontalCenter: parent.horizontalCenter
+                columns: buttonsBox.stacked ? 1 : Math.max(1, dialog.buttons.length)
+                spacing: Settings.us(12)
 
                 Repeater {
                     model: dialog.buttons
                     delegate: StyledButton {
+                        width: buttonsBox.stacked ? buttonsBox.width : naturalWidth
                         text: modelData.label
                         role: modelData.role === "primary" ? "primary"
                             : modelData.role === "danger"  ? "danger"
@@ -112,6 +139,7 @@ Item {
                         }
                     }
                 }
+            }
             }
         }
     }

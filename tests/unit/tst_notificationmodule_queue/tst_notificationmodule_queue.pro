@@ -4,6 +4,7 @@ CONFIG -= app_bundle
 
 TARGET = tst_notificationmodule_queue
 TEMPLATE = app
+include($$PWD/../../common.pri)
 
 INCLUDEPATH += $$PWD/../../..
 DEPENDPATH  += $$PWD/../../..
@@ -13,6 +14,4 @@ SOURCES += \
     ../../../modules/NotificationModule/NotificationModule.cpp
 
 HEADERS += \
-    ../../../modules/NotificationModule/NotificationModule.h \
-    ../../../core/IModule.h \
-    ../../../core/EventBus.h
+    ../../../modules/NotificationModule/NotificationModule.h

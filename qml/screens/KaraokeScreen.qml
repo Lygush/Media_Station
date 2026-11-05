@@ -1,6 +1,6 @@
 // qml/screens/KaraokeScreen.qml
 import QtQuick
-import QtQuick.Controls
+import QtQuick.Controls.Basic   // свой фон полей ввода; нативный стиль Windows его игнорирует
 import QtQuick.Dialogs
 import QtMultimedia
 import AppSettings 1.0
@@ -12,7 +12,7 @@ Item {
     width:  parent ? parent.width  : 0
     height: parent ? parent.height : 0
 
-    property string screenTitle: "Karaoke"
+    property string screenTitle: Settings.tr("karaoke")
 
     // ── Состояние ─────────────────────────────────────────────────────────────
     property string currentFilePath:  ""
@@ -242,21 +242,32 @@ Item {
     }
 
     // ── Медиаплееры ───────────────────────────────────────────────────────────
-    MediaPlayer {
-        id: vocalsPlayer
-        audioOutput: AudioOutput { volume: 0.6; muted: !root.vocalsOn }
-        onPositionChanged: root.updateLyrics(vocalsPlayer.position)
+    // Создаются, только когда трек готов: раньше два MediaPlayer с аудиовыходами
+    // создавались при каждом входе на экран (на Windows это инициализация
+    // FFmpeg/аудио — фриз при открытии).
+    Loader {
+        id: playersLoader
+        active: root.playerReady
+        sourceComponent: QtObject {
+            property MediaPlayer vocals: MediaPlayer {
+                audioOutput: AudioOutput { volume: 0.6; muted: !root.vocalsOn }
+                onPositionChanged: root.updateLyrics(position)
+            }
+            property MediaPlayer instr: MediaPlayer {
+                audioOutput: AudioOutput { volume: 1.0 }
+            }
+        }
     }
+    readonly property var vocalsPlayer: playersLoader.item ? playersLoader.item.vocals : null
+    readonly property var instrPlayer:  playersLoader.item ? playersLoader.item.instr  : null
+    readonly property int  vDuration: vocalsPlayer ? vocalsPlayer.duration : 0
+    readonly property int  vPosition: vocalsPlayer ? vocalsPlayer.position : 0
+    readonly property bool vPlaying:  vocalsPlayer ? vocalsPlayer.playbackState === MediaPlayer.PlayingState : false
 
-    MediaPlayer {
-        id: instrPlayer
-        audioOutput: AudioOutput { volume: 1.0 }
-    }
-
-    function playBoth()  { vocalsPlayer.play();  instrPlayer.play()  }
-    function pauseBoth() { vocalsPlayer.pause(); instrPlayer.pause() }
-    function stopBoth()  { vocalsPlayer.stop();  instrPlayer.stop()  }
-    function seekBoth(ms){ vocalsPlayer.position = ms; instrPlayer.position = ms }
+    function playBoth()  { if (vocalsPlayer) { vocalsPlayer.play();  instrPlayer.play()  } }
+    function pauseBoth() { if (vocalsPlayer) { vocalsPlayer.pause(); instrPlayer.pause() } }
+    function stopBoth()  { if (vocalsPlayer) { vocalsPlayer.stop();  instrPlayer.stop()  } }
+    function seekBoth(ms){ if (vocalsPlayer) { vocalsPlayer.position = ms; instrPlayer.position = ms } }
 
     Timer {
         interval: 1000; repeat: true
@@ -370,10 +381,13 @@ Item {
         spacing: Settings.us(24)
         visible: !root.processing && !root.playerReady && !root.analyzing && !root.confirming
 
-        Text {
+        Image {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "🎤"
-            font.pixelSize: Settings.us(96)
+            source: "qrc:/assets/icons/ic_karaoke.png"
+            width: Settings.us(110); height: width
+            sourceSize.width: 256; sourceSize.height: 256
+            smooth: true; mipmap: true
+            opacity: 0.85
         }
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
@@ -394,7 +408,7 @@ Item {
         StyledButton {
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Выбрать файл"
-            width: Settings.us(300)
+            width: Math.max(Settings.us(300), naturalWidth)
             onClicked: filePicker.open()
         }
     }
@@ -453,7 +467,7 @@ Item {
             }
             StyledButton {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Отмена"; width: Settings.us(200)
+                text: "Отмена"; width: Math.max(Settings.us(200), naturalWidth)
                 onClicked: KaraokeModule.cancel()
             }
         }
@@ -492,10 +506,10 @@ Item {
                 Text {
                     id: srcText
                     anchors.centerIn: parent
-                    text: root.proposedSource === "tags"   ? "✓ Из тегов файла"
-                        : root.proposedSource === "ai"     ? "🤖 Определено нейросетью — проверьте"
-                        : root.proposedSource === "manual" ? "✍ Не удалось определить — введите вручную"
-                        :                                    "📄 Из имени файла"
+                    text: root.proposedSource === "tags"   ? "Из тегов файла"
+                        : root.proposedSource === "ai"     ? "Определено нейросетью — проверьте"
+                        : root.proposedSource === "manual" ? "Не удалось определить — введите вручную"
+                        :                                    "Из имени файла"
                     font.family: appFont.name; font.pixelSize: Settings.fs(15)
                     color: root.proposedSource === "manual" ? "#ffb86b" : "white"
                 }
@@ -540,11 +554,11 @@ Item {
                 anchors.horizontalCenter: parent.horizontalCenter
                 spacing: Settings.us(24)
                 StyledButton {
-                    text: "Другой файл"; width: Settings.us(200)
+                    text: "Другой файл"; width: Math.max(Settings.us(200), naturalWidth)
                     onClicked: { root.confirming = false; filePicker.open() }
                 }
                 StyledButton {
-                    text: "Продолжить"; width: Settings.us(240)
+                    text: "Продолжить"; width: Math.max(Settings.us(240), naturalWidth)
                     enabled: titleField.text.trim() !== ""
                     opacity: enabled ? 1.0 : 0.4
                     onClicked: root.confirmCurrent()
@@ -655,7 +669,7 @@ Item {
             }
             StyledButton {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Отмена"; width: Settings.us(200)
+                text: "Отмена"; width: Math.max(Settings.us(200), naturalWidth)
                 onClicked: KaraokeModule.cancel()
             }
         }
@@ -743,8 +757,8 @@ Item {
                         width: parent.width; height: Settings.us(4)
                         radius: 2; color: "#44ffffff"
                         Rectangle {
-                            width: vocalsPlayer.duration > 0
-                                   ? parent.width * vocalsPlayer.position / vocalsPlayer.duration : 0
+                            width: root.vDuration > 0
+                                   ? parent.width * root.vPosition / root.vDuration : 0
                             height: parent.height; radius: 2
                             color: Settings.accent(1.0)
                             Behavior on width { NumberAnimation { duration: 100 } }
@@ -753,8 +767,8 @@ Item {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: {
-                            if (vocalsPlayer.duration > 0)
-                                seekBoth(mouseX / width * vocalsPlayer.duration)
+                            if (root.vDuration > 0)
+                                seekBoth(mouseX / width * root.vDuration)
                         }
                     }
                 }
@@ -764,27 +778,27 @@ Item {
                     spacing: Settings.us(24)
 
                     StyledButton {
-                        text: "Другой трек"; width: Settings.us(180)
+                        text: "Другой трек"; width: Math.max(Settings.us(180), naturalWidth)
                         onClicked: { stopBoth(); root.playerReady = false; filePicker.open() }
                     }
                     StyledButton {
-                        text: vocalsPlayer.playbackState === MediaPlayer.PlayingState
-                               ? "⏸ Пауза" : "▶ Играть"
-                        width: Settings.us(160)
+                        text: root.vPlaying
+                               ? "Пауза" : "Играть"
+                        width: Math.max(Settings.us(160), naturalWidth)
                         onClicked: {
-                            if (vocalsPlayer.playbackState === MediaPlayer.PlayingState)
+                            if (root.vPlaying)
                                 pauseBoth()
                             else
                                 playBoth()
                         }
                     }
                     StyledButton {
-                        text: "⏹ Стоп"; width: Settings.us(140)
+                        text: "Стоп"; width: Math.max(Settings.us(140), naturalWidth)
                         onClicked: stopBoth()
                     }
                     StyledButton {
-                        text: root.vocalsOn ? "🎤 Вокал: вкл" : "🎤 Вокал: выкл"
-                        width: Settings.us(200)
+                        text: root.vocalsOn ? "Вокал: вкл" : "Вокал: выкл"
+                        width: Math.max(Settings.us(200), naturalWidth)
                         onClicked: root.vocalsOn = !root.vocalsOn
                     }
                 }

@@ -7,6 +7,9 @@
 #include "G72BatteryModule.h"
 #include "LoggerModule.h"
 #include <QDebug>
+#include <QElapsedTimer>
+#include <QThread>
+#include <QStringList>
 #include <atomic>
 #include <cmath>
 #include <array>
@@ -35,6 +38,27 @@ constexpr winrt::guid kBatteryLevel {
     { 0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb }
 };
 constexpr quint64 kFallbackMac = 0xDC6D8630E0EDULL;
+
+// Ожидание WinRT-операции с возможностью прервать её. Раньше использовался
+// блокирующий .get(): поиск отсутствующего пульта висел несколько секунд, и
+// при каждом выходе из приложения поток не успевал завершиться за 1,5 с
+// («forcing termination»). Теперь операция отменяется при завершении или по
+// таймауту.
+template <typename TOp>
+auto awaitOp(TOp const &op, const std::atomic<bool> &stop, int timeoutMs = 15000)
+{
+    using winrt::Windows::Foundation::AsyncStatus;
+    QElapsedTimer t;
+    t.start();
+    while (op.Status() == AsyncStatus::Started) {
+        if (stop.load() || t.elapsed() > timeoutMs) {
+            op.Cancel();
+            throw winrt::hresult_canceled();
+        }
+        QThread::msleep(15);
+    }
+    return op.GetResults();
+}
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,18 +98,18 @@ void G72BatteryWorker::doSearch()
     try {
         if (m_shuttingDown.load()) { delete st; return; }
 
-        st->device = BluetoothLEDevice::FromBluetoothAddressAsync(kFallbackMac).get();
+        st->device = awaitOp(BluetoothLEDevice::FromBluetoothAddressAsync(kFallbackMac), m_shuttingDown);
 
         if (!st->device) {
             if (m_shuttingDown.load()) { delete st; return; }
             try {
                 auto sel  = BluetoothLEDevice::GetDeviceSelectorFromDeviceName(L"G72");
-                auto devs = DeviceInformation::FindAllAsync(sel).get();
+                auto devs = awaitOp(DeviceInformation::FindAllAsync(sel), m_shuttingDown);
                 if (devs.Size() > 0) {
-                    auto d = BluetoothLEDevice::FromIdAsync(devs.GetAt(0).Id()).get();
+                    auto d = awaitOp(BluetoothLEDevice::FromIdAsync(devs.GetAt(0).Id()), m_shuttingDown);
                     if (d) {
                         quint64 mac = d.BluetoothAddress();
-                        st->device = BluetoothLEDevice::FromBluetoothAddressAsync(mac).get();
+                        st->device = awaitOp(BluetoothLEDevice::FromBluetoothAddressAsync(mac), m_shuttingDown);
                     }
                 }
             } catch (...) {}
@@ -100,9 +124,9 @@ void G72BatteryWorker::doSearch()
 
         if (m_shuttingDown.load()) { delete st; return; }
 
-        auto svcResult = st->device.GetGattServicesForUuidAsync(
+        auto svcResult = awaitOp(st->device.GetGattServicesForUuidAsync(
                                        kBatteryService,
-                                       BluetoothCacheMode::Uncached).get();
+                                       BluetoothCacheMode::Uncached), m_shuttingDown);
         if (svcResult.Status() != GattCommunicationStatus::Success
             || svcResult.Services().Size() == 0)
         {
@@ -114,10 +138,10 @@ void G72BatteryWorker::doSearch()
 
         if (m_shuttingDown.load()) { delete st; return; }
 
-        auto charResult = svcResult.Services().GetAt(0)
+        auto charResult = awaitOp(svcResult.Services().GetAt(0)
                               .GetCharacteristicsForUuidAsync(
                                   kBatteryLevel,
-                                  BluetoothCacheMode::Uncached).get();
+                                  BluetoothCacheMode::Uncached), m_shuttingDown);
         if (charResult.Status() != GattCommunicationStatus::Success
             || charResult.Characteristics().Size() == 0)
         {
@@ -137,15 +161,16 @@ void G72BatteryWorker::doSearch()
         }
 
     } catch (winrt::hresult_error const &e) {
+        delete st;
+        if (m_shuttingDown.load()) return;   // операция отменена при выходе
         QString msg = QString("WinRT error in doSearch: code=%1, message=%2")
         .arg(static_cast<long>(e.code()))
             .arg(QString::fromStdWString(e.message().c_str()));
-        qWarning() << "[G72Battery]" << msg;
-        delete st;
+        Logger::write(Logger::kLevelDebug, "G72Battery", msg);
         if (!m_shuttingDown.load())
             emit deviceFailed(msg);
     } catch (...) {
-        qWarning() << "[G72Battery] Unknown error in doSearch";
+        Logger::write(Logger::kLevelWarning, "G72Battery", "Unknown error in doSearch");
         delete st;
         if (!m_shuttingDown.load())
             emit deviceFailed("Unknown error in doSearch");
@@ -174,7 +199,7 @@ void G72BatteryWorker::doRead()
     if (!m_busy) return;
     m_busy->store(true);
     try {
-        auto result = st->charac.ReadValueAsync(BluetoothCacheMode::Uncached).get();
+        auto result = awaitOp(st->charac.ReadValueAsync(BluetoothCacheMode::Uncached), m_shuttingDown);
         if (result.Status() == GattCommunicationStatus::Success) {
             auto reader = DataReader::FromBuffer(result.Value());
             if (reader.UnconsumedBufferLength() >= 1) {
@@ -187,11 +212,12 @@ void G72BatteryWorker::doRead()
         }
         m_busy->store(false);
     } catch (winrt::hresult_error const &e) {
+        m_busy->store(false);
+        if (m_shuttingDown.load()) return;   // операция отменена при выходе
         QString msg = QString("WinRT read error: code=%1, message=%2")
         .arg(static_cast<long>(e.code()))
             .arg(QString::fromStdWString(e.message().c_str()));
-        qWarning() << "[G72Battery]" << msg;
-        m_busy->store(false);
+        Logger::write(Logger::kLevelWarning, "G72Battery", msg);
         delete st;
         m_device = nullptr;
         m_charac = nullptr;
@@ -199,7 +225,7 @@ void G72BatteryWorker::doRead()
             emit deviceFailed(msg);
     } catch (...) {
         m_busy->store(false);
-        qWarning() << "[G72Battery] Unknown read error";
+        Logger::write(Logger::kLevelWarning, "G72Battery", "Unknown read error");
         if (!m_shuttingDown.load())
             emit deviceFailed("Unknown read error");
     }
@@ -286,12 +312,7 @@ void G72BatteryModule::initialize(EventBus *bus, SettingsManager *)
     m_thread.start();
     QMetaObject::invokeMethod(m_worker, "doSearch", Qt::QueuedConnection);
 
-    qDebug() << "[G72Battery] Module initialized, search started";
-    if (m_bus) {
-        emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                Logger::makeEvent(Logger::kLevelInfo, moduleId().toUtf8().constData(),
-                                                  "Module initialized, search started"));
-    }
+    log(Logger::kLevelDebug, "Module initialized, search started");
 }
 
 void G72BatteryModule::shutdown()
@@ -336,8 +357,7 @@ void G72BatteryModule::shutdown()
     //    Максимум — 1500 мс. Если не успел — terminate (безопасно для WinRT
     //    объектов, т.к. cleanupState уже поставлен в очередь до quit).
     if (!m_thread.wait(1500)) {
-        qWarning() << "[G72Battery] Worker thread did not finish in 1500ms,"
-                   << "forcing termination (WinRT objects may leak)";
+        log(Logger::kLevelWarning, "Worker thread did not finish in 1500 ms, forcing termination");
         m_thread.terminate();
         m_thread.wait(300);
     }
@@ -361,12 +381,7 @@ void G72BatteryModule::onDeviceReady()
     m_pollTimer.start();
 
     if (!wasConnected) {
-        qDebug() << "[G72Battery] Connected";
-        if (m_bus) {
-            emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                    Logger::makeEvent(Logger::kLevelInfo, moduleId().toUtf8().constData(),
-                                                      "Connected"));
-        }
+        log(Logger::kLevelInfo, "G72 remote connected");
     }
 }
 
@@ -377,36 +392,25 @@ void G72BatteryModule::onDeviceFailed(const QString &reason)
     m_pollTimer.stop();
     m_retryTimer.start();
 
-    // Собираем диагностику
-    QString diag;
+    // Диагностика: фильтр и сырые значения имеют смысл, только если пульт
+    // когда-то отвечал
+    QStringList diag;
+    diag << reason;
     if (m_rawHistoryCount > 0) {
-        diag = QString("Last raw values: %1").arg(rawHistoryString());
+        diag << QString("last raw values: %1").arg(rawHistoryString());
+        diag << QString("filter: %1").arg(filterStateString());
     }
-    diag += QString("; Filter state: %1").arg(filterStateString());
-    diag += QString("; Reason: %1").arg(reason);
 
     if (wasConnected) {
         // Реальная потеря связи – выводим всегда
-        qDebug() << "[G72Battery] Disconnected:" << diag;
-        if (m_bus) {
-            QByteArray msg = QString("Disconnected: %1").arg(diag).toUtf8();
-            emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                    Logger::makeEvent(Logger::kLevelError, moduleId().toUtf8().constData(),
-                                                      msg.constData()));
-        }
+        log(Logger::kLevelWarning, "G72 remote disconnected: " + diag.join("; "));
         m_failureLogged = false;   // сброс для будущих попыток
-    } else {
-        // Неудачная попытка подключения – выводим только один раз
-        if (!m_failureLogged) {
-            qDebug() << "[G72Battery] Connection failed:" << diag;
-            if (m_bus) {
-                QByteArray msg = QString("Connection failed: %1").arg(diag).toUtf8();
-                emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                        Logger::makeEvent(Logger::kLevelWarning, moduleId().toUtf8().constData(),
-                                                          msg.constData()));
-            }
-            m_failureLogged = true;
-        }
+    } else if (!m_failureLogged) {
+        // Пульт не найден / не отвечает — один раз, дальше повторы молча
+        log(Logger::kLevelInfo,
+            QString("G72 remote not available (%1), retrying every %2 s")
+                .arg(diag.join("; ")).arg(m_retryTimer.interval() / 1000));
+        m_failureLogged = true;
     }
 }
 
@@ -431,16 +435,7 @@ void G72BatteryModule::onRawSample(quint8 raw)
         double drop = m_prevRaw - rawD;
         if (!m_frozen && drop >= DROP_THRESHOLD) {
             m_frozen = true;
-            if (m_bus) {
-                QByteArray msg = QString("Frozen: drop=%1 (prevRaw=%2, raw=%3)")
-                .arg(drop, 0, 'f', 1)
-                    .arg(m_prevRaw, 0, 'f', 1)
-                    .arg(rawD, 0, 'f', 1)
-                    .toUtf8();
-                emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                        Logger::makeEvent(Logger::kLevelWarning, moduleId().toUtf8().constData(),
-                                                          msg.constData()));
-            }
+            log(Logger::kLevelWarning, QString("Frozen: drop=%1 (prevRaw=%2, raw=%3)") .arg(drop, 0, 'f', 1) .arg(m_prevRaw, 0, 'f', 1) .arg(rawD, 0, 'f', 1));
         }
     }
     m_prevRaw = rawD;
@@ -452,15 +447,7 @@ void G72BatteryModule::onRawSample(quint8 raw)
     pushVar(m_ema);
     if (m_frozen && m_varCount >= VAR_WIN && variance() < VAR_THRESHOLD) {
         m_frozen = false;
-        if (m_bus) {
-            QByteArray msg = QString("Unfrozen: variance=%1, ema=%2")
-            .arg(variance(), 0, 'f', 3)
-                .arg(m_ema, 0, 'f', 1)
-                .toUtf8();
-            emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                    Logger::makeEvent(Logger::kLevelInfo, moduleId().toUtf8().constData(),
-                                                      msg.constData()));
-        }
+        log(Logger::kLevelInfo, QString("Unfrozen: variance=%1, ema=%2") .arg(variance(), 0, 'f', 3) .arg(m_ema, 0, 'f', 1));
     }
 
     if (!m_frozen) {
@@ -528,15 +515,7 @@ void G72BatteryModule::applyBattery(int percent)
     Zone z = percent > 50 ? Green : percent >= 20 ? Yellow : Red;
     if (z != m_zone) { m_zone = z; emit zoneChanged(static_cast<int>(m_zone)); }
 
-    if (m_bus) {
-        QByteArray msg = QString("Battery changed to %1%, Raw sample: %2")
-        .arg(percent)
-            .arg(m_lastRawSample)
-            .toUtf8();
-        emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                                Logger::makeEvent(Logger::kLevelInfo, moduleId().toUtf8().constData(),
-                                                  msg.constData()));
-    }
+    log(Logger::kLevelInfo, QString("Battery changed to %1%, Raw sample: %2") .arg(percent) .arg(m_lastRawSample));
 }
 
 void G72BatteryModule::setConnected(bool v)
@@ -544,4 +523,9 @@ void G72BatteryModule::setConnected(bool v)
     if (v == m_connected) return;
     m_connected = v;
     emit connectedChanged(v);
+}
+
+void G72BatteryModule::log(const char *level, const QString &msg)
+{
+    Logger::write(level, "G72Battery", msg);
 }

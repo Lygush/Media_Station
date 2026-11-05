@@ -4,6 +4,7 @@ CONFIG -= app_bundle
 
 TARGET = tst_gamelibrarymodule_scan
 TEMPLATE = app
+include($$PWD/../../common.pri)
 
 INCLUDEPATH += $$PWD/../../..
 DEPENDPATH  += $$PWD/../../..
@@ -17,6 +18,4 @@ SOURCES += \
 HEADERS += \
     ../../../modules/GameLibraryModule/GameLibraryModule.h \
     ../../../modules/TileModule/InstallUtils.h \
-    ../../../modules/SettingsModule/SettingsManager.h \
-    ../../../core/IModule.h \
-    ../../../core/EventBus.h
+    ../../../modules/SettingsModule/SettingsManager.h

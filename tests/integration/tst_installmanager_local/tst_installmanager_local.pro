@@ -4,6 +4,7 @@ CONFIG -= app_bundle
 
 TARGET = tst_installmanager_local
 TEMPLATE = app
+include($$PWD/../../common.pri)
 
 INCLUDEPATH += $$PWD/../../..
 DEPENDPATH  += $$PWD/../../..
@@ -15,6 +16,4 @@ SOURCES += \
 
 HEADERS += \
     ../../../modules/TileModule/InstallManager.h \
-    ../../../modules/TileModule/InstallUtils.h \
-    ../../../core/IModule.h \
-    ../../../core/EventBus.h
+    ../../../modules/TileModule/InstallUtils.h

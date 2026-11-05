@@ -89,9 +89,11 @@ void NotificationModule::enqueue(const NotificationItem &item)
     // Вытеснение: новое уведомление строго выше уровнем текущего.
     if (static_cast<int>(item.level) > static_cast<int>(m_current.level)) {
         m_autoDismissTimer->stop();
-        // Info-уведомления при вытеснении теряются — они не важны.
-        // Warning и Error возвращаются в начало очереди.
-        if (m_current.level != NotificationLevel::Info)
+        // Временные Info-уведомления при вытеснении теряются — они не важны.
+        // Постоянные (без автоскрытия) и Warning/Error возвращаются в начало
+        // очереди: раньше постоянное Info («Логи отправлены» и т.п.) пропадало
+        // бесследно, если в этот момент приходила ошибка.
+        if (m_current.level != NotificationLevel::Info || !m_current.autoDismiss)
             m_queue.prepend(m_current);
         m_current = item;
         emit currentChanged();

@@ -83,5 +83,6 @@ private:
     QString m_destPath;   // итоговый путь trailer.mp4
     QString m_tmpPath;    // путь к .tmp файлу
 
-    bool    m_cancelled = false;
+    bool    m_cancelled   = false;
+    bool    m_writeFailed = false;   // ошибка записи .tmp (нет места) — результат брак
 };

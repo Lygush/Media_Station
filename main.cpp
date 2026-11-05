@@ -30,6 +30,8 @@
 #include <QPixmap>
 #include <QDebug>
 #include <QWindow>
+#include <QTimer>
+#include <QElapsedTimer>
 
 #ifdef Q_OS_WIN
 #  include <windows.h>
@@ -105,16 +107,16 @@ int main(int argc, char *argv[])
     host.registerModule(new UpdateManager(&host));
 
     // Завершается после UpdateManager — освобождает llama.cpp (медленно)
-    host.registerModule(new GameInfoModule());
+    host.registerModule(new GameInfoModule(&host));
 
     // Завершается после GameInfoModule — отменяет загрузки медиа
-    host.registerModule(new GameMediaModule());
+    host.registerModule(new GameMediaModule(&host));
 
     // Завершается после GameMediaModule — отменяет задачи архивации
     host.registerModule(new GameLibraryModule(&host));
 
     // Завершается после GameLibraryModule — скрывает оверлей
-    host.registerModule(new OverlayModule);
+    host.registerModule(new OverlayModule(&host));
 
     // Завершается после OverlayModule — WinRT Bluetooth поток
     host.registerModule(new G72BatteryModule(&host));
@@ -158,7 +160,36 @@ int main(int argc, char *argv[])
         qWarning() << "main: failed to get main window for Layered setup";
     }
 
+    // ── Сторож отзывчивости интерфейса ──────────────────────────────────────
+    // Тик каждые 100 мс в GUI-потоке. Если очередной тик опоздал больше чем на
+    // 250 мс — поток интерфейса был занят (синхронная загрузка, тяжёлый JS,
+    // создание плеера…): пишем в журнал, сколько и на каком экране. Это даёт
+    // данные о «фризах» с реальной машины, а не догадки.
+    QTimer stallTimer;
+    QElapsedTimer stallClock;
+    stallClock.start();
+    stallTimer.setInterval(100);
+    QObject::connect(&stallTimer, &QTimer::timeout, [&]() {
+        const qint64 gap = stallClock.restart();
+        // Пока на переднем плане игра/эмулятор, система вправе притормаживать
+        // наш процесс — это не фриз интерфейса
+        if (gap < 350 || QGuiApplication::applicationState() != Qt::ApplicationActive) return;
+        QString screen;
+        if (QObject *root = engine.rootObjects().value(0)) {
+            if (QObject *stack = root->findChild<QObject *>(QStringLiteral("mainStack"))) {
+                if (QObject *cur = stack->property("currentItem").value<QObject *>())
+                    screen = cur->property("screenTitle").toString();
+            }
+        }
+        Logger::write(gap > 1000 ? Logger::kLevelWarning : Logger::kLevelInfo, "UI",
+                      QString("interface was unresponsive for %1 ms (screen: %2)")
+                          .arg(gap - 100).arg(screen.isEmpty() ? QStringLiteral("home") : screen));
+    });
+    // Первые секунды — загрузка экрана и модулей, не считаем
+    QTimer::singleShot(3000, &stallTimer, [&]() { stallClock.restart(); stallTimer.start(); });
+
     const int rc = app.exec();
+    stallTimer.stop();
 
     // 1) Модули завершают внешние процессы (эмулятор, DS4Windows, хуки), пока UI жив
     host.shutdownAll();

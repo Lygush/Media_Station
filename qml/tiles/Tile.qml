@@ -108,6 +108,7 @@ Item {
 
             layer.enabled: true
             layer.effect: OpacityMask {
+                cached: true
                 maskSource: coverMask
             }
 
@@ -158,11 +159,19 @@ Item {
         // ── ИКОНКА (показывается только когда нет обложки) ───────────────────
         Item {
             id: iconContainer
-            anchors.centerIn: parent
-            anchors.verticalCenterOffset: (root.installing || root.launching) ? Settings.us(-28) : 0
-            Behavior on anchors.verticalCenterOffset { NumberAnimation { duration: 200 } }
+            // По центру плитки, как раньше, но не ниже верхнего края названия:
+            // на ужатых плитках (1280 px) и крупном шрифте двухстрочное название
+            // заезжало на значок. При нехватке места значок уменьшается.
+            readonly property int _gap: Settings.us(8)
+            readonly property int _centerY: Math.round((parent.height - height) / 2)
+                                            + ((root.installing || root.launching) ? Settings.us(-28) : 0)
+            anchors.horizontalCenter: parent.horizontalCenter
+            y: Math.max(_gap, Math.min(_centerY, titleText.y - height - _gap))
+            Behavior on y { NumberAnimation { duration: 200 } }
 
-            width: Math.round(root.tileW * 0.24); height: Math.round(root.tileW * 0.24)
+            width: Math.max(Settings.us(24), Math.min(Math.round(root.tileW * 0.24),
+                                                     titleText.y - 2 * _gap))
+            height: width
             property bool imageError: false
 
             // Скрываем иконку когда показана обложка или когда идёт AndroidTV-запуск
@@ -229,6 +238,7 @@ Item {
             // Лёгкая тень на тексте — чтобы читался поверх любой обложки
             layer.enabled: root._hasCover
             layer.effect: DropShadow {
+                cached: true
                 horizontalOffset: 0; verticalOffset: 1
                 radius: 6; samples: 13; color: "#CC000000"
             }
@@ -309,6 +319,8 @@ Item {
                         }
 
                         Glow {
+                            cached: true
+                            visible: opacity > 0   // невидимое свечение не считать каждый кадр
                             anchors.fill: cancelRect; source: cancelRect
                             radius: 8; samples: 16; color: "#FF4444"
                             opacity: cancelZone._hovered ? 0.6 : 0.0
@@ -424,6 +436,8 @@ Item {
     }
 
     Glow {
+        cached: true
+        visible: opacity > 0   // невидимое свечение не считать каждый кадр
         id: borderGlow
         anchors.fill: borderRect; source: borderRect
         radius: 16; samples: 24; color: Settings.accent(1.0)
@@ -432,6 +446,7 @@ Item {
     }
 
     Glow {
+        cached: true
         id: launchGlow
         anchors.fill: borderRect; source: borderRect
         radius: 24; samples: 32; color: Settings.accent(1.0)

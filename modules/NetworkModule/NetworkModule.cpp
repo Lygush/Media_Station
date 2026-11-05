@@ -9,6 +9,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QDateTime>
+#include <QTimer>
 
 NetworkModule::NetworkModule(QObject *parent)
     : QObject(parent)
@@ -33,6 +34,8 @@ void NetworkModule::initialize(EventBus *bus, SettingsManager *settings)
 
 void NetworkModule::shutdown()
 {
+    m_stopped = true;
+    if (m_idleTimer) m_idleTimer->stop();
     if (m_server) {
         m_server->close();
         for (QTcpSocket *socket : m_clients.keys())
@@ -51,19 +54,76 @@ void NetworkModule::shutdown()
 void NetworkModule::initServer()
 {
     m_server = new QTcpServer(this);
-    if (m_server->listen(QHostAddress::Any, 12345)) {
-        connect(m_server, &QTcpServer::newConnection, this, &NetworkModule::newConnection);
-    } else {
-        qWarning() << "[NetworkModule] Failed to listen on TCP port 12345:"
-                   << m_server->errorString();
-    }
+    connect(m_server, &QTcpServer::newConnection, this, &NetworkModule::newConnection);
 
     m_udpSocket = new QUdpSocket(this);
-    if (m_udpSocket->bind(QHostAddress::Any, 12346)) {
-        connect(m_udpSocket, &QUdpSocket::readyRead, this, &NetworkModule::processUdpDatagrams);
-    } else {
-        qWarning() << "[NetworkModule] Failed to bind UDP port 12346:"
-                   << m_udpSocket->errorString();
+    connect(m_udpSocket, &QUdpSocket::readyRead, this, &NetworkModule::processUdpDatagrams);
+
+    // Клиенты, которые замолчали на середине передачи, не должны висеть вечно
+    // (открытый временный архив на гигабайты + запись в m_clients).
+    m_idleTimer = new QTimer(this);
+    m_idleTimer->setInterval(10'000);
+    connect(m_idleTimer, &QTimer::timeout, this, &NetworkModule::checkIdleClients);
+    m_idleTimer->start();
+
+    startListening();
+}
+
+// Раньше при занятом порте (остался прошлый экземпляр, порт держит другая
+// программа) в лог писалось предупреждение, и приём игр/обновлений молча не
+// работал до перезапуска. Теперь пробуем снова каждые 10 с.
+void NetworkModule::startListening()
+{
+    if (m_stopped) return;
+
+    bool allUp = true;
+
+    if (!m_server->isListening()) {
+        if (m_server->listen(QHostAddress::Any, 12345)) {
+            log("INFO", "TCP 12345: слушаю");
+        } else {
+            allUp = false;
+            log("WARN", QString("TCP 12345 недоступен: %1 — повтор через 10 с")
+                            .arg(m_server->errorString()));
+        }
+    }
+
+    if (m_udpSocket->state() != QAbstractSocket::BoundState) {
+        if (m_udpSocket->bind(QHostAddress::Any, 12346,
+                              QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
+            log("INFO", "UDP 12346: слушаю");
+        } else {
+            allUp = false;
+            log("WARN", QString("UDP 12346 недоступен: %1 — повтор через 10 с")
+                            .arg(m_udpSocket->errorString()));
+        }
+    }
+
+    if (!allUp)
+        QTimer::singleShot(10'000, this, &NetworkModule::startListening);
+}
+
+void NetworkModule::checkIdleClients()
+{
+    constexpr qint64 kIdleLimitMs = 60'000;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    QList<QTcpSocket *> stale;
+    for (auto it = m_clients.constBegin(); it != m_clients.constEnd(); ++it) {
+        const ClientState &st = it.value();
+        // Упаковка на стороне отправителя может долго идти без данных,
+        // распаковка идёт у нас — эти фазы не трогаем.
+        const bool watched = st.phase == PhaseNegotiating
+                          || st.phase == PhaseReceiving
+                          || st.phase == PhaseUpdate;
+        if (watched && st.lastActivityMs > 0 && now - st.lastActivityMs > kIdleLimitMs)
+            stale.append(it.key());
+    }
+    for (QTcpSocket *s : std::as_const(stale)) {
+        if (!m_clients.contains(s)) continue;
+        log("WARN", QString("Клиент %1 не отвечает более 60 с — соединение закрыто")
+                        .arg(s->peerAddress().toString()));
+        cleanupClient(s, true);   // отправит CANCEL, уберёт плитку и закроет сокет
     }
 }
 
@@ -85,11 +145,7 @@ void NetworkModule::onSettingsChanged(const QString &key, const QVariant &value)
 // logs/app.log. Теперь дублируем в LoggerModule, как это делает InstallManager.
 void NetworkModule::log(const char *level, const QString &msg) const
 {
-    qDebug().noquote() << "[NetworkModule]" << level << msg;
-    if (!m_bus) return;
-    const QByteArray bytes = msg.toUtf8();
-    emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                            Logger::makeEvent(level, "network", bytes.constData()));
+    Logger::write(level, "NetworkModule", msg);
 }
 
 // ─── Реализация серверных методов вставляется из NetworkServer.cpp ─────────

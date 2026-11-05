@@ -36,28 +36,9 @@ GameInfoModule::~GameInfoModule()
 
 void GameInfoModule::logMsg(const char *level, const QString &message)
 {
-    // Сравниваем содержимое, а не указатели: литералы из заголовка в разных
-    // единицах трансляции могут иметь разные адреса
-    if (qstrcmp(level, Logger::kLevelError) == 0 || qstrcmp(level, Logger::kLevelWarning) == 0)
-        qWarning() << "[GameInfoModule]" << message;
-    else
-        qDebug()   << "[GameInfoModule]" << message;
-
-    if (!m_bus) return;
-
-    const QString lvl = QString::fromUtf8(level);
-    const QString msg = message;
-    QMetaObject::invokeMethod(m_bus, [this, lvl, msg]() {
-        emit m_bus->moduleEvent(
-            Logger::kModule,
-            Logger::kEventLog,
-            Logger::makeEvent(
-                lvl.toUtf8().constData(),
-                "GameInfoModule",
-                msg.toUtf8().constData()
-            )
-        );
-    }, Qt::QueuedConnection);
+    // Один путь записи (консоль + файл); раньше каждое сообщение уходило
+    // дважды — в qDebug/qWarning и через шину.
+    Logger::write(level, "GameInfoModule", message);
 }
 
 // ── IModule ───────────────────────────────────────────────────────────────────
@@ -83,11 +64,13 @@ void GameInfoModule::shutdown()
         QMutexLocker locker(&m_candidateMutex);
         m_aborted = true;
         m_candidateCond.wakeAll();
+        // m_llama создаётся фоновым потоком под этим же мьютексом —
+        // читаем его здесь же, без гонки.
+        if (m_llama) m_llama->requestAbort();
     }
 
-    // Прерываем генерацию и ДОЖИДАЕМСЯ фонового потока: раньше m_llama удалялся,
-    // пока doFetch ещё работал с ним (падение при выходе во время генерации).
-    if (m_llama) m_llama->requestAbort();
+    // ДОЖИДАЕМСЯ фонового потока: раньше m_llama удалялся, пока doFetch
+    // ещё работал с ним (падение при выходе во время генерации).
     if (m_fetchFuture.isRunning()) {
         GIM_LOG(Logger::kLevelInfo, "shutdown(): waiting for fetch thread");
         m_fetchFuture.waitForFinished();
@@ -281,9 +264,22 @@ void GameInfoModule::doFetch(const QString &tileId,
     GIM_LOG(Logger::kLevelInfo, "preparing LlamaClient...");
     QMetaObject::invokeMethod(this, [this]() { setStage("generating"); }, Qt::QueuedConnection);
 
-    if (!m_llama) {
-        m_llama = new LlamaClient();
-        m_llama->setBus(m_bus); // пробрасываем шину ДО initialize()
+    // Создание и сброс флага — под мьютексом, которым shutdown() выставляет
+    // m_aborted и вызывает requestAbort(): после этой точки выход из программы
+    // гарантированно прервёт загрузку модели и генерацию.
+    {
+        QMutexLocker locker(&m_candidateMutex);
+        if (m_aborted) return;
+        if (!m_llama) {
+            m_llama = new LlamaClient();
+            m_llama->setBus(m_bus); // пробрасываем шину ДО initialize()
+        }
+        m_llama->resetAbort();
+    }
+
+    // Модель выгружается после каждой генерации (см. ниже), поэтому
+    // загружаем её заново, если объект есть, но модель не в памяти.
+    if (!m_llama->isReady()) {
 
         const QString modelPath = QSettings("MediaStation", "MediaStation")
             .value("llamaModelPath").toString();
@@ -308,8 +304,8 @@ void GameInfoModule::doFetch(const QString &tileId,
         if (!m_llama->initialize(resolvedPath)) {
             GIM_LOG(Logger::kLevelError,
                     "LlamaClient: initialize() failed — see above for details");
-            delete m_llama;
-            m_llama = nullptr;
+            // Объект не удаляем: он может читаться в shutdown(); следующий
+            // запрос просто попробует загрузить модель заново.
 
             QMetaObject::invokeMethod(this, [this, tileId]() {
                 m_fetching = false;
@@ -342,6 +338,12 @@ void GameInfoModule::doFetch(const QString &tileId,
     };
 
     const QVariantMap meta = generateGameInfo(title, sourceText, onToken, onJsonToken);
+
+    // Освобождаем видеопамять сразу после генерации. Раньше модель (~4.5 ГБ)
+    // оставалась в VRAM до выхода из программы, и запущенные после этого игры
+    // получали заметно меньше видеопамяти. Описание игры запрашивается редко,
+    // повторная загрузка модели занимает несколько секунд.
+    m_llama->shutdown();
 
     {
         QMutexLocker locker(&m_candidateMutex);

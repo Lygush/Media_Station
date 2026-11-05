@@ -77,8 +77,16 @@ Row {
 
         delegate: Item {
             id: btn
-            width:  root.buttonWidth
-            height: root.buttonHeight
+            // buttonWidth — минимальная ширина; длинная подпись расширяет кнопку
+            width:  Math.max(root.buttonWidth, Math.ceil(btnMetrics.advanceWidth) + Settings.us(20))
+            height: Math.max(root.buttonHeight, Math.ceil(btnMetrics.height) + Settings.us(12))
+
+            TextMetrics {
+                id: btnMetrics
+                font.pixelSize: Settings.fs(13)
+                font.bold: true          // активная кнопка — жирным, меряем по ней
+                text: root._itemLabel(modelData)
+            }
 
             readonly property bool active: root._isActive(modelData)
 

@@ -43,13 +43,17 @@ public:
     void     initialize(EventBus *bus, SettingsManager *settings) override;
     QObject *qmlObject() override { return this; }
     QString  qmlName()   const override { return "AppController"; }
+    /// Завершение приложения: остановка наблюдения за игрой и возврат панели
+    /// задач. Раньше этот метод был скрыт одноимённым Q_INVOKABLE и никогда
+    /// не вызывался — при выходе во время игры панель задач оставалась скрытой.
+    void     shutdown() override;
     /// Регистрируется как QML-синглтон (не контекстное свойство).
     void     registerWithQml(QQmlApplicationEngine *engine) override;
 
     // ── API ───────────────────────────────────────────────────────────────────
     Q_INVOKABLE QString parentPath(const QString &path) const;
     Q_INVOKABLE void    launch(const QString &path, const QString &tileId = QString());
-    Q_INVOKABLE void    shutdown() const;
+    Q_INVOKABLE void    quitApplication() const;
     Q_INVOKABLE void    showBlackOverlay();
     Q_INVOKABLE void    hideBlackOverlay();
 

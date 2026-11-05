@@ -190,7 +190,7 @@ void KaraokeModule::startPipeline(const SongMeta &meta)
     m_processing = true;
     const QString appDir = QCoreApplication::applicationDirPath();
 
-    auto future = QtConcurrent::run([=]() {
+    auto future = QtConcurrent::run([this, appDir, meta, cacheDir]() {
         KaraokeWorker worker(appDir, meta, cacheDir, &m_cancelled);
 
         // Прогресс пробрасываем через Qt::QueuedConnection из лямбды —

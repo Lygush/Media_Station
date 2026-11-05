@@ -64,8 +64,7 @@ void InstallManager::initialize(EventBus *bus, SettingsManager * /*settings*/)
         finalizeInstallation(tileId, title, gameRootPath, exeRelPath, iconRelPath, kind);
     });
 
-    qDebug() << "[InstallManager] Initialized";
-    log(Logger::kLevelInfo, "Initialized");
+    log(Logger::kLevelDebug, "Initialized");
 }
 
 void InstallManager::shutdown()
@@ -83,10 +82,7 @@ void InstallManager::shutdown()
 
 void InstallManager::log(const char *level, const QString &msg)
 {
-    if (!m_bus) return;
-    const QByteArray bytes = msg.toUtf8();
-    emit m_bus->moduleEvent(Logger::kModule, Logger::kEventLog,
-                            Logger::makeEvent(level, "installManager", bytes.constData()));
+    Logger::write(level, "InstallManager", msg);
 }
 
 void InstallManager::logAsync(const char *level, const QString &msg)
@@ -155,10 +151,17 @@ void InstallManager::cancelAllInstallations()
 void InstallManager::deleteInstalledGame(const QString &folderPath)
 {
     if (folderPath.isEmpty()) return;
+    // Защита от рекурсивного удаления чужой папки (битый installFolder в
+    // structure.json, ручная правка и т.п.): удаляем только папки игр,
+    // созданные MediaStation.
+    if (!InstallUtils::isManagedGameFolder(folderPath)) {
+        log(Logger::kLevelWarning,
+            QString("deleteInstalledGame: refused, not a game folder: %1").arg(folderPath));
+        return;
+    }
     QDir dir(folderPath);
     if (dir.exists()) {
         dir.removeRecursively();
-        qDebug() << "[InstallManager] Deleted game folder:" << folderPath;
         log(Logger::kLevelInfo, QString("Deleted game folder: %1").arg(folderPath));
     }
 }
@@ -192,7 +195,6 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
     task.progress    = 0.0;
     m_installTasks.insert(tileId, task);
 
-    qDebug() << "[InstallManager] Starting local installation:" << tileId << title;
     log(Logger::kLevelInfo, QString("Starting installation: %1 (%2)").arg(tileId, title));
 
     connect(watcher, &QFutureWatcher<QVariantMap>::finished, this,
@@ -207,7 +209,6 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
                 QDir(*gameRootPathPtr).removeRecursively();
             m_installTasks.remove(tileId);
 
-            qDebug() << "[InstallManager] Installation cancelled:" << tileId;
             log(Logger::kLevelInfo, QString("Installation cancelled: %1").arg(tileId));
             // Пользователь сам нажал отмену — уведомление не нужно.
             emit installationCancelled(tileId);
@@ -218,7 +219,6 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
                 QDir(*gameRootPathPtr).removeRecursively();
             m_installTasks.remove(tileId);
 
-            qWarning() << "[InstallManager] Installation failed:" << tileId;
             log(Logger::kLevelWarning, QString("Installation failed: %1").arg(tileId));
             notify(NotificationLevel::Error,
                    QString("Ошибка установки: %1").arg(title));
@@ -228,7 +228,6 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
             const QString gameFolder = result["gameFolder"].toString();
             m_installTasks.remove(tileId);
 
-            qDebug() << "[InstallManager] Installation finished:" << tileId << "->" << gameFolder;
             log(Logger::kLevelInfo,
                 QString("Installation finished: %1 → %2").arg(tileId, gameFolder));
             notify(NotificationLevel::Info,
@@ -261,7 +260,6 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
             QDir(sourceDirPath).absolutePath());
 
         if (!QDir(sourceDir).exists()) {
-            qWarning() << "[InstallManager] Source dir not found:" << sourceDir;
             logAsync(Logger::kLevelWarning,
                      QString("startInstallation: source dir not found: %1").arg(sourceDir));
             return {};
@@ -271,7 +269,6 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
         exeRel.replace('\\', '/');
         const QString exeAbsPath = QDir(sourceDir).absoluteFilePath(exeRel);
         if (!QFile::exists(exeAbsPath)) {
-            qWarning() << "[InstallManager] Selected exe not found:" << exeAbsPath;
             logAsync(Logger::kLevelWarning,
                      QString("startInstallation: exe not found: %1").arg(exeAbsPath));
             return {};
@@ -286,10 +283,8 @@ void InstallManager::startInstallation(const QString &tileId,        const QStri
         if (allFiles.isEmpty()) return {};
         if (cancelFlag->load()) return {};
 
-        QString safeTitle = title;
-        static const QRegularExpression kInvalidCharsRe("[<>:\"/\\\\|?*]");
-        safeTitle.replace(kInvalidCharsRe, "_");
-        const QString gameFolderName = InstallUtils::generateUniqueFolderName(safeTitle, gamesInstallDir);
+        const QString gameFolderName = InstallUtils::generateUniqueFolderName(
+            InstallUtils::sanitizeFolderName(title, tileId), gamesInstallDir);
 
         const QDir gamesDir(gamesInstallDir);
         if (!gamesDir.mkpath(".")) return {};
@@ -390,8 +385,6 @@ void InstallManager::finalizeInstallation(const QString &tileId,   const QString
                                           const QString &iconRelativePath,
                                           const QString &kind)
 {
-    Q_UNUSED(title)
-
     const QString gameSubPath     = gameRootPath + "/game";
     const QString launcherSubPath = gameRootPath + "/launcher";
     // Отображаемое имя для уведомлений — берём из имени папки если title пуст.
@@ -433,8 +426,10 @@ void InstallManager::finalizeInstallation(const QString &tileId,   const QString
 
         if (exeFullPath.isEmpty()) {
             qWarning() << "[InstallManager] finalizeInstallation: no exe in" << gameSubPath;
-            log(Logger::kLevelWarning,
-                QString("finalizeInstallation: no exe found for %1").arg(tileId));
+            // Распакованные файлы без запускаемого exe бесполезны — раньше
+            // они (иногда гигабайты) оставались на диске навсегда.
+            if (InstallUtils::isManagedGameFolder(gameRootPath))
+                QDir(gameRootPath).removeRecursively();
             notify(NotificationLevel::Error,
                    QString("Ошибка установки: не найден исполняемый файл (%1)").arg(displayTitle));
             emit installationFinished(tileId, false, {}, {}, {});
@@ -463,8 +458,8 @@ void InstallManager::finalizeInstallation(const QString &tileId,   const QString
     const QString ps1Path = InstallUtils::createLaunchScript(gameRootPath, exeRelativeInGame, kind);
     if (ps1Path.isEmpty()) {
         qWarning() << "[InstallManager] finalizeInstallation: failed to create launch.ps1 for" << tileId;
-        log(Logger::kLevelWarning,
-            QString("finalizeInstallation: failed to create launch.ps1 for %1").arg(tileId));
+        if (InstallUtils::isManagedGameFolder(gameRootPath))
+            QDir(gameRootPath).removeRecursively();
         notify(NotificationLevel::Error,
                QString("Ошибка установки: не удалось создать скрипт запуска (%1)").arg(displayTitle));
         emit installationFinished(tileId, false, {}, {}, {});
@@ -472,12 +467,12 @@ void InstallManager::finalizeInstallation(const QString &tileId,   const QString
     }
 
     // ── Запись game_info.json ──────────────────────────────────────────────────
-    const QString gameTitle = QDir(gameRootPath).dirName();
+    // Настоящее название (с «:», «?» и т.п.), а не имя папки
+    const QString gameTitle = displayTitle;
     const QString exeForInfo = (kind == "app") ? exeRelativeInGame : QString();
     InstallUtils::writeGameInfoFile(gameRootPath, tileId, gameTitle, "installed",
                                     exeForInfo, newIconPath);
 
-    qDebug() << "[InstallManager] finalizeInstallation: done" << tileId;
     log(Logger::kLevelInfo,
         QString("Network installation finalized: %1 → %2")
         .arg(tileId, QDir::toNativeSeparators(gameRootPath)));
@@ -506,10 +501,8 @@ void InstallManager::createExternalShortcut(const QString &tileId,  const QStrin
         ? m_appDir + "/data/games"
         : installDir;
 
-    QString safeTitle = title;
-    static const QRegularExpression kInvalidCharsRe("[<>:\"/\\\\|?*]");
-    safeTitle.replace(kInvalidCharsRe, "_");
-    const QString gameFolderName = InstallUtils::generateUniqueFolderName(safeTitle, gamesInstallDir);
+    const QString gameFolderName = InstallUtils::generateUniqueFolderName(
+        InstallUtils::sanitizeFolderName(title, tileId), gamesInstallDir);
 
     const QDir gamesDir(gamesInstallDir);
     if (!gamesDir.mkpath(".")) {
@@ -560,7 +553,6 @@ void InstallManager::createExternalShortcut(const QString &tileId,  const QStrin
 
     InstallUtils::writeGameInfoFile(gameRootPath, tileId, title, "external", exePath, newIconPath);
 
-    qDebug() << "[InstallManager] External shortcut created:" << tileId;
     log(Logger::kLevelInfo,
         QString("External shortcut created: %1 (%2)").arg(tileId, title));
     notify(NotificationLevel::Info,
@@ -584,16 +576,12 @@ QString InstallManager::prepareInstallDir(const QString &tileId, const QString &
         ? m_appDir + "/data/games"
         : installDir;
 
-    QString safeTitle = title;
-    static const QRegularExpression kInvalidCharsRe("[<>:\"/\\\\|?*]");
-    safeTitle.replace(kInvalidCharsRe, "_");
-    const QString gameFolderName = InstallUtils::generateUniqueFolderName(safeTitle, gamesInstallDir);
+    const QString gameFolderName = InstallUtils::generateUniqueFolderName(
+        InstallUtils::sanitizeFolderName(title, tileId), gamesInstallDir);
 
     const QDir gamesDir(gamesInstallDir);
     if (!gamesDir.mkpath(".")) {
         qWarning() << "[InstallManager] Cannot create games dir:" << gamesInstallDir;
-        log(Logger::kLevelWarning,
-            QString("prepareInstallDir: cannot create games dir for %1").arg(tileId));
         return {};
     }
 
@@ -602,8 +590,6 @@ QString InstallManager::prepareInstallDir(const QString &tileId, const QString &
         !QDir(gameRootPath + "/game").mkpath(".")  ||
         !QDir(gameRootPath + "/launcher").mkpath(".")) {
         qWarning() << "[InstallManager] Cannot create subdirs for:" << gameRootPath;
-        log(Logger::kLevelWarning,
-            QString("prepareInstallDir: cannot create subdirs for %1").arg(tileId));
         return {};
     }
 
@@ -615,24 +601,6 @@ QString InstallManager::prepareInstallDir(const QString &tileId, const QString &
 // Поиск установленных игр
 // ═════════════════════════════════════════════════════════════════════════════
 
-QString InstallManager::resolveInstallFolder(const QString &installFolder,
-                                             const QString &installBasePath) const
-{
-    if (!installFolder.isEmpty()) {
-        const QDir dir(installFolder);
-        if (dir.exists()) return QDir::toNativeSeparators(dir.absolutePath());
-    }
-    if (!installBasePath.isEmpty()) {
-        const QDir base(installBasePath);
-        const QFileInfoList entries = base.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
-        for (const QFileInfo &e : entries) {
-            if (QFile::exists(e.absoluteFilePath() + "/launcher/launch.ps1"))
-                return QDir::toNativeSeparators(e.absoluteFilePath());
-        }
-    }
-    return {};
-}
-
 bool InstallManager::installedGameExists(const QString &installFolder,
                                          const QString &installBasePath) const
 {
@@ -643,8 +611,12 @@ bool InstallManager::installedGameExists(const QString &installFolder,
 QString InstallManager::findInstallFolderByTileId(const QString &tileId,
                                                   const QString &installBasePath) const
 {
-    if (tileId.isEmpty() || installBasePath.isEmpty()) return {};
-    const QDir base(installBasePath);
+    if (tileId.isEmpty()) return {};
+    // Пустой путь в настройках = каталог по умолчанию, куда игры и ставятся.
+    // Раньше поиск сразу возвращал пустоту, и «удалить вместе с файлами»
+    // оставлял игру на диске.
+    const QDir base(installBasePath.isEmpty() ? m_appDir + "/data/games"
+                                              : installBasePath);
     if (!base.exists()) return {};
 
     const QFileInfoList entries = base.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
@@ -795,7 +767,11 @@ void InstallManager::updateLaunchExe(const QString &tileId,
                     }
                 }
             }
-            checkDependencies("update_" + tileId, exeAbs);
+            // checkDependencies обращается к членам объекта — запускаем его из
+            // GUI-потока, а не напрямую из фоновой задачи.
+            if (self) QMetaObject::invokeMethod(self.data(), [this, tileId, exeAbs]() {
+                checkDependencies("update_" + tileId, exeAbs);
+            }, Qt::QueuedConnection);
         } else {
             qWarning() << "[InstallManager] updateLaunchExe: failed to write ps1 for" << tileId;
         }
@@ -907,12 +883,10 @@ void InstallManager::checkDependencies(const QString &requestId,
             if (deps.missing.isEmpty()) {
                 const QString msg = QString("Dependencies OK for %1 inputTypes=[%2]")
                     .arg(exeName, deps.inputTypes.join(", "));
-                qDebug() << "[InstallManager]" << msg;
                 log(Logger::kLevelInfo, msg);
             } else {
                 const QString msg = QString("Missing dependencies for %1: %2")
                     .arg(exeName, deps.missing.join(", "));
-                qWarning() << "[InstallManager]" << msg;
                 log(Logger::kLevelWarning, msg);
                 notify(NotificationLevel::Warning,
                        QString("Внимание: не найдены библиотеки для %1:\n%2")

@@ -17,6 +17,7 @@
 #include <QTextStream>
 #include <QDebug>
 #include <functional>
+#include <memory>
 
 #ifdef Q_OS_WIN
 #  include <windows.h>
@@ -173,9 +174,7 @@ UpdaterWindow::UpdaterWindow(const QString &archivePath,
     root->addLayout(btnRow);
 
     connect(retryBtn,  &QPushButton::clicked, this, &UpdaterWindow::onRetryClicked);
-    connect(cancelBtn, &QPushButton::clicked, this, [this]() {
-        QApplication::quit();
-    });
+    connect(cancelBtn, &QPushButton::clicked, this, &UpdaterWindow::onCancelClicked);
 
     if (QScreen *sc = QApplication::primaryScreen()) {
         const QRect sg = sc->availableGeometry();
@@ -287,11 +286,15 @@ bool UpdaterWindow::moveDirectory(const QString &srcPath, const QString &dstPath
         }
     }
 
-    // Удаляем исходную директорию (должна быть пустой после переноса файлов).
+    // Удаляем исходную директорию ТОЛЬКО если всё перенесено. Раньше она
+    // удалялась безусловно: файлы, которые не удалось перенести (нет места,
+    // нет прав), пропадали безвозвратно вместе с исходной папкой.
     // Если Explorer или AV держит хэндл на директорию — removeRecursively вернёт
-    // false, но это не критично: папка уже пуста и будет убрана при removeRecursively
-    // на m_oldDir в launchNew().
-    srcDir.removeRecursively();
+    // false, но это не критично: файлы уже скопированы в назначение.
+    if (success)
+        srcDir.removeRecursively();
+    else
+        logWarn("moveDirectory: источник НЕ удалён, часть файлов не перенесена: " + srcPath);
 
     return success;
 }
@@ -302,18 +305,38 @@ bool UpdaterWindow::moveDirectory(const QString &srcPath, const QString &dstPath
 void UpdaterWindow::startUpdate()
 {
     show();
-    QApplication::processEvents();
-
     setStatus("Проверка архива...");
     setProgress(5);
-    QApplication::processEvents();
 
-    if (!m_expectedHash.isEmpty() && !verifyHash()) {
-        fatal("Контрольная сумма архива не совпадает.\n"
-              "Файл повреждён — обновление отменено.\n\n"
-              "MediaStation не был изменён.");
+    if (m_expectedHash.isEmpty()) {
+        continueAfterHash();
         return;
     }
+
+    const QString path     = m_archivePath;
+    const QString expected = m_expectedHash;
+    auto result = std::make_shared<int>(-1);
+    QThread *t = QThread::create([path, expected, result]() {
+        *result = computeHashMatch(path, expected);
+    });
+    connect(t, &QThread::finished, this, [this, t, result]() {
+        t->deleteLater();
+        if (*result < 0)
+            logError("verifyHash: cannot open archive: " + m_archivePath);
+        logInfo(QString("verifyHash: %1").arg(*result == 1 ? "OK" : "MISMATCH"));
+        if (*result != 1) {
+            fatal("Контрольная сумма архива не совпадает.\n"
+                  "Файл повреждён — обновление отменено.\n\n"
+                  "MediaStation не был изменён.", /*removeArchive=*/true);
+            return;
+        }
+        continueAfterHash();
+    });
+    t->start();
+}
+
+void UpdaterWindow::continueAfterHash()
+{
     setProgress(10);
 
     if (m_waitPid > 0) {
@@ -369,6 +392,11 @@ void UpdaterWindow::tick()
     if (h) {
         running = (WaitForSingleObject(h, 0) == WAIT_TIMEOUT);
         CloseHandle(h);
+    } else {
+        // ERROR_INVALID_PARAMETER = процесса с таким PID уже нет. Любая другая
+        // ошибка (например, отказ в доступе) НЕ означает, что он завершился —
+        // иначе замена файлов начиналась при ещё работающем MediaStation.
+        running = (GetLastError() != ERROR_INVALID_PARAMETER);
     }
 #endif
 
@@ -380,16 +408,14 @@ void UpdaterWindow::tick()
         // Пауза после завершения процесса: Windows Defender и другие антивирусы
         // продолжают держать хэндл на .exe ещё 1-3 секунды после выхода процесса.
         // Без паузы MoveFileEx немедленно получает ERROR_ACCESS_DENIED (WinErr=5).
+        // Таймер вместо msleep(3000): окно остаётся отзывчивым.
         setStatus("MediaStation завершён, ожидание освобождения файлов...");
-        QApplication::processEvents();
-        QThread::msleep(3000);
-
-        setStatus("Распаковка архива...");
-        setProgress(15);
-        QApplication::processEvents();
-
-        prepareNewDir();
-        startExtract();
+        QTimer::singleShot(3000, this, [this]() {
+            setStatus("Распаковка архива...");
+            setProgress(15);
+            prepareNewDir();
+            startExtract();
+        });
     }
 }
 
@@ -420,7 +446,8 @@ void UpdaterWindow::startExtract()
     m_extractProc->start(sevenZ, {"x", m_archivePath, "-o" + m_newDir, "-y", "-bsp1"});
     if (!m_extractProc->waitForStarted(5000)) {
         fatal("Не удалось запустить 7zr.exe.\n"
-              "Убедитесь, что он находится в папке tools рядом с MediaStation.");
+              "Убедитесь, что он находится в папке tools рядом с MediaStation.\n\n"
+              "MediaStation не был изменён.", /*removeArchive=*/false);
     }
 }
 
@@ -444,6 +471,18 @@ void UpdaterWindow::onExtractFinished(int exitCode, QProcess::ExitStatus)
             });
         return;
     }
+    // Проверяем распакованное ДО замены рабочей версии: повреждённый или
+    // неверный архив без MediaStation.exe раньше приводил к удалению старой
+    // версии и запуску пустоты.
+    if (!QFile::exists(m_newDir + "/MediaStation.exe")) {
+        logError("Extracted archive has no MediaStation.exe in: " + m_newDir);
+        QDir(m_newDir).removeRecursively();
+        fatal("Архив обновления не содержит MediaStation.exe.\n"
+              "Обновление отменено.\n\n"
+              "MediaStation не был изменён.", /*removeArchive=*/true);
+        return;
+    }
+
     setProgress(80);
     setStatus("Замена файлов...");
     QApplication::processEvents();
@@ -455,11 +494,14 @@ void UpdaterWindow::extractProgress()
     if (!m_extractProc) return;
     const QByteArray out = m_extractProc->readAllStandardOutput()
                            + m_extractProc->readAllStandardError();
-    static QRegularExpression re("\\s*(\\d+)%");
+    // 7z перерисовывает прогресс через \r (и \b), а не \n — делим по всем
+    // разделителям и берём последнее значение, иначе прогресс отстаёт.
+    static const QRegularExpression sep("[\\r\\n\\x08]+");
+    static const QRegularExpression re("^\\s*(\\d{1,3})%");
     int last = -1;
-    for (const QString &line : QString::fromLocal8Bit(out).split('\n', Qt::SkipEmptyParts)) {
+    for (const QString &line : QString::fromLocal8Bit(out).split(sep, Qt::SkipEmptyParts)) {
         QRegularExpressionMatch m = re.match(line);
-        if (m.hasMatch()) last = m.captured(1).toInt();
+        if (m.hasMatch()) last = qBound(0, m.captured(1).toInt(), 100);
     }
     if (last >= 0)
         setProgress(15 + last * 60 / 100);
@@ -471,10 +513,13 @@ void UpdaterWindow::extractProgress()
 void UpdaterWindow::doReplace()
 {
     dismissRetry();
+    // Небольшая пауза перед переименованием (антивирус отпускает файлы) —
+    // таймером, а не msleep, чтобы окно не замирало.
+    QTimer::singleShot(500, this, &UpdaterWindow::doReplaceNow);
+}
 
-    // ★★★ НЕБОЛЬШАЯ ПАУЗА ПЕРЕД ПЕРЕИМЕНОВАНИЕМ ★★★
-    QThread::msleep(500);
-
+void UpdaterWindow::doReplaceNow()
+{
     // m_oldDir генерируется один раз при первом вызове.
     // При повторных вызовах (retry) используем тот же путь — иначе каждый
     // раз создаётся новая папка и предыдущая попытка пофайлового переноса
@@ -512,7 +557,7 @@ void UpdaterWindow::doReplace()
         // moveDirectory копирует все файлы в m_oldDir; файлы занятые AV/Defender
         // будут скопированы (dst создан), но src может не удалиться — это нормально,
         // мы продолжаем и в конце пробуем rename снова на опустевшую папку.
-        logWarn("Atomic rename failed after 10 attempts, trying file-by-file move to oldDir.");
+        logWarn("Atomic rename failed, trying file-by-file move to oldDir.");
         setStatus("Перемещение файлов из старой папки (обход блокировки Explorer)...");
         QApplication::processEvents();
 
@@ -537,9 +582,24 @@ void UpdaterWindow::doReplace()
     }
 
     if (!renamedOld) {
+#ifdef Q_OS_WIN
+        // Запоминаем код ошибки сразу: дальнейшие вызовы (логи, QDir) его затирают
+        const DWORD err = GetLastError();
+#endif
+        // Часть файлов могла уже уехать в oldDir — возвращаем их на место,
+        // чтобы установленная версия осталась целой.
+        if (QDir(m_oldDir).exists()) {
+            logWarn("Rolling back partial move: " + m_oldDir + " -> " + m_targetDir);
+            if (moveDirectory(m_oldDir, m_targetDir)) {
+                QDir(m_oldDir).removeRecursively();
+                m_oldDir.clear();
+            } else {
+                logError("Rollback of partial move incomplete, oldDir is KEPT: " + m_oldDir);
+            }
+        }
+
         QString hint;
 #ifdef Q_OS_WIN
-        DWORD err = GetLastError();
         if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION)
             hint = "Один или несколько файлов MediaStation заняты другим процессом.\n"
                    "Закройте все окна Проводника с папкой MediaStation и другие программы.\n"
@@ -553,16 +613,10 @@ void UpdaterWindow::doReplace()
 #else
         hint = "Проверьте права доступа к папке и попробуйте снова.";
 #endif
+        // ВАЖНО: oldDir здесь НЕ удаляется. Раньше «Попробовать снова» стирало
+        // её целиком, а в ней уже лежали перенесённые файлы (в т.ч. data/).
         recoverableError("Не удалось переместить текущую папку MediaStation.", hint,
-                         [this]() {
-                             // Убираем частично заполненную oldDir и сбрасываем путь,
-                             // чтобы на следующей попытке создалась чистая папка.
-                             if (!m_oldDir.isEmpty()) {
-                                 QDir(m_oldDir).removeRecursively();
-                                 m_oldDir.clear();
-                             }
-                             doReplace();
-                         });
+                         [this]() { doReplace(); });
         return;
     }
 
@@ -572,7 +626,7 @@ void UpdaterWindow::doReplace()
     if (!renamedNew) {
         // Атомарный rename newDir→targetDir не прошёл: возможно targetDir всё ещё
         // существует (пустая, с занятым файлом). Пробуем пофайловый перенос.
-        logWarn("Atomic rename newDir->targetDir failed after 5 attempts, trying file-by-file.");
+        logWarn("Atomic rename newDir->targetDir failed, trying file-by-file.");
         setStatus("Установка новой версии (пофайловый перенос)...");
         QApplication::processEvents();
         QDir().mkpath(m_targetDir);
@@ -594,8 +648,9 @@ void UpdaterWindow::doReplace()
             recoverableError(
                 "Не удалось установить новую версию. Предыдущая версия восстановлена.",
                 "Проверьте права доступа к папке и нажмите «Попробовать снова».\n"
-                "Распаковывать архив заново не нужно.",
+                "Архив будет распакован заново.",
                 [this]() {
+                    m_oldDir.clear();
                     setStatus("Распаковка архива...");
                     setProgress(15);
                     QApplication::processEvents();
@@ -607,7 +662,7 @@ void UpdaterWindow::doReplace()
             fatal("Критическая ошибка: не удалось установить новую версию\n"
                   "и не удалось восстановить старую.\n\n"
                   "Путь установки: " + m_targetDir + "\n"
-                  "Старая версия сохранена в: " + m_oldDir);
+                  "Старая версия сохранена в: " + m_oldDir, /*removeArchive=*/false);
         }
         return;
     }
@@ -666,6 +721,8 @@ void UpdaterWindow::doReplace()
                     } else {
                         logError("All methods failed to migrate data folder!");
                         setStatus("⚠ Не удалось перенести папку data — проверьте её вручную.");
+                        // Единственная копия данных пользователя — в oldDir. Не удаляем.
+                        m_keepOldDir = true;
                     }
                 }
             }
@@ -698,6 +755,7 @@ void UpdaterWindow::doReplace()
                 } else {
                     logError("Failed to copy tools from: " + oldToolsPath);
                     setStatus("Предупреждение: не удалось скопировать папку tools.");
+                    m_keepOldDir = true;
                 }
             }
         } else {
@@ -768,12 +826,19 @@ void UpdaterWindow::doReplace()
 void UpdaterWindow::launchNew()
 {
     const QString newExe = m_targetDir + "/MediaStation.exe";
+    bool started = false;
     if (QFile::exists(newExe)) {
         logInfo("Launching: " + newExe);
-        QProcess::startDetached(newExe, {});
+        // Рабочий каталог — папка приложения, а не временная папка Updater,
+        // которая будет удалена (новый процесс иначе унаследует её как CWD).
+        started = QProcess::startDetached(newExe, {}, m_targetDir);
+        if (!started)
+            logError("startDetached failed for: " + newExe);
     } else {
         logWarn("MediaStation.exe not found at: " + newExe);
     }
+    if (!started)
+        m_keepOldDir = true;   // новая версия не стартовала — сохраняем старую для отката
 
     setProgress(100);
     setStatus("Готово! Очистка временных файлов...");
@@ -793,9 +858,20 @@ void UpdaterWindow::launchNew()
         QFile::copy(srcLog, dstLogsDir + "/" + m_logFileName);
     }
 
+    if (m_keepOldDir && !m_oldDir.isEmpty()) {
+        QMessageBox::warning(this, "Обновление завершено с предупреждением",
+            "Обновление установлено, но были проблемы (см. лог).\n\n"
+            "Предыдущая версия и ваши данные сохранены в папке:\n" + m_oldDir + "\n\n"
+            "Удалите её вручную, когда убедитесь, что всё работает.");
+    }
+
+    // Освобождаем CWD: иначе временная папка (в которой лежит сам Updater)
+    // не может быть удалена даже частично.
+    QDir::setCurrent(QDir::tempPath());
+
     QThread *t = QThread::create([this]() {
         QFile::remove(m_archivePath);
-        if (!m_oldDir.isEmpty())
+        if (!m_oldDir.isEmpty() && !m_keepOldDir)
             QDir(m_oldDir).removeRecursively();
         if (!m_tempDir.isEmpty() && QDir(m_tempDir).exists()) {
             QDir(m_tempDir).removeRecursively();
@@ -807,23 +883,23 @@ void UpdaterWindow::launchNew()
     t->start();
 }
 
-bool UpdaterWindow::verifyHash() const
+int UpdaterWindow::computeHashMatch(const QString &path, const QString &expected)
 {
-    QFile f(m_archivePath);
-    if (!f.open(QIODevice::ReadOnly)) {
-        const_cast<UpdaterWindow*>(this)->logError("verifyHash: cannot open archive: " + m_archivePath);
-        return false;
-    }
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return -1;
     QCryptographicHash h(QCryptographicHash::Sha256);
-    while (!f.atEnd()) h.addData(f.read(4 * 1024 * 1024));
-    const bool ok = QString::fromLatin1(h.result().toHex())
-                        .compare(m_expectedHash, Qt::CaseInsensitive) == 0;
-    const_cast<UpdaterWindow*>(this)->logInfo(
-        QString("verifyHash: %1").arg(ok ? "OK" : "MISMATCH"));
-    return ok;
+    while (!f.atEnd()) {
+        const QByteArray chunk = f.read(4 * 1024 * 1024);
+        if (chunk.isEmpty() && f.error() != QFileDevice::NoError)
+            return -1;
+        h.addData(chunk);
+    }
+    return QString::fromLatin1(h.result().toHex())
+               .compare(expected, Qt::CaseInsensitive) == 0 ? 1 : 0;
 }
 
-void UpdaterWindow::fatal(const QString &msg)
+void UpdaterWindow::fatal(const QString &msg, bool removeArchive)
 {
     logError("FATAL: " + msg);
     if (m_logStream) { m_logStream->flush(); delete m_logStream; m_logStream = nullptr; }
@@ -836,11 +912,43 @@ void UpdaterWindow::fatal(const QString &msg)
         if (QDir(dstLogsDir).exists() || QDir().mkpath(dstLogsDir))
             QFile::copy(srcLog, dstLogsDir + "/" + m_logFileName);
     }
-    QFile::remove(m_archivePath);
-    setStatus("Ошибка обновления. MediaStation не был изменён.");
+    // Архив удаляем только если он сам негоден (битый хэш / нет exe внутри);
+    // при остальных сбоях он нужен для повторной попытки.
+    if (removeArchive)
+        QFile::remove(m_archivePath);
+    setStatus("Ошибка обновления.");
     progressBar->setValue(0);
     QMessageBox::critical(this, "Ошибка обновления", msg);
-    QApplication::quit();
+    quitApp();
+}
+
+void UpdaterWindow::quitApp()
+{
+    // quit() до входа в app.exec() (fatal вызывается из startUpdate) не
+    // срабатывает — процесс Updater оставался висеть с окном навсегда.
+    // Отложенный вызов гарантированно отработает внутри цикла событий.
+    QMetaObject::invokeMethod(qApp, &QCoreApplication::quit, Qt::QueuedConnection);
+}
+
+void UpdaterWindow::onCancelClicked()
+{
+    // Нажатие, попавшее в очередь до скрытия кнопки, могло доставиться одним
+    // из processEvents() посреди замены файлов и удалить MediaStation_New_*,
+    // которую в этот момент переносят на место установки. Отмена допустима
+    // только в состоянии ошибки, когда кнопка показана.
+    if (!cancelBtn->isVisible()) return;
+    logInfo("Cancelled by user");
+    if (!m_newDir.isEmpty() && QDir(m_newDir).exists())
+        QDir(m_newDir).removeRecursively();
+
+    // Если установка осталась без рабочей версии — прямо говорим, где она.
+    if (!m_oldDir.isEmpty() && QDir(m_oldDir).exists()
+        && !QFile::exists(m_targetDir + "/MediaStation.exe")) {
+        QMessageBox::warning(this, "Обновление прервано",
+            "Рабочая версия не восстановлена автоматически.\n"
+            "Предыдущая версия и данные находятся в папке:\n" + m_oldDir);
+    }
+    quitApp();
 }
 
 void UpdaterWindow::recoverableError(const QString &msg,
@@ -868,6 +976,7 @@ void UpdaterWindow::recoverableError(const QString &msg,
 
 void UpdaterWindow::onRetryClicked()
 {
+    if (!retryBtn->isVisible()) return;   // см. onCancelClicked
     if (m_retryStep) {
         auto step = m_retryStep;
         m_retryStep = nullptr;

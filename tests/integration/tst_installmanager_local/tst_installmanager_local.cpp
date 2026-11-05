@@ -36,10 +36,6 @@ private slots:
         // Настраиваем менеджер
         installer = new InstallManager(this);
         installer->initialize(&bus, nullptr); // SettingsManager не нужен, передаём nullptr
-        // В InstallManager есть m_appDir – он берётся из QCoreApplication::applicationDirPath().
-        // Для теста мы не можем его изменить. Но можно сделать setter.
-        // В реальном коде добавьте метод setAppDirForTesting(const QString &path).
-        // Пока пропустим.
     }
     void cleanup() {
         delete installer;
@@ -84,6 +80,18 @@ void tst_InstallManagerLocal::testLocalInstall()
 
 void tst_InstallManagerLocal::testCancelInstallation()
 {
+    // Достаточно данных, чтобы копирование не успело завершиться до отмены
+    // (раньше крошечная установка заканчивалась быстрее, чем через 100 мс,
+    // и тест падал случайным образом).
+    QDir src(sourceDir->path());
+    src.mkpath("data");
+    const QByteArray block(256 * 1024, 'x');
+    for (int i = 0; i < 200; ++i) {
+        QFile f(src.filePath(QString("data/chunk_%1.bin").arg(i)));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(block);
+    }
+
     QSignalSpy spyCancelled(installer, &InstallManager::installationCancelled);
     QSignalSpy spyFinished(installer, &InstallManager::installationFinished);
 
@@ -92,8 +100,6 @@ void tst_InstallManagerLocal::testCancelInstallation()
                                  sourceDir->path() + "/icon.png",
                                  targetBase->path());
 
-    // Даём немного времени на начало копирования
-    QTest::qWait(100);
     installer->cancelInstallation("tile456");
 
     QTRY_COMPARE(spyCancelled.count(), 1);

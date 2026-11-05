@@ -4,6 +4,7 @@
 #include "core/IModule.h"
 #include <QObject>
 #include <QProcess>
+#include <QElapsedTimer>
 #include <QProcessEnvironment>
 #include <QTimer>
 #include <QString>
@@ -229,6 +230,9 @@ private:
     void removeAvdLocks(const QString &avdDirPath);
     void syncAdbKeyAndRestartServer(const QString &avdName, std::function<void()> onReady = {});
     void syncAdbKeys(const QString &avdName);
+    QStringList adbKeyDirs() const;                 // где могут лежать adbkey / adbkey.pub
+    void checkEmulatorAdbKey(const QString &pubKey); // сверка ключа, который шлёт эмулятор
+    void scanEmulatorOutput(const QString &out);     // «Boot completed», ключ adb
 
     // ── Окна ─────────────────────────────────────────────────────────────────
     void setMediaStationOpacity(int alpha);
@@ -255,6 +259,7 @@ private:
     static int remoteKeyToAndroidKeyCode(const QString &key);
     void notifyKeyMode(bool emulatorActive);
     void sendAndroidKey(int keyCode);
+    void flushPendingKeys();
     void startKeyShell();
     void stopKeyShell();
 
@@ -326,6 +331,12 @@ private:
     QTimer   *m_bootPollTimer   = nullptr;
     int       m_bootPollCount   = 0;
     bool      m_bootPollInFlight = false;
+    QElapsedTimer m_launchTimer;             // время с начала launch() — для журнала
+    QString   m_lastBootPollOut;             // последний ответ getprop (offline/unauthorized…)
+    int       m_emulatorLinesForwarded = 0;  // строки эмулятора с ошибками, отправленные в основной лог
+    bool      m_emuReportedBoot = false;     // эмулятор написал «Boot completed in N ms»
+    int       m_unauthorizedPolls = 0;       // подряд ответов adb «unauthorized» после загрузки
+    bool      m_adbUnauthorized = false;     // запущен без доступа adb (пульт через adb не работает)
     static constexpr int kBootPollIntervalMs = 2000;
     static constexpr int kBootPollMaxTries   = 150;   // 5 минут
 
@@ -346,6 +357,16 @@ private:
     QProcess   *m_logcatProcess = nullptr;
 
     QProcess   *m_keyShell = nullptr;
+    // Объединение нажатий: `input keyevent` в Android запускает отдельную JVM
+    // (сотни мс). Пока команда выполняется, новые нажатия копятся и уходят
+    // одной командой; очередь ограничена, чтобы удержание кнопки не давало
+    // «хвост» навигации после отпускания.
+    QList<int>    m_pendingKeys;
+    bool          m_keyBatchInFlight = false;
+    QElapsedTimer m_keyBatchSent;
+    QString       m_keyShellBuf;
+    static constexpr int kMaxPendingKeys   = 8;
+    static constexpr int kKeyBatchStuckMs  = 2000;
 
     bool m_overlayOpen        = false;
     bool m_overlayCooldown    = false;

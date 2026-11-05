@@ -81,6 +81,7 @@ private slots:
     void onRetryTick();
 
 private:
+    void log(const char *level, const QString &msg);
     static constexpr int    BATTERY_MAX    = 0xBB;
     static constexpr int    BATTERY_MIN    = 0x87;
     static constexpr double EMA_ALPHA      = 0.3;

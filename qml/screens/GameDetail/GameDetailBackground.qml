@@ -34,61 +34,117 @@ Item {
         return "file:///" + parts.join("/")
     }
 
-    // Когда нет никаких медиа — компонент полностью прозрачен, системный фон виден
-    visible: _hasAnyMedia
+    // Пока медиа нет — компонент прозрачен, виден системный фон. Появление фона
+    // и смена обложки на backdrop — плавные (раньше картинка возникала рывком).
+    readonly property bool _imageShown: frontImage.status === Image.Ready
+    opacity: (_imageShown || showTrailer) ? 1.0 : 0.0
+    visible: opacity > 0
+    Behavior on opacity { NumberAnimation { duration: 700; easing.type: Easing.InOutQuad } }
 
     // ── Состояние: backdrop → trailer → backdrop ──────────────────────────────
     property bool showTrailer: false
+
+    // Плеер трейлера создаётся не сразу, а после анимации открытия экрана:
+    // создание MediaPlayer (на Windows — загрузка FFmpeg) и открытие файла
+    // шли в момент перехода и давали заметный фриз.
+    property bool _playerArmed: false
+    Timer {
+        interval: 900; running: bg._hasTrailer && !bg._playerArmed
+        onTriggered: bg._playerArmed = true
+    }
+    readonly property var mediaPlayer: playerLoader.item ? playerLoader.item.player : null
 
     Timer {
         id: backdropTimer
         interval: 5000
         repeat:   false
-        running:  bg._hasTrailer && bg._hasBackdrop && !bg.showTrailer
+        running:  bg._hasTrailer && bg._hasBackdrop && !bg.showTrailer && bg.mediaPlayer !== null
         onTriggered: fadeOverlay.startFadeIn()
     }
 
-    onTrailerPathChanged: {
-        if (_hasTrailer && !_hasBackdrop) {
+    function _startTrailerIfOnly() {
+        if (_hasTrailer && !_hasBackdrop && mediaPlayer && !showTrailer) {
             showTrailer = true
             mediaPlayer.play()
         }
     }
+    onTrailerPathChanged: _startTrailerIfOnly()
+    onMediaPlayerChanged: _startTrailerIfOnly()
 
-    // ── Backdrop / обложка ────────────────────────────────────────────────────
-    Image {
-        id: bgImage
-        anchors.fill: parent
-        source:   bg._hasBackdrop ? bg._fileUrl(bg.backdropPath)
-                : bg._hasCover    ? bg._fileUrl(bg.coverPath)
-                : ""
-        fillMode: Image.PreserveAspectCrop
-        cache:    true
-        asynchronous: true
-        opacity:  bg.showTrailer ? 0.0 : 1.0
-        Behavior on opacity { NumberAnimation { duration: 600 } }
-    }
+    // ── Backdrop / обложка: две картинки с перекрёстным переходом ───────────
+    readonly property string _imageSource: _hasBackdrop ? _fileUrl(backdropPath)
+                                         : _hasCover    ? _fileUrl(coverPath)
+                                         : ""
+    property bool _aFront: true
+    readonly property Image frontImage: _aFront ? imgA : imgB
+    readonly property Image backImage:  _aFront ? imgB : imgA
 
-    // ── Медиаплеер ────────────────────────────────────────────────────────────
-    MediaPlayer {
-        id: mediaPlayer
-        source:      bg._hasTrailer ? bg._trailerSource : ""
-        videoOutput: videoOutput
-        audioOutput: AudioOutput { volume: 0.0 }
-
-        onPlaybackStateChanged: {
-            if (playbackState === MediaPlayer.StoppedState && bg.showTrailer && bg._hasTrailer)
-                fadeOverlay.startFadeIn()
+    on_ImageSourceChanged: {
+        if (frontImage.source == "" || frontImage.status !== Image.Ready) {
+            frontImage.source = _imageSource       // первое появление — общий fade
+        } else if (frontImage.source != _imageSource) {
+            backImage.source = _imageSource        // переход, когда загрузится
         }
-        onErrorOccurred: console.warn("Video error:", errorString)
+    }
+    Component.onCompleted: imgA.source = _imageSource
+
+    function _onBackReady(img) {
+        if (img === backImage && img.status === Image.Ready && img.source == _imageSource)
+            _aFront = !_aFront
     }
 
-    VideoOutput {
-        id: videoOutput
+    Item {
         anchors.fill: parent
-        fillMode:     VideoOutput.PreserveAspectCrop
-        opacity:      bg.showTrailer ? 1.0 : 0.0
+        opacity: bg.showTrailer ? 0.0 : 1.0
         Behavior on opacity { NumberAnimation { duration: 600 } }
+
+        Image {
+            id: imgA
+            anchors.fill: parent
+            fillMode: Image.PreserveAspectCrop
+            cache: true; asynchronous: true
+            opacity: bg._aFront ? 1.0 : 0.0
+            Behavior on opacity { NumberAnimation { duration: 700; easing.type: Easing.InOutQuad } }
+            onStatusChanged: bg._onBackReady(imgA)
+        }
+        Image {
+            id: imgB
+            anchors.fill: parent
+            fillMode: Image.PreserveAspectCrop
+            cache: true; asynchronous: true
+            opacity: bg._aFront ? 0.0 : 1.0
+            Behavior on opacity { NumberAnimation { duration: 700; easing.type: Easing.InOutQuad } }
+            onStatusChanged: bg._onBackReady(imgB)
+        }
+    }
+
+    // ── Медиаплеер (создаётся отложенно, см. _playerArmed) ────────────────────
+    Loader {
+        id: playerLoader
+        anchors.fill: parent
+        active: bg._hasTrailer && bg._playerArmed
+        sourceComponent: Item {
+            property alias player: mediaPlayer
+            MediaPlayer {
+                id: mediaPlayer
+                source:      bg._trailerSource
+                videoOutput: videoOutput
+                audioOutput: AudioOutput { volume: 0.0 }
+
+                onPlaybackStateChanged: {
+                    if (playbackState === MediaPlayer.StoppedState && bg.showTrailer && bg._hasTrailer)
+                        fadeOverlay.startFadeIn()
+                }
+                onErrorOccurred: console.warn("Video error:", errorString)
+            }
+            VideoOutput {
+                id: videoOutput
+                anchors.fill: parent
+                fillMode:     VideoOutput.PreserveAspectCrop
+                opacity:      bg.showTrailer ? 1.0 : 0.0
+                Behavior on opacity { NumberAnimation { duration: 600 } }
+            }
+        }
     }
 
     // ── Затемняющий оверлей для переходов ────────────────────────────────────
@@ -110,11 +166,11 @@ Item {
                 script: {
                     if (bg.showTrailer) {
                         bg.showTrailer = false
-                        mediaPlayer.stop()
+                        if (bg.mediaPlayer) bg.mediaPlayer.stop()
                         backdropTimer.restart()
-                    } else {
+                    } else if (bg.mediaPlayer) {
                         bg.showTrailer = true
-                        mediaPlayer.play()
+                        bg.mediaPlayer.play()
                     }
                 }
             }

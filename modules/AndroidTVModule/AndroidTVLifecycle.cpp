@@ -3,9 +3,11 @@
 // Запуск / остановка эмулятора, подготовка AVD, взаимодействие с adb.
 
 #include "AndroidTVModule.h"
+#include <QPointer>
 #include "LoggerModule.h"
 #include "core/EventBus.h"
 #include "SettingsManager.h"
+#include "modules/NotificationModule/NotificationModule.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -94,6 +96,19 @@ QProcessEnvironment AndroidTVModule::toolsEnvironment() const
     env.insert("ANDROID_AVD_HOME",      avdHome);
     env.insert("ANDROID_EMULATOR_HOME", avdHome);
     env.insert("SKIP_JDK_VERSION_CHECK", "true");
+
+    // adb-сервер предлагает устройству все найденные ключи, а не только свой
+    // %USERPROFILE%\.android\adbkey. Эмулятор берёт ключ из своей папки
+    // (ANDROID_EMULATOR_HOME) — если там другой, без этого устройство остаётся
+    // «unauthorized» и загрузка не завершается.
+    QStringList vendorKeys;
+    for (const QString &dir : adbKeyDirs()) {
+        const QString key = QDir::toNativeSeparators(dir + "/adbkey");
+        if (QFile::exists(key) && !vendorKeys.contains(key, Qt::CaseInsensitive))
+            vendorKeys << key;
+    }
+    if (!vendorKeys.isEmpty())
+        env.insert("ADB_VENDOR_KEYS", vendorKeys.join(QDir::listSeparator()));
     env.insert("PATH",
                QDir::toNativeSeparators(m_appDir + "/tools/android-sdk/platform-tools")
                    + QDir::listSeparator() + QDir::toNativeSeparators(jdkBinPath())
@@ -201,7 +216,14 @@ void AndroidTVModule::launch()
     }
 
     openEmulatorLogFile();
-    logImportant(Logger::kLevelInfo, "launching Android TV emulator with profile " + profile->name);
+    m_launchTimer.start();
+    m_lastBootPollOut.clear();
+    m_emulatorLinesForwarded = 0;
+    m_emuReportedBoot   = false;
+    m_unauthorizedPolls = 0;
+    m_adbUnauthorized   = false;
+    logImportant(Logger::kLevelInfo, "launching Android TV emulator with profile " + profile->name
+                 + " (details: logs/Android_TV.log)");
     refreshQcow2Size();
 
     m_exitRequested = false;
@@ -219,9 +241,11 @@ void AndroidTVModule::launch()
     // заметно лагает (adb переподключается к уже работающему эмулятору).
     syncAdbKeyAndRestartServer(profile->avdName, [this]() {
         if (!m_booting || m_shutdownDone) {
-            logToEmulatorFile("launch cancelled before emulator start");
+            logImportant(Logger::kLevelInfo, "launch cancelled before emulator start");
             return;
         }
+        logImportant(Logger::kLevelInfo, QString("adb server restarted (%1 ms), starting emulator")
+                                             .arg(m_launchTimer.elapsed()));
         startEmulator();
     });
 }
@@ -232,8 +256,11 @@ void AndroidTVModule::stop()
         m_exitRequested = false;
         return;
     }
+    logImportant(Logger::kLevelInfo,
+                 m_booting ? QString("stop requested while booting (%1 s, status \"%2\")")
+                                 .arg(m_launchTimer.isValid() ? m_launchTimer.elapsed() / 1000 : 0).arg(m_status)
+                           : QStringLiteral("stop requested"));
     setStatus("Stopping emulator...");
-    logImportant(Logger::kLevelInfo, "stop() requested");
 
     // Эмулятор ещё не успел стартовать (идёт перезапуск adb) — просто отменяем запуск.
     if (!m_emulatorProcess || m_emulatorProcess->state() == QProcess::NotRunning) {
@@ -252,8 +279,13 @@ void AndroidTVModule::stop()
     stopLogcat();
     adb({"emu", "kill"}, {}, 5000);
 
-    QTimer::singleShot(6000, this, [this]() {
-        if (m_emulatorProcess && m_emulatorProcess->state() != QProcess::NotRunning) {
+    // Запоминаем, КАКОЙ процесс останавливали: если за 6 с пользователь успел
+    // выйти и запустить Android TV снова, таймер раньше убивал новую сессию.
+    const QPointer<QProcess> stopping(m_emulatorProcess);
+    QTimer::singleShot(6000, this, [this, stopping]() {
+        if (!stopping || stopping != m_emulatorProcess)
+            return;   // уже завершился, а возможно, запущен новый эмулятор
+        if (stopping->state() != QProcess::NotRunning) {
             logImportant(Logger::kLevelWarning, "emulator didn't respond to 'emu kill', terminating process tree");
             killEmulatorTree();
         }
@@ -675,6 +707,59 @@ void AndroidTVModule::syncAdbKeys(const QString &avdName)
     }
 }
 
+QStringList AndroidTVModule::adbKeyDirs() const
+{
+    QStringList dirs;
+    const QString userHome = qEnvironmentVariable("ANDROID_USER_HOME");
+    if (!userHome.isEmpty()) dirs << userHome;
+    const QString sdkHome = qEnvironmentVariable("ANDROID_SDK_HOME");
+    if (!sdkHome.isEmpty()) dirs << sdkHome + "/.android";
+    dirs << QDir::homePath() + "/.android";
+    dirs << avdHomePath();
+    return dirs;
+}
+
+// Эмулятор пишет в stdout «Sending adb public key [<ключ> @unknown]». Если этот
+// ключ не совпадает ни с одним adbkey.pub, adb-сервер не сможет авторизоваться
+// — пишем в основной журнал, где лежит совпадающий ключ (или что его нет).
+void AndroidTVModule::checkEmulatorAdbKey(const QString &pubKey)
+{
+    const QString emuKey = pubKey.section(QLatin1Char(' '), 0, 0).trimmed();
+    if (emuKey.isEmpty()) return;
+    QStringList checked;
+    for (const QString &dir : adbKeyDirs()) {
+        QFile f(dir + "/adbkey.pub");
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) continue;
+        const QString key = QString::fromUtf8(f.readAll()).section(QLatin1Char(' '), 0, 0).trimmed();
+        checked << QDir::toNativeSeparators(f.fileName());
+        if (key == emuKey) {
+            logToEmulatorFile("emulator adb key matches " + QDir::toNativeSeparators(f.fileName()));
+            return;
+        }
+    }
+    logImportant(Logger::kLevelWarning,
+                 "emulator sends an adb key that matches no adbkey.pub (checked: "
+                 + (checked.isEmpty() ? QStringLiteral("none found") : checked.join(", "))
+                 + ") — adb may stay unauthorized");
+}
+
+void AndroidTVModule::scanEmulatorOutput(const QString &out)
+{
+    static const QRegularExpression reKey(QStringLiteral(R"(Sending adb public key \[([^\]]+)\])"));
+    static const QRegularExpression reBoot(QStringLiteral(R"(Boot completed in (\d+) ms)"));
+    const QRegularExpressionMatch mk = reKey.match(out);
+    if (mk.hasMatch()) {
+        // Ключ может прийти разорванным на два куска вывода — сверяем, только если целый
+        checkEmulatorAdbKey(mk.captured(1));
+    }
+    const QRegularExpressionMatch mb = reBoot.match(out);
+    if (mb.hasMatch() && !m_emuReportedBoot) {
+        m_emuReportedBoot = true;
+        logImportant(Logger::kLevelInfo,
+                     QString("emulator reports Android booted (%1 s), checking adb").arg(mb.captured(1).toInt() / 1000));
+    }
+}
+
 // Перезапуск adb-сервера полностью асинхронно (раньше — QThread с захватом this,
 // который мог пережить модуль при закрытии приложения).
 void AndroidTVModule::syncAdbKeyAndRestartServer(const QString &avdName, std::function<void()> onReady)
@@ -928,11 +1013,11 @@ void AndroidTVModule::startEmulator()
 
     connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
         const QString out = QString::fromUtf8(proc->readAllStandardOutput()).trimmed();
-        if (!out.isEmpty()) logToEmulatorFile(out, true);
+        if (!out.isEmpty()) { scanEmulatorOutput(out); logToEmulatorFile(out, true); }
     });
     connect(proc, &QProcess::readyReadStandardError, this, [this, proc]() {
         const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
-        if (!err.isEmpty()) logToEmulatorFile(err, true);
+        if (!err.isEmpty()) { scanEmulatorOutput(err); logToEmulatorFile(err, true); }
     });
 
     connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus) {
@@ -953,7 +1038,8 @@ void AndroidTVModule::startEmulator()
         if (proc != m_emulatorProcess) return;
         m_emulatorPid        = proc->processId();
         m_initialEmulatorPid = m_emulatorPid;
-        logToEmulatorFile("emulator process started PID " + QString::number(m_emulatorPid));
+        logImportant(Logger::kLevelInfo, "emulator process started, PID " + QString::number(m_emulatorPid)
+                                         + ", waiting for Android to boot");
 
 #ifdef Q_OS_WIN
         HANDLE hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, static_cast<DWORD>(m_emulatorPid));
@@ -973,7 +1059,8 @@ void AndroidTVModule::startEmulator()
 
             using GetThreadDescFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
             static auto getThreadDesc = reinterpret_cast<GetThreadDescFn>(
-                GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+                reinterpret_cast<void *>(
+                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
 
             HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if (hSnap == INVALID_HANDLE_VALUE) {
@@ -1041,7 +1128,15 @@ void AndroidTVModule::startEmulator()
 void AndroidTVModule::onEmulatorFinished(int exitCode)
 {
     const bool wasBooting = m_booting;
-    logImportant(Logger::kLevelInfo, "emulator finished, exit code " + QString::number(exitCode));
+    if (wasBooting && !m_exitRequested)
+        logImportant(Logger::kLevelError,
+                     QString("emulator exited during boot after %1 s, exit code %2, last adb: %3 "
+                             "— see logs/Android_TV.log")
+                         .arg(m_launchTimer.isValid() ? m_launchTimer.elapsed() / 1000 : 0)
+                         .arg(exitCode)
+                         .arg(m_lastBootPollOut.isEmpty() ? QStringLiteral("-") : m_lastBootPollOut.simplified()));
+    else
+        logImportant(Logger::kLevelInfo, "emulator finished, exit code " + QString::number(exitCode));
 
     stopKeepTopmostTimer();
     stopWindowPolling();
@@ -1104,6 +1199,7 @@ void AndroidTVModule::startBootPolling()
         if (m_bootPollCount > kBootPollMaxTries) {
             stopBootPolling();
             // Эмулятор, не загрузившийся за 5 минут, оставлять висеть бессмысленно
+            m_exitRequested = true;   // это наше завершение, а не падение
             killEmulatorTree();
             failLaunch("Boot timeout exceeded",
                        QString("boot polling timeout (%1 s)").arg(kBootPollMaxTries * kBootPollIntervalMs / 1000));
@@ -1123,8 +1219,40 @@ void AndroidTVModule::startBootPolling()
             if (!m_booting) return;   // уже загрузился / отменён
             const QString res = out.trimmed();
             if (res != QLatin1String("1")) {
+                m_lastBootPollOut = res.left(200);
+                // Android загрузился (так пишет сам эмулятор), но adb не пускают:
+                // не ждём 5 минут впустую — показываем Android TV, а о том, что
+                // команды через adb (кнопки пульта, блоклист) не работают, сообщаем.
+                if (m_emuReportedBoot && res.contains(QLatin1String("unauthorized"))) {
+                    if (++m_unauthorizedPolls >= 8) {
+                        m_adbUnauthorized = true;
+                        logImportant(Logger::kLevelError,
+                                     "adb is not authorized by the device — showing Android TV without adb "
+                                     "(remote keys via adb unavailable). Fix: Settings → Android TV → "
+                                     "Profiles → Clear data, then launch again");
+                        if (m_bus)
+                            emit m_bus->moduleEvent(
+                                Notifications::kModule, Notifications::kEventShow,
+                                Notifications::makeEvent(
+                                    QStringLiteral("Android TV запущен, но не разрешил подключение adb — "
+                                                   "кнопки пульта могут не работать. Помогает «Очистить данные» "
+                                                   "в Настройки → Android TV → Профили."),
+                                    NotificationLevel::Warning, false, 0));
+                        onBootCompleted();
+                        return;
+                    }
+                } else {
+                    m_unauthorizedPolls = 0;
+                }
                 if (m_bootPollCount % 10 == 0 && !res.isEmpty())
-                    logToEmulatorFile("boot poll: " + res.left(200));
+                    logToEmulatorFile("boot poll: " + m_lastBootPollOut);
+                // Раз в 30 с — в основной журнал: видно, на чём застряла загрузка
+                if (m_bootPollCount % 15 == 0)
+                    logImportant(Logger::kLevelInfo,
+                                 QString("still booting: %1 s, adb: %2")
+                                     .arg(m_launchTimer.elapsed() / 1000)
+                                     .arg(res.isEmpty() ? QStringLiteral("(no answer)")
+                                                        : res.simplified().left(120)));
                 return;
             }
             onBootCompleted();
@@ -1146,7 +1274,8 @@ void AndroidTVModule::stopBootPolling()
 
 void AndroidTVModule::onBootCompleted()
 {
-    logImportant(Logger::kLevelInfo, "sys.boot_completed = 1");
+    if (!m_adbUnauthorized)
+        logImportant(Logger::kLevelInfo, QString("Android booted in %1 s").arg(m_launchTimer.elapsed() / 1000));
     stopBootPolling();
     stopKeepTopmostTimer();
     setBooting(false);
@@ -1198,6 +1327,8 @@ void AndroidTVModule::startHealthCheck()
                         QVariantMap{{"sizeMb", sizeMb}, {"limitMb", static_cast<int>(kMaxQcow2SizeMb)}});
             }
         }
+
+        if (m_adbUnauthorized) return;   // adb не пускают — проверять нечем
 
         adb({"shell", "cat", "/proc/meminfo"}, [this](const QString &out) {
             for (const QString &line : out.split(QLatin1Char('\n'))) {

@@ -38,6 +38,7 @@ Item {
         Behavior on scale   { NumberAnimation { duration: 320; easing.type: Easing.OutBack; easing.overshoot: 0.7 } }
 
         DropShadow {
+            cached: true
             anchors.fill: bg; source: bg
             radius: 30; samples: 40; color: "#AA000000"; verticalOffset: 8
         }
@@ -55,6 +56,7 @@ Item {
             border.color: Settings.accent(0.667); border.width: 1.5
         }
         Glow {
+            cached: true
             anchors.fill: bg; source: bg
             radius: 20; samples: 28; color: Settings.accent(0.267)
         }

@@ -20,6 +20,7 @@ Item {
     property bool   gameLaunching:   false
 
     property alias tilesModel: tilesModel
+    property alias editDialog: editDialog
     property int   editIndex:   -1
     property bool  _creatingNew: false
 
@@ -35,18 +36,36 @@ Item {
     function loadData() {
         tilesModel.clear()
         var saved = isFolder ? TileManager.loadFolder(storageKey) : TileManager.loadScreen(storageKey)
+        var droppedDead = false
         for (var i = 0; i < saved.length; i++) {
             var item = saved[i]
+            var tid  = item.id || ""
+
+            // Сетевая установка, прерванная выходом/сбоем: плитка сохранилась без
+            // пути и больше никогда не завершится. Раньше она оставалась навсегда
+            // как нерабочая. Живую установку (идёт приём) не трогаем.
+            if (tid.indexOf("net_") === 0 && !item.path
+                    && !TileManager.isInstalling(tid)
+                    && !NetworkListener.hasActiveInstall(tid)) {
+                console.warn("Dropping unfinished network install tile:", tid, item.title)
+                droppedDead = true
+                continue
+            }
             if (item.installFolder === undefined) item.installFolder = ""
             if (item.kind          === undefined) item.kind          = ""
             if (item.installPhase  === undefined) item.installPhase  = ""
             if (item.coverPath     === undefined) item.coverPath     = ""
 
-            var tileId = item.id || ""
+            var tileId = tid
             if (tileId !== "" && TileManager.isInstalling(tileId)) {
                 item.installing      = true
                 item.installProgress = TileManager.getInstallProgress(tileId)
                 item.installPhase    = ""
+            } else if (tileId !== "" && NetworkListener.hasActiveInstall(tileId)) {
+                // Идёт приём по сети: прогресс подтянется следующим сигналом
+                item.installing      = true
+                item.installProgress = item.installProgress || 0.0
+                item.installPhase    = item.installPhase || "receiving"
             } else {
                 item.installing      = false
                 item.installProgress = 0.0
@@ -54,6 +73,8 @@ Item {
             }
             tilesModel.append(item)
         }
+        if (droppedDead)
+            saveAll()
     }
 
     function saveAll() {
@@ -298,24 +319,60 @@ Item {
         }
     }
 
+    // ── Раскладка сетки ──────────────────────────────────────────────────────
+    // Плитки исходного размера 420×270 (в пикселях, без масштаба интерфейса —
+    // как было изначально), до 3 столбцов. Уменьшаются только если ряд не
+    // помещается по ширине (например, окно 1280 px). Контент начинается под
+    // шапкой, при переполнении — вертикальная прокрутка (колесо, перетаскивание,
+    // стрелки пульта).
+    readonly property int  _baseTileW: 420
+    readonly property int  _baseTileH: 270
+    readonly property int  _tileCount: tilesModel.count + 1
+                                       + ((storageKey === "tv" && !isFolder) ? 2 : 0)
+    readonly property int  _cols:      Math.max(1, Math.min(3, _tileCount))
+    readonly property int  _spacing:   24
+    readonly property int  _sideMargin: 90     // не заходить под стрелку «назад»
+    readonly property real _fit: {
+        var avail = tilesContainer.width - 2 * _sideMargin - (_cols - 1) * _spacing
+        return Math.max(0.4, Math.min(1.0, avail / (_cols * _baseTileW)))
+    }
+    readonly property int  gridTileW: Math.floor(_baseTileW * _fit)
+    readonly property int  gridTileH: Math.floor(_baseTileH * _fit)
+
+    function scrollBy(rows) {
+        var step = (gridTileH + _spacing) * rows
+        var maxY = Math.max(0, tilesFlick.contentHeight - tilesFlick.height)
+        tilesFlick.contentY = Math.max(0, Math.min(maxY, tilesFlick.contentY + step))
+    }
+
     Item {
         id: tilesContainer
-        anchors.fill: parent; anchors.topMargin: 80
+        anchors.fill: parent
+        anchors.topMargin: (typeof root !== "undefined" && root.headerHeight) ? root.headerHeight : 160
         visible: !dynScreen.dialogOpen
+
+        Flickable {
+            id: tilesFlick
+            anchors.fill: parent
+            clip: true
+            flickableDirection: Flickable.VerticalFlick
+            boundsBehavior: Flickable.StopAtBounds
+            // Запас сверху/снизу — под увеличение плитки при наведении
+            readonly property int pad: 16
+            contentWidth: width
+            contentHeight: Math.max(height, flow.height + 2 * pad)
+            Behavior on contentY { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
 
         Flow {
             id: flow
-            anchors.centerIn: parent
-            spacing: 24
-            width: {
-                var n = tilesModel.count + 1
-                if (dynScreen.storageKey === "tv" && !dynScreen.isFolder) n += 2
-                return Math.min(n, 3) * 444
-            }
+            x: Math.round((tilesFlick.width - width) / 2)
+            y: Math.max(tilesFlick.pad, Math.round((tilesFlick.height - height) / 2))
+            spacing: dynScreen._spacing
+            width: dynScreen._cols * dynScreen.gridTileW + (dynScreen._cols - 1) * dynScreen._spacing
 
             Tile {
                 id: androidTvTile
-                width: 420; height: 270
+                tileW: dynScreen.gridTileW; tileH: dynScreen.gridTileH
                 visible:           dynScreen.storageKey === "tv" && !dynScreen.isFolder
                 title:             Settings.tr("android_tv")
                 iconSource:        "qrc:/assets/icons/ic_android_tv.png"
@@ -338,9 +395,9 @@ Item {
 
             Tile {
                 id: karaokeTile
-                width: 420; height: 270
+                tileW: dynScreen.gridTileW; tileH: dynScreen.gridTileH
                 visible:           dynScreen.storageKey === "tv" && !dynScreen.isFolder
-                title:             "Karaoke"
+                title:             Settings.tr("karaoke")
                 iconSource:        "qrc:/assets/icons/ic_karaoke.png"
                 type:              "karaoke"
                 enableContextMenu: false
@@ -354,7 +411,7 @@ Item {
             Repeater {
                 model: tilesModel
                 delegate: Tile {
-                    width: 420; height: 270
+                    tileW: dynScreen.gridTileW; tileH: dynScreen.gridTileH
                     type:            model.type
                     title:           model.title
                     iconSource:      model.icon            || ""
@@ -429,11 +486,22 @@ Item {
             }
 
             Tile {
-                width: 420; height: 270
+                tileW: dynScreen.gridTileW; tileH: dynScreen.gridTileH
                 title: Settings.tr("add"); iconSource: "qrc:/assets/icons/ic_add.png"; isAddButton: true
                 onFolderChosen:   { dynScreen._creatingNew = true; editDialog.open({ type:"folder",   kind:"", title:"", icon:"", path:"", id:"" }) }
                 onShortcutChosen: { dynScreen._creatingNew = true; editDialog.open({ type:"shortcut", kind:"", title:"", icon:"", path:"", id:"" }) }
             }
+        }
+        }   // Flickable
+
+        // Индикатор прокрутки — видно, что плиток больше, чем помещается
+        Rectangle {
+            visible: tilesFlick.contentHeight > tilesFlick.height + 1
+            anchors.right: parent.right; anchors.rightMargin: Settings.us(12)
+            width: Settings.us(4); radius: width / 2
+            color: "#80FFFFFF"
+            y: tilesFlick.height * tilesFlick.visibleArea.yPosition
+            height: Math.max(Settings.us(24), tilesFlick.height * tilesFlick.visibleArea.heightRatio)
         }
     }
 }

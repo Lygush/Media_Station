@@ -18,6 +18,16 @@ Item {
     opacity: _hasContent ? 1.0 : 0.0
     Behavior on opacity { NumberAnimation { duration: 300 } }
 
+    // Тёмная подложка: описание лежало прямо на фоне, и на светлых
+    // участках картинки (небо, вода, светлые обложки) текст не читался.
+    Rectangle {
+        anchors.fill: descCol
+        anchors.margins: -Settings.us(16)
+        radius: Settings.us(12)
+        color: Qt.rgba(0, 0, 0, 0.45)
+        visible: rightPanel._hasContent
+    }
+
     Column {
         id: descCol
         anchors {

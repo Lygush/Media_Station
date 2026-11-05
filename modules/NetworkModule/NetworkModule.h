@@ -111,6 +111,9 @@ private:
     QTcpSocket *m_socket     = nullptr;
     QUdpSocket *m_udpSocket  = nullptr;
     QTimer     *m_discoverTimer = nullptr;
+    QTimer     *m_watchdog      = nullptr;   ///< сеть молчит дольше kStallMs → ошибка
+    void        kickWatchdog();
+    void        onStalled();
     QMetaObject::Connection m_discoverConn;
     // Флаг отмены фоновой упаковки (shared_ptr — поток пула может пережить отправку)
     std::shared_ptr<std::atomic<bool>> m_packCancel;
@@ -125,6 +128,7 @@ private:
     static constexpr quint16 kDiscoverPort     = 12346;
     static constexpr quint16 kLogsDiscoverPort = 12348;   // <-- добавлено
     static constexpr qint64  kChunkSize        = 2 * 1024 * 1024;
+    static constexpr int     kStallMs          = 30'000;
 };
 
 
@@ -159,6 +163,10 @@ public slots:
     void cancelInstallByTileId(const QString &tileId);
     void cancelInstall(QTcpSocket *socket);
 
+    /// true, пока по сети идёт приём/распаковка для этой плитки
+    /// (нужно экрану, чтобы не принять живую установку за «мёртвую» плитку)
+    Q_INVOKABLE bool hasActiveInstall(const QString &tileId) const;
+
 signals:
     // ── Существующие сигналы (серверная часть) ──────────────────────────────
     void showInstallDialog(const QString &title,            const QString &kind,
@@ -176,6 +184,8 @@ private slots:
 
 private:
     void initServer();
+    void startListening();          // идемпотентно; повторяет попытку, пока порты заняты
+    void checkIdleClients();        // таймаут «зависших» клиентов
     void initLogSender();
     // Пишет в qDebug и дублирует в LoggerModule через EventBus
     void log(const char *level, const QString &msg) const;
@@ -186,8 +196,8 @@ private:
     void cleanupClient(QTcpSocket *socket, bool sendCancel = false);
     QString prepareUpdateArchivePath() const;
     QString prepareInstallDir(const QString &tileId, const QString &title) const;
-    static QString generateUniqueFolderName(const QString &baseName,
-                                            const QString &gamesDirPath);
+    // true, если в томе, где лежит dirPath, достаточно места (или объём не определить)
+    static bool hasFreeSpace(const QString &dirPath, qint64 neededBytes);
 
     EventBus        *m_bus      = nullptr;
     SettingsManager *m_settings = nullptr;
@@ -221,7 +231,16 @@ private:
         std::shared_ptr<std::atomic<bool>> cancelFlag = std::make_shared<std::atomic<bool>>(false);
         bool               cancelled = false;
         bool               isUpdate = false;
+        bool               finished = false;     // установка передана в InstallManager — не отменять
+        qint64             lastActivityMs = 0;   // для таймаута «молчащих» клиентов
+        qint64             lastProgressMs = 0;   // для троттлинга сигналов прогресса
     };
 
+    // Сигнал прогресса не чаще раза в 100 мс (иначе на каждый 512-КБ кусок:
+    // сотни сигналов в секунду в QML и в шину событий)
+    void reportProgress(ClientState &st, bool force);
+
     QMap<QTcpSocket *, ClientState> m_clients;
+    QTimer *m_idleTimer = nullptr;
+    bool    m_stopped   = false;   ///< после shutdown() порты больше не переоткрываются
 };

@@ -51,6 +51,7 @@ private slots:
     void testScanFindsInstalledGame();
     void testScanFindsLegacyGame();
     void testCurrentEntries();
+    void testRescanDropsDeletedGames();
 
 private:
     QTemporaryDir *gamesDir;
@@ -91,7 +92,11 @@ void tst_GameLibraryModuleScan::testScanFindsLegacyGame()
         QVariantMap m = v.toMap();
         if (m["name"].toString() == "LegacyGame") {
             found = true;
-            QVERIFY(m.contains("legacyNoMetadata") && m["legacyNoMetadata"].toBool());
+            // Для legacy-папки (только tile_id.txt) модуль генерирует
+            // game_info.json, после чего метаданные считаются полными.
+            QCOMPARE(m.value("legacyNoMetadata").toBool(), false);
+            QCOMPARE(m.value("executablePath").toString(), QString("game.exe"));
+            QVERIFY(QFile::exists(gamesDir->path() + "/LegacyGame/game_info.json"));
             break;
         }
     }
@@ -108,6 +113,23 @@ void tst_GameLibraryModuleScan::testCurrentEntries()
     QVariantList entries = module->currentEntries();
     QVERIFY(!entries.isEmpty());
     // Проверяем, что currentEntries не пустой и содержит те же данные
+}
+
+void tst_GameLibraryModuleScan::testRescanDropsDeletedGames()
+{
+    QSignalSpy spy(module, &GameLibraryModule::scanFinished);
+    module->scanLibrary();
+    QTRY_COMPARE(spy.count(), 1);
+    const int before = module->currentEntries().size();
+    QVERIFY(before >= 2);
+
+    // Игру удалили с диска вручную — после пересканирования её быть не должно
+    QVERIFY(QDir(gamesDir->path() + "/LegacyGame").removeRecursively());
+    module->scanLibrary();
+    QTRY_COMPARE(spy.count(), 2);
+    QCOMPARE(module->currentEntries().size(), before - 1);
+    for (const QVariant &v : module->currentEntries())
+        QVERIFY(v.toMap().value("name").toString() != "LegacyGame");
 }
 
 QTEST_MAIN(tst_GameLibraryModuleScan)

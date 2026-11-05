@@ -9,6 +9,8 @@ Item {
 
     // ── Интерфейс экрана ──────────────────────────────────────────────────────
     property string screenTitle: gameData.title || ""
+    // Название показано в левой панели — в шапке не дублируем
+    readonly property bool hideHeaderTitle: true
     property var    launchGame:  null
     property var    gameData:    ({})
 
@@ -210,6 +212,7 @@ Item {
     // ── Левая панель ──────────────────────────────────────────────────────────
     GameDetailLeftPanel {
         id: leftPanel
+        z: 2      // попапы выбора игры / генерации — поверх описания справа
         anchors {
             left:   parent.left; leftMargin:   Settings.us(80)
             top:    parent.top;  topMargin:    Settings.us(140)

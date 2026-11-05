@@ -156,12 +156,16 @@ Item {
                         anchors.horizontalCenter: parent.horizontalCenter
                         spacing: Settings.us(4)
 
+                        // Ширина ограничена карточкой: раньше строка до 14 символов
+                        // (~100 px) центрировалась в карточке шириной us(70) с clip,
+                        // и имя срезалось с обеих сторон («lShock 4», «ualSense»).
+                        // Белый цвет — акцентный синий не читался на фоне неба.
                         Text {
-                            text: {
-                                var n = card.name || ""
-                                return n.length > 14 ? n.substring(0, 14) + "…" : n
-                            }
-                            color:          (Settings.accentColor || "#6c63ff")
+                            text:           card.name || ""
+                            width:          Math.min(implicitWidth,
+                                                     card.width - connIcon.width - parent.spacing - Settings.us(4))
+                            elide:          Text.ElideRight
+                            color:          Qt.rgba(1, 1, 1, 0.9)
                             font.pixelSize: Settings.fs(11)
                             font.bold:      true
                             visible:        (card.name || "") !== ""
@@ -169,6 +173,7 @@ Item {
                         }
 
                         Image {
+                            id: connIcon
                             source: {
                                 var ct = (card.connType || "").toUpperCase()
                                 return (ct === "BT" || ct === "BLUETOOTH" || ct === "WIRELESS")
@@ -461,7 +466,7 @@ Item {
                         Item { width: parent.width - battLabel.implicitWidth - Settings.us(40); height: 1 }
                         Text {
                             id: battLabel
-                            text:  (tooltip.tCharge ? "⚡ " : "") + tooltip.tBat + "%"
+                            text:  (tooltip.tCharge ? "ϟ " : "") + tooltip.tBat + "%"
                             color: tooltip.tBat < 20 ? "#F44336"
                                  : tooltip.tBat < 50 ? "#FFC107"
                                  :                     "#4CAF50"

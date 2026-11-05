@@ -3,6 +3,8 @@
 
 #include "SettingsManager.h"
 #include <qmath.h>
+#include <QCoreApplication>
+#include <QDir>
 
 SettingsManager::SettingsManager(QObject *parent)
     : QObject(parent)
@@ -31,9 +33,19 @@ QString SettingsManager::language() const
     return m_settings.value("language", "ru").toString();
 }
 
+// Пустое значение (по умолчанию) раньше уходило в модули как есть, и каждый
+// трактовал его по-своему: установка шла в <app>/data/games, а библиотека игр
+// при пустом пути не сканировала ничего, поиск папки игры по tile_id тоже.
+// Теперь пустое значение всегда означает каталог по умолчанию.
+QString SettingsManager::defaultInstallPath()
+{
+    return QDir::cleanPath(QCoreApplication::applicationDirPath() + "/data/games");
+}
+
 QString SettingsManager::installPath() const
 {
-    return m_settings.value("installPath", QString()).toString();
+    const QString p = m_settings.value("installPath", QString()).toString().trimmed();
+    return p.isEmpty() ? defaultInstallPath() : p;
 }
 
 double SettingsManager::uiScale() const
@@ -84,7 +96,7 @@ void SettingsManager::setLanguage(const QString &lang)
 void SettingsManager::setInstallPath(const QString &path)
 {
     if (installPath() == path) return;
-    m_settings.setValue("installPath", path);
+    m_settings.setValue("installPath", path.trimmed());
     emit installPathChanged();
 }
 

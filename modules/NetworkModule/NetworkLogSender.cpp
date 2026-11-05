@@ -22,7 +22,34 @@ NetworkLogSender::NetworkLogSender(QObject *parent)
     m_udpSocket->bind(QHostAddress::AnyIPv4, 0, QUdpSocket::ShareAddress);
     m_logsDir     = QCoreApplication::applicationDirPath() + "/logs";
     m_archivePath = QDir::temp().absoluteFilePath("mediacenter_logs_upload.7z");
+
+    // Раньше при сервере, который принял соединение и замолчал (или недоступном
+    // IP с «чёрной дырой»), статус «Ожидание…» висел бесконечно.
+    m_watchdog = new QTimer(this);
+    m_watchdog->setSingleShot(true);
+    m_watchdog->setInterval(kStallMs);
+    connect(m_watchdog, &QTimer::timeout, this, &NetworkLogSender::onStalled);
+
     setStatus("Готов");
+}
+
+void NetworkLogSender::kickWatchdog()
+{
+    if (m_watchdog) m_watchdog->start();
+}
+
+void NetworkLogSender::onStalled()
+{
+    if (!m_busy || m_cancelled) return;
+    if (m_step != StepConnecting && m_step != StepSending) return;
+    const QString what = m_step == StepConnecting
+        ? QStringLiteral("Сервер %1 не отвечает.").arg(m_serverIp)
+        : QStringLiteral("Сервер перестал принимать данные.");
+    cleanup();
+    setBusy(false);
+    m_step = StepIdle;
+    setStatus("Нет ответа от сервера");
+    emit finished(false, what + "\nПроверьте, что программа приёма логов запущена.");
 }
 
 NetworkLogSender::~NetworkLogSender()
@@ -303,6 +330,7 @@ void NetworkLogSender::startConnecting()
     m_socket->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 512 * 1024);
     m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     m_socket->connectToHost(m_serverIp, kLogsPort);
+    kickWatchdog();
 }
 
 void NetworkLogSender::onSocketConnected()
@@ -327,6 +355,7 @@ void NetworkLogSender::sendHandshake()
 // ─── Чтение ответов сервера ─────────────────────────────────────────────────
 void NetworkLogSender::onSocketReadyRead()
 {
+    kickWatchdog();
     m_incoming.append(m_socket->readAll());
     while (m_incoming.contains('\n')) {
         int nl = m_incoming.indexOf('\n');
@@ -382,6 +411,7 @@ void NetworkLogSender::sendChunk()
 
 void NetworkLogSender::onBytesWritten(qint64 bytes)
 {
+    kickWatchdog();
     if (m_step != StepSending || !m_archiveFile) return;
     m_bytesSent += bytes;
     if (m_archiveSize > 0) {
@@ -439,6 +469,7 @@ void NetworkLogSender::onSocketError(QAbstractSocket::SocketError)
 // ─── Вспомогательные ────────────────────────────────────────────────────────
 void NetworkLogSender::cleanup()
 {
+    if (m_watchdog) m_watchdog->stop();
     if (m_packCancel) {
         m_packCancel->store(true);
         m_packCancel.reset();

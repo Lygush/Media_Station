@@ -44,7 +44,12 @@ public:
 
     // Прервать текущий runInference() (из любого потока). Сбрасывается в
     // начале следующего runInference().
+    // Флаг прерывания сбрасывает только тот, кто начинает новую задачу
+    // (до initialize()). Раньше его сбрасывал сам runInference(), и отмена,
+    // пришедшая во время загрузки модели, терялась — выход из программы
+    // ждал окончания всей генерации.
     void requestAbort() { m_abort.store(true); }
+    void resetAbort()   { m_abort.store(false); }
     bool isAborted() const { return m_abort.load(); }
 
 private:

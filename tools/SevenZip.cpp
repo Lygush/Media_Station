@@ -43,7 +43,11 @@ bool isAvailable()
     // Фолбэк — проверяем PATH через QProcess
     QProcess p;
     p.start(bin, {"--help"});
-    return p.waitForStarted(2000);
+    const bool started = p.waitForStarted(2000);
+    // Дожидаемся выхода, иначе деструктор QProcess убивает работающий процесс
+    if (started && !p.waitForFinished(3000))
+        p.kill();
+    return started;
 }
 
 // ── Внутренний запуск процесса ────────────────────────────────────────────────
@@ -102,20 +106,24 @@ static Result runProcess(const QString          &binary,
             onProgress(lastPercent, lastFile);
     }
 
-    // Читаем оставшийся вывод после завершения
-    if (onProgress) {
-        proc.readAllStandardOutput();
-        if (proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0)
-            onProgress(100, {});
-    }
+    // Падение процесса — это ошибка, даже если exitCode() вернул 0.
+    // Раньше аварийное завершение 7z считалось успехом, и после «успешной»
+    // архивации GameLibrary удалял папку game/ — данные игры терялись.
+    const bool crashed  = proc.exitStatus() != QProcess::NormalExit;
+    const int  exitCode = proc.exitCode();
 
-    const int exitCode = proc.exitCode();
-    if (exitCode != 0) {
-        qWarning() << "SevenZip: process exited with code" << exitCode
-                   << "args:" << args;
+    proc.readAllStandardOutput();
+    if (crashed || exitCode != 0) {
+        const QString err = QString::fromLocal8Bit(proc.readAllStandardError()).trimmed();
+        qWarning() << "SevenZip:" << (crashed ? "process crashed" : "process exited with code")
+                   << (crashed ? QString() : QString::number(exitCode))
+                   << "args:" << args
+                   << (err.isEmpty() ? QString() : "stderr: " + err.left(2000));
         return ExitError;
     }
 
+    if (onProgress)
+        onProgress(100, {});
     return Ok;
 }
 

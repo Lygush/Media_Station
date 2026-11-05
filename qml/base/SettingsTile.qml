@@ -30,6 +30,7 @@ Item {
 
     // Тень под карточкой
     DropShadow {
+        cached: true
         anchors.fill: bgRect
         source: bgRect
         radius: 32
@@ -63,6 +64,8 @@ Item {
 
     // Свечение при наведении
     Glow {
+        cached: true
+        visible: opacity > 0   // невидимое свечение не считать каждый кадр
         anchors.fill: borderRect
         source: borderRect
         radius: 16

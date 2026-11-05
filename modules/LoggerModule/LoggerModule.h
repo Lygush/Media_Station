@@ -9,6 +9,7 @@
 #include <QDateTime>
 #include <QMutex>
 #include <QVariantMap>
+#include <QDebug>
 
 #include "core/IModule.h"
 #include "core/EventBus.h"
@@ -21,6 +22,20 @@ inline constexpr const char *kLevelDebug   = "debug";
 inline constexpr const char *kLevelInfo    = "info";
 inline constexpr const char *kLevelWarning = "warning";
 inline constexpr const char *kLevelError   = "error";
+
+/// Единый способ записи в журнал из любого потока: уходит через обработчик
+/// сообщений Qt и попадает и в консоль, и в MediaStation.log — один раз,
+/// с уровнем и источником. Уровень: "debug" | "info" | "warning"/"warn" |
+/// "error" (регистр не важен).
+inline void write(const char *level, const char *source, const QString &message)
+{
+    const QString line = QLatin1Char('[') + QLatin1String(source) + QLatin1String("] ") + message;
+    const QByteArray l = QByteArray(level).toLower();
+    if (l.startsWith("err"))       qCritical().noquote() << line;
+    else if (l.startsWith("warn")) qWarning().noquote()  << line;
+    else if (l == "debug")         qDebug().noquote()    << line;
+    else                           qInfo().noquote()     << line;
+}
 
 inline QVariantMap makeEvent(const char *level,
                              const char *source,
@@ -50,6 +65,17 @@ private:
     QTextStream m_stream;
     bool m_running = true;
     bool m_stopped = false;
+    int  m_writesSinceSizeCheck = 0;
+    void rotateIfTooBig();
+
+    // Схлопывание повторов: одинаковая строка подряд пишется один раз,
+    // затем «… повторилось N раз» (сетевые сбои, опросы и т.п.).
+    QString m_lastKey;
+    QString m_lastLevel;
+    QString m_lastSource;
+    int     m_repeat = 0;
+    void    writeLine(const QString &level, const QString &source, const QString &message);
+    void    flushRepeats();
 };
 
 class LoggerModule : public QObject, public IModule

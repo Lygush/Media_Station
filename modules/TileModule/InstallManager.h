@@ -90,8 +90,6 @@ public:
     Q_INVOKABLE void deleteInstalledGame(const QString &folderPath);
 
     // ── Поиск установленных игр ───────────────────────────────────────────────
-    Q_INVOKABLE QString resolveInstallFolder(const QString &installFolder,
-                                             const QString &installBasePath) const;
     Q_INVOKABLE bool    installedGameExists(const QString &installFolder,
                                             const QString &installBasePath) const;
     Q_INVOKABLE QString findInstallFolderByTileId(const QString &tileId,

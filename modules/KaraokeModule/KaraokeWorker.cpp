@@ -96,7 +96,10 @@ void KaraokeWorker::run()
 
     // ── Шаг 3: LRC (lrclib.net или Whisper) ───────────────────────────────────
     reportProgress(65, "Получение текста...");
-    if (!stepLrc(vocalsWav, lrcOut)) return;
+    if (!stepLrc(vocalsWav, lrcOut)) {
+        QFile::remove(vocals16k);   // временный файл распознавания не нужен
+        return;
+    }
 
     // vocals_16k.wav удаляем если остался
     QFile::remove(vocals16k);

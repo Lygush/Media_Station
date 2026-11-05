@@ -162,6 +162,7 @@ SongNameResolver::Result SongNameResolver::resolve(const QString &fileName,
         llama->setBus(m_bus);
         m_llama.store(llama);
     }
+    llama->resetAbort();   // новая задача; abort() после этой точки сработает
     if (!llama->initialize(modelPath())) {
         r.message = QStringLiteral("Не удалось загрузить нейросеть — использую имя файла");
         return r;

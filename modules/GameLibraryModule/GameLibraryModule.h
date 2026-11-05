@@ -105,6 +105,8 @@ private:
     static QString makeGameId(const QString &folderPath);
     static qint64  calcFolderSize(const QString &path);
 
+    // Возвращает плитки, удалённые перед архивацией (отмена или ошибка)
+    void restoreTilesAfterArchive(const QString &gameId);
     void removeTilesFromStructure(const QStringList &tileLocations, const QString &gameId);
 
     // Возвращает стандартный путь к архиву внутри папки игры:

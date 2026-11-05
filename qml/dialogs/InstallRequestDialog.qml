@@ -102,11 +102,14 @@ Item {
     BaseDialog {
         id: base
         dialogWidth:  Settings.us(620)
-        dialogHeight: Settings.us(560)
+        // По содержимому: при крупном шрифте колонка была выше фиксированных
+        // us(560), и кнопки ложились на рамку окна.
+        dialogHeight: Math.max(Settings.us(420), installCol.implicitHeight + 2 * Settings.us(28))
         closeOnClickOutside: false
         onVisibleChanged: if (!visible) dialog.visible = false
 
         Column {
+            id: installCol
             width: parent.width; spacing: Settings.us(14)
 
             // ── Заголовок ──────────────────────────────────────────────────────
@@ -174,7 +177,7 @@ Item {
 
                 StyledButton {
                     text: Settings.tr("cancel")
-                    width: Settings.us(160); height: Settings.us(52)
+                    width: Math.max(Settings.us(160), naturalWidth); height: Settings.us(52)
                     onClicked: {
                         if (dialog.socket) NetworkListener.rejectInstall(dialog.socket)
                         dialog.rejected()
@@ -184,7 +187,7 @@ Item {
                 StyledButton {
                     text: Settings.tr("install")
                     role: "primary"
-                    width: Settings.us(160); height: Settings.us(52)
+                    width: Math.max(Settings.us(160), naturalWidth); height: Settings.us(52)
                     onClicked: { dialog.accepted(); dialog.close() }
                 }
             }

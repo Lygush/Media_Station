@@ -1,6 +1,7 @@
 // qml/screens/GameDetail/GameDetailStageRow.qml
 import QtQuick
 import AppSettings 1.0
+import "../../base"
 
 Item {
     id: stageRow
@@ -55,19 +56,12 @@ Item {
     }
 
     // Спиннер когда active
-    Rectangle {
+    Spinner {
         anchors.right:          stageRow.right
         anchors.verticalCenter: stageRow.verticalCenter
-        width: Settings.us(12); height: Settings.us(12)
-        radius: width / 2
-        color: "transparent"
-        border.color: "white"; border.width: 1.5
+        size: Settings.us(14)
+        color: "white"
         visible: stageRow.active
-
-        RotationAnimator on rotation {
-            from: 0; to: 360; duration: 800
-            loops:   Animation.Infinite
-            running: stageRow.active
-        }
+        running: stageRow.active
     }
 }

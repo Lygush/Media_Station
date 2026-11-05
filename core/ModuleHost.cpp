@@ -54,11 +54,20 @@ void ModuleHost::initializeAll()
     // он не является IModule, но должен быть доступен из QML.
     qmlRegisterSingletonInstance("AppSettings", 1, 0, "SettingsManager", &m_settings);
 
+    // В журнал — одна итоговая строка; по модулю отдельно — только медленные
+    QElapsedTimer total;
+    total.start();
     for (IModule *mod : m_modules) {
+        QElapsedTimer t;
+        t.start();
         mod->initialize(&m_bus, &m_settings);
         mod->registerWithQml(m_engine);
-        qDebug() << "ModuleHost: initialized" << mod->moduleId();
+        if (t.elapsed() > 200)
+            qInfo().noquote() << "ModuleHost: slow initialize for" << mod->moduleId()
+                              << "—" << t.elapsed() << "ms";
     }
+    qInfo().noquote() << "ModuleHost:" << m_modules.size() << "modules initialized in"
+                      << total.elapsed() << "ms";
 }
 
 void ModuleHost::shutdownAll()
@@ -66,7 +75,6 @@ void ModuleHost::shutdownAll()
     if (m_shuttingDown) return;
     m_shuttingDown = true;
 
-    qDebug() << "ModuleHost: shutdownAll started";
 
     QElapsedTimer totalTimer;
     totalTimer.start();
@@ -79,13 +87,18 @@ void ModuleHost::shutdownAll()
     for (auto it = m_modules.rbegin(); it != m_modules.rend(); ++it) {
         IModule *mod = *it;
 
-        // Жёсткий лимит на весь shutdown — если уже вышли за пределы,
-        // лишь логируем и пропускаем оставшиеся модули.
+        // Модули НЕ пропускаем даже при превышении общего лимита: прервать
+        // зависший shutdown() таймаут всё равно не может, а пропуск оставлял
+        // без завершения следующие модули — процессы эмулятора Android TV,
+        // хуки клавиатуры, сброс журнала (Logger завершается последним).
         if (totalTimer.elapsed() > kTotalShutdownTimeoutMs) {
-            qWarning() << "ModuleHost: total shutdown timeout exceeded, skipping"
-                       << mod->moduleId();
-            continue;
+            qWarning().noquote() << "ModuleHost: total shutdown budget exceeded before"
+                                 << mod->moduleId() << "— continuing anyway";
         }
+
+        // Журнал завершается последним — итог пишем до него, иначе строка теряется
+        if (mod == m_modules.front() && m_modules.size() > 1)
+            qInfo().noquote() << "ModuleHost: modules shut down in" << totalTimer.elapsed() << "ms";
 
         QElapsedTimer modTimer;
         modTimer.start();
@@ -94,15 +107,11 @@ void ModuleHost::shutdownAll()
 
         const qint64 elapsed = modTimer.elapsed();
         if (elapsed > kModuleShutdownWarnMs) {
-            qWarning() << "ModuleHost: slow shutdown for" << mod->moduleId()
-                       << "—" << elapsed << "ms";
-        } else {
-            qDebug() << "ModuleHost: shutdown" << mod->moduleId()
-                     << "in" << elapsed << "ms";
+            qWarning().noquote() << "ModuleHost: slow shutdown for" << mod->moduleId()
+                                 << "—" << elapsed << "ms";
         }
     }
 
-    qDebug() << "ModuleHost: shutdownAll finished in" << totalTimer.elapsed() << "ms";
 
     m_modules.clear();
 }

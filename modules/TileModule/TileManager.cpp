@@ -50,6 +50,9 @@ void TileManager::setInstallManager(InstallManager *im)
     // QML подписан на TileManager.xxx, поэтому сигналы должны идти от него.
     connect(m_installer, &InstallManager::installationProgress,
             this,        &TileManager::installationProgress);
+    // Сначала сохраняем результат в хранилище, затем сообщаем QML
+    connect(m_installer, &InstallManager::installationFinished,
+            this,        &TileManager::persistInstallResult);
     connect(m_installer, &InstallManager::installationFinished,
             this,        &TileManager::installationFinished);
     connect(m_installer, &InstallManager::installationCancelled,
@@ -539,6 +542,81 @@ void TileManager::removeTileFromStructure(const QString &tileId)
         bool removedAny = false;
         while (removeNodeById(arr, tileId)) removedAny = true;
         if (removedAny) { m_structure[screen] = arr; changed = true; }
+    }
+    if (changed) saveStructure();
+}
+
+int TileManager::updateNodesById(QJsonArray &arr, const QString &id, const QJsonObject &fields)
+{
+    int changed = 0;
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject obj = arr[i].toObject();
+        bool dirty = false;
+        if (obj["id"].toString() == id) {
+            for (auto it = fields.constBegin(); it != fields.constEnd(); ++it)
+                obj[it.key()] = it.value();
+            dirty = true;
+            ++changed;
+        }
+        if (obj["type"].toString() == "folder") {
+            QJsonArray children = obj["children"].toArray();
+            const int n = updateNodesById(children, id, fields);
+            if (n > 0) { obj["children"] = children; dirty = true; changed += n; }
+        }
+        if (dirty) arr[i] = obj;
+    }
+    return changed;
+}
+
+bool TileManager::nodeHasEmptyPath(const QJsonArray &arr, const QString &id, bool &found)
+{
+    for (const QJsonValue &v : arr) {
+        const QJsonObject obj = v.toObject();
+        if (obj["id"].toString() == id) {
+            found = true;
+            if (obj["path"].toString().isEmpty()) return true;
+        }
+        if (obj["type"].toString() == "folder"
+            && nodeHasEmptyPath(obj["children"].toArray(), id, found))
+            return true;
+    }
+    return false;
+}
+
+void TileManager::persistInstallResult(const QString &tileId, bool success,
+                                       const QString &ps1Path, const QString &iconPath,
+                                       const QString &installFolder)
+{
+    if (tileId.isEmpty()) return;
+
+    if (!success) {
+        // Удаляем только плитку, которая так и не была установлена (без пути).
+        // Неудачная переустановка не должна стирать рабочий ярлык.
+        bool found = false, emptyPath = false;
+        for (auto it = m_structure.constBegin(); it != m_structure.constEnd(); ++it)
+            if (it.value().isArray() && nodeHasEmptyPath(it.value().toArray(), tileId, found))
+                emptyPath = true;
+        if (found && emptyPath)
+            removeTileFromStructure(tileId);
+        return;
+    }
+
+    QJsonObject fields;
+    fields["path"]            = ps1Path;
+    fields["installing"]      = false;
+    fields["installProgress"] = 0.0;
+    fields["installPhase"]    = QString();
+    if (!iconPath.isEmpty())      fields["icon"]          = iconPath;
+    if (!installFolder.isEmpty()) fields["installFolder"] = installFolder;
+
+    bool changed = false;
+    for (const QString &key : m_structure.keys()) {
+        if (!m_structure[key].isArray()) continue;
+        QJsonArray arr = m_structure[key].toArray();
+        if (updateNodesById(arr, tileId, fields) > 0) {
+            m_structure[key] = arr;
+            changed = true;
+        }
     }
     if (changed) saveStructure();
 }

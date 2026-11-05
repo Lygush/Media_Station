@@ -30,6 +30,9 @@ AppController::AppController(QObject *parent)
     m_taskbarWatchdog->setInterval(kWatchdogMs);
     connect(m_taskbarWatchdog, &QTimer::timeout, this, [this]() {
         if (!m_taskbarHidden) return;
+        // Игра идёт (долгая загрузка/поиск окна) — панель задач не возвращаем,
+        // иначе она всплывала поверх игры через 20 с после запуска
+        if (m_watcher->isGameRunning()) return;
         qWarning() << "AppController: watchdog fired — restoring taskbar";
         hideBlackOverlay();
         if (!m_watcher->isGameRunning()) {
@@ -54,6 +57,7 @@ AppController::AppController(QObject *parent)
     connect(m_watcher, &GameWatcher::gameWindowAppeared,
             this, [this](const QString &tileId, bool windowFound) {
                 m_windowLostFallback->stop();
+                m_taskbarWatchdog->stop();   // игра на экране — сторож запуска больше не нужен
                 if (!windowFound) {
                     qWarning() << "AppController: window not found for" << tileId
                                << "— fallback armed";
@@ -198,7 +202,16 @@ void AppController::hideBlackOverlay()
 
 // ── shutdown ──────────────────────────────────────────────────────────────────
 
-void AppController::shutdown() const
+void AppController::quitApplication() const
 {
     QGuiApplication::quit();
+}
+
+void AppController::shutdown()
+{
+    m_taskbarWatchdog->stop();
+    m_windowLostFallback->stop();
+    m_watcher->stopAll();
+    if (m_taskbarHidden)
+        hideBlackOverlay();   // возвращает панель задач
 }

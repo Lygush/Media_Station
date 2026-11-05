@@ -10,7 +10,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
-#include <algorithm>
+#include <QRecursiveMutex>
+#include <QMutexLocker>
+#include <QPointer>
 
 
 
@@ -24,7 +26,17 @@ static constexpr int kGpuLayers = 999;
 // userdata — указатель на LlamaClient. Колбэк вызывается из потока llama.cpp,
 // поэтому используем invokeMethod(Qt::QueuedConnection) для безопасной передачи
 // в поток Qt.
-static void llamaLogCallback(ggml_log_level level, const char *text, void *userdata)
+// ── Глобальное состояние llama.cpp ────────────────────────────────────────────
+// llama_backend_init/free и llama_log_set — глобальные на весь процесс, а
+// клиентов два (GameInfo и Karaoke). Раньше каждый клиент вызывал backend_free
+// в деструкторе — даже когда второй ещё работал, — а обработчик журнала
+// указывал на последний созданный клиент и после его удаления становился
+// висячим указателем.
+static QRecursiveMutex s_globalMutex;   // рекурсивный: backend_init/free пишут в журнал под этой блокировкой
+static int           s_backendRefs = 0;
+static LlamaClient  *s_logOwner    = nullptr;   // кому отдавать сообщения llama.cpp
+
+static void llamaLogCallback(ggml_log_level level, const char *text, void * /*userdata*/)
 {
     if (!text || text[0] == '\0') return;
 
@@ -32,14 +44,24 @@ static void llamaLogCallback(ggml_log_level level, const char *text, void *userd
     QString msg = QString::fromUtf8(text).trimmed();
     if (msg.isEmpty()) return;
 
-    auto *client = static_cast<LlamaClient *>(userdata);
+    QMutexLocker lock(&s_globalMutex);
+    LlamaClient *client = s_logOwner;
+    if (!client) {
+        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN)
+            qWarning().noquote() << "[llama.cpp]" << msg;
+        return;
+    }
 
     switch (level) {
     case GGML_LOG_LEVEL_ERROR:
         client->log(Logger::kLevelError, "[llama.cpp] " + msg);
         break;
     case GGML_LOG_LEVEL_WARN:
-        client->log(Logger::kLevelWarning, "[llama.cpp] " + msg);
+        // Контекст задан меньше обучающего намеренно (экономия памяти) — это
+        // штатная ситуация, не предупреждение
+        client->log(msg.contains(QLatin1String("n_ctx_per_seq")) ? Logger::kLevelDebug
+                                                                  : Logger::kLevelWarning,
+                    "[llama.cpp] " + msg);
         break;
     default:
         // Пишем всё что касается инициализации железа и памяти.
@@ -80,39 +102,27 @@ LlamaClient::LlamaClient(QObject *parent)
     // при инициализации CUDA бэкенда.
     qputenv("GGML_CUDA_NO_GRAPHS", "1");
 
-    llama_backend_init();
+    QMutexLocker lock(&s_globalMutex);
+    if (s_backendRefs++ == 0) {
+        llama_backend_init();
+        llama_log_set(llamaLogCallback, nullptr);
+    }
 }
 
 LlamaClient::~LlamaClient()
 {
     shutdown();
-    llama_backend_free();
+    QMutexLocker lock(&s_globalMutex);
+    if (s_logOwner == this)
+        s_logOwner = nullptr;
+    if (--s_backendRefs == 0)
+        llama_backend_free();
 }
 
 void LlamaClient::log(const char *level, const QString &message)
 {
-    // Дублируем в qDebug/qWarning чтобы видеть в IDE даже без LoggerModule
-    if (qstrcmp(level, Logger::kLevelError) == 0 || qstrcmp(level, Logger::kLevelWarning) == 0)
-        qWarning() << "[LlamaClient]" << message;
-    else
-        qDebug()   << "[LlamaClient]" << message;
-
-    if (!m_bus) return;
-
-    // Захватываем строки по значению — колбэк может вызываться из чужого потока
-    const QString lvl = QString::fromUtf8(level);
-    const QString msg = message;
-    QMetaObject::invokeMethod(m_bus, [this, lvl, msg]() {
-        emit m_bus->moduleEvent(
-            Logger::kModule,
-            Logger::kEventLog,
-            Logger::makeEvent(
-                lvl.toUtf8().constData(),
-                "LlamaClient",
-                msg.toUtf8().constData()
-            )
-        );
-    }, Qt::QueuedConnection);
+    // Потокобезопасно; один путь записи (раньше — дважды: qDebug и шина)
+    Logger::write(level, "LlamaClient", message);
 }
 
 bool LlamaClient::initialize(const QString &modelPath)
@@ -121,20 +131,34 @@ bool LlamaClient::initialize(const QString &modelPath)
 
     log(Logger::kLevelInfo, "initialize() start, model path: " + modelPath);
 
-    // Регистрируем колбэк ПОСЛЕ того как m_bus уже установлен
-    llama_log_set(llamaLogCallback, this);
+    // Сообщения llama.cpp идут в журнал клиента, который сейчас загружает модель
+    {
+        QMutexLocker lock(&s_globalMutex);
+        s_logOwner = this;
+    }
 
     // Версия llama.cpp и системная информация — критично для диагностики на клиенте
     log(Logger::kLevelInfo,
         QString("llama.cpp build: %1").arg(llama_print_system_info()));
 
+    if (m_abort.load()) return false;
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = kGpuLayers;
+    // Загрузка модели (несколько секунд) прерывается по requestAbort()
+    mparams.progress_callback = [](float, void *ud) -> bool {
+        return !static_cast<LlamaClient *>(ud)->isAborted();
+    };
+    mparams.progress_callback_user_data = this;
 
     log(Logger::kLevelInfo,
         QString("Loading model with n_gpu_layers=%1").arg(kGpuLayers));
 
     m_model = llama_model_load_from_file(modelPath.toUtf8().constData(), mparams);
+    if (!m_model && m_abort.load()) {
+        log(Logger::kLevelInfo, "Model loading aborted");
+        return false;
+    }
     if (!m_model) {
         log(Logger::kLevelWarning,
             "GPU load failed (or not available), retrying CPU-only (n_gpu_layers=0)");
@@ -190,7 +214,10 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
         log(Logger::kLevelError, "runInference() called but client is not ready");
         return {};
     }
-    m_abort.store(false);
+    if (m_abort.load()) {
+        log(Logger::kLevelInfo, "runInference(): aborted before start");
+        return {};
+    }
     // KV-кэш мог остаться заполненным после прерванного/неудачного вызова
     llama_kv_self_clear(m_ctx);
 

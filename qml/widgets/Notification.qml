@@ -113,12 +113,15 @@ Item {
     }
 
     DropShadow {
+        cached: true
         anchors.fill: notifBox; source: notifBox
         radius: 24; samples: 32; color: "#CC000000"
         horizontalOffset: 0; verticalOffset: 6
     }
 
     Glow {
+        cached: true
+        visible: opacity > 0   // невидимое свечение не считать каждый кадр
         anchors.fill: notifBox; source: notifBox
         radius: 14; samples: 24
         color: root._accentColor
@@ -128,7 +131,10 @@ Item {
     Rectangle {
         id: notifBox
         width:  root.width
-        height: Settings.us(56) + (root._autoDismiss ? Settings.us(16) : 0)
+        // Высота по тексту: раньше фиксированные us(56), и сообщение в 3–4
+        // строки (длинное название игры) вылезало за плашку и за край экрана.
+        height: Math.max(Settings.us(56), msgText.contentHeight + Settings.us(28))
+                + (root._autoDismiss ? Settings.us(16) : 0)
         radius: Settings.us(16)
 
         gradient: Gradient {
@@ -176,7 +182,10 @@ Item {
             }
 
             Text {
+                id: msgText
                 width: parent.width - Settings.us(26) - Settings.us(28) - Settings.us(24)
+                maximumLineCount: 5
+                elide: Text.ElideRight
                 text: root._message
                 color: "white"
                 font.family: appFont.name
