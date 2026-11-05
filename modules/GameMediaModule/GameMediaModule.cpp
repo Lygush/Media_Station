@@ -8,6 +8,7 @@
 #include "core/EventBus.h"
 #include "SettingsManager.h"
 #include "tools/AtomicFile.h"
+#include "tools/GameInfoStore.h"
 
 #include <QThread>
 #include <QDir>
@@ -280,34 +281,22 @@ void GameMediaModule::saveToGameInfo(const QString &installFolder,
                                      const QString &backdropPath,
                                      const QString &trailerPath) const
 {
-    const QString infoPath = installFolder + "/game_info.json";
-    QFile f(infoPath);
-
-    QJsonObject obj;
-
-    // Читаем существующий файл, если есть
-    if (f.open(QIODevice::ReadOnly)) {
-        const QByteArray raw = f.readAll();
-        f.close();
-        QJsonParseError err;
-        const QJsonDocument doc = QJsonDocument::fromJson(raw, &err);
-        if (err.error == QJsonParseError::NoError && doc.isObject())
-            obj = doc.object();
-    }
-
-    // Обновляем только заполненные поля, не трогаем остальные
+    // Только свои поля, под общей блокировкой (GameInfoStore). Пути внутри
+    // папки игры храним относительными — тогда перенос папки игр на другой
+    // диск не ломает обложки и трейлер.
+    QJsonObject patch;
     if (!coverPath.isEmpty())
-        obj["coverPath"] = coverPath;
+        patch["coverPath"] = GameInfoStore::toStored(installFolder, coverPath);
     if (!backdropPath.isEmpty())
-        obj["backdropPath"] = backdropPath;
+        patch["backdropPath"] = GameInfoStore::toStored(installFolder, backdropPath);
     if (!trailerPath.isEmpty())
-        obj["trailerPath"] = trailerPath;
-    obj["mediaFetched"] = true;
+        patch["trailerPath"] = GameInfoStore::toStored(installFolder, trailerPath);
+    patch["mediaFetched"] = true;
 
-    if (!AtomicFile::writeJson(infoPath, QJsonDocument(obj)))
-        qWarning() << "GameMediaModule: failed to update game_info.json at" << infoPath;
+    if (!GameInfoStore::update(installFolder, patch))
+        qWarning() << "GameMediaModule: failed to update game_info.json in" << installFolder;
     else
-        qDebug() << "GameMediaModule: game_info.json updated at" << infoPath;
+        qDebug() << "GameMediaModule: game_info.json updated in" << installFolder;
 }
 
 // ── Уведомление пользователю ──────────────────────────────────────────────────

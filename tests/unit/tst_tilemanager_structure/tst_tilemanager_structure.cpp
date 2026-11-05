@@ -49,6 +49,9 @@ private slots:
     void saveAndLoadFolder();
     void deleteFolder();
     void removeTileById();
+    void appRelativePaths();
+    void gameInfoStorePatchKeepsOtherFields();
+    void gameInfoStoreRelativeMedia();
 
 private:
     QTemporaryDir *tempDir;
@@ -135,3 +138,64 @@ void tst_TileManagerStructure::removeTileById()
 
 QTEST_MAIN(tst_TileManagerStructure)
 #include "tst_tilemanager_structure.moc"
+// Пути внутри папки программы пишутся в structure.json как "$APP/…",
+// а в памяти и для QML остаются абсолютными
+void tst_TileManagerStructure::appRelativePaths()
+{
+    const QString app = QCoreApplication::applicationDirPath();
+    const QString inside  = QDir::toNativeSeparators(app + "/data/games/Doom/launcher/launch.ps1");
+    const QString outside = QStringLiteral("notepad.exe");
+
+    QVariantMap t;
+    t["id"] = "a"; t["type"] = "shortcut"; t["title"] = "Doom";
+    t["path"] = inside; t["icon"] = outside;
+    manager->saveScreen("games", { t });
+
+    QFile f(app + "/data/structure.json");
+    QVERIFY(f.open(QIODevice::ReadOnly));
+    const QString raw = QString::fromUtf8(f.readAll());
+    QVERIFY2(raw.contains("$APP/data/games/Doom/launcher/launch.ps1"), qPrintable(raw));
+    QVERIFY(raw.contains("notepad.exe"));
+    f.close();
+
+    delete manager;
+    manager = new TileManager();
+    const QVariantList loaded = manager->loadScreen("games");
+    QCOMPARE(loaded.size(), 1);
+    QCOMPARE(QDir::fromNativeSeparators(loaded[0].toMap()["path"].toString()),
+             QDir::fromNativeSeparators(inside));
+    QCOMPARE(loaded[0].toMap()["icon"].toString(), outside);
+}
+
+#include "GameInfoStore.h"
+
+void tst_TileManagerStructure::gameInfoStorePatchKeepsOtherFields()
+{
+    const QString root = tempDir->path();
+    QJsonObject a; a["description"] = "desc"; a["name"] = "Game";
+    QVERIFY(GameInfoStore::write(root, a));
+
+    QJsonObject patch; patch["coverPath"] = "x.jpg"; patch["name"] = QJsonValue::Null;
+    QVERIFY(GameInfoStore::update(root, patch));
+
+    const QJsonObject r = GameInfoStore::read(root);
+    QCOMPARE(r["description"].toString(), QStringLiteral("desc"));
+    QCOMPARE(r["coverPath"].toString(), QStringLiteral("x.jpg"));
+    QVERIFY(!r.contains("name"));
+}
+
+void tst_TileManagerStructure::gameInfoStoreRelativeMedia()
+{
+    const QString root = QDir::fromNativeSeparators(tempDir->path());
+    const QString cover = root + "/launcher/media/cover.jpg";
+    QCOMPARE(GameInfoStore::toStored(root, cover), QStringLiteral("launcher/media/cover.jpg"));
+    QCOMPARE(QDir::fromNativeSeparators(GameInfoStore::resolve(root, "launcher/media/cover.jpg")), cover);
+    // Снаружи папки игры и URL — без изменений
+    QVERIFY(QDir::isAbsolutePath(QDir::fromNativeSeparators(GameInfoStore::toStored(root, "/other/x.jpg"))));
+    QCOMPARE(GameInfoStore::toStored(root, "https://a/b.jpg"), QStringLiteral("https://a/b.jpg"));
+
+    QVariantMap info{{"coverPath", "launcher/media/cover.jpg"}, {"trailerPath", "https://t"}};
+    GameInfoStore::resolveMediaPaths(root, info);
+    QCOMPARE(QDir::fromNativeSeparators(info["coverPath"].toString()), cover);
+    QCOMPARE(info["trailerPath"].toString(), QStringLiteral("https://t"));
+}

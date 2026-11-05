@@ -30,12 +30,14 @@ Item {
                 audioTimerMs:   (typeof raw.audioTimerMs === "string" || typeof raw.audioTimerMs === "number")
                                 ? raw.audioTimerMs : "auto",
                 dsoundLatencyMs:(typeof raw.dsoundLatencyMs === "string" || typeof raw.dsoundLatencyMs === "number")
-                                ? raw.dsoundLatencyMs : "auto"
+                                ? raw.dsoundLatencyMs : "auto",
+                diagnosticLogcat: raw.diagnosticLogcat === true
             }
         } else {
             profileData = {
                 displayName: "", cores: 4, ramMb: 2048, resolution: "auto",
-                audioDriver: "dsound", audioTimerMs: "auto", dsoundLatencyMs: "auto"
+                audioDriver: "dsound", audioTimerMs: "auto", dsoundLatencyMs: "auto",
+                diagnosticLogcat: false
             }
         }
     }

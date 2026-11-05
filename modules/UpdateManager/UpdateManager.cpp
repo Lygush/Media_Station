@@ -23,6 +23,19 @@
 #  define MEDIASTATION_VERSION "1.0.0"
 #endif
 
+// Архивы обновлений, принятые по сети, лежат в %TEMP%/MediaStation_Update
+// (NetworkModule::prepareUpdateArchivePath). Удаляем только файлы оттуда,
+// чтобы случайно не стереть что-то по чужому пути.
+static void removeReceivedArchive(const QString &path)
+{
+    if (path.isEmpty()) return;
+    const QString dir = QDir::cleanPath(QDir::temp().absoluteFilePath("MediaStation_Update"));
+    const QString file = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    if (!file.startsWith(dir + "/", Qt::CaseInsensitive)) return;
+    if (QFile::remove(file))
+        qDebug() << "[UpdateManager] removed update archive:" << file;
+}
+
 UpdateManager::UpdateManager(QObject *parent)
     : QObject(parent)
     , m_appDir(QCoreApplication::applicationDirPath())
@@ -55,6 +68,15 @@ void UpdateManager::initialize(EventBus *bus, SettingsManager *)
     // запущенный exe), поэтому там копились копии Updater от каждого обновления.
     // Чистим устаревшие (старше суток) в фоне.
     (void)QtConcurrent::run([]() {
+        // Старые архивы обновлений (отклонённые, прерванные, от прошлых версий)
+        const QDir arch(QDir::temp().absoluteFilePath("MediaStation_Update"));
+        if (arch.exists()) {
+            const QDateTime limit = QDateTime::currentDateTime().addDays(-1);
+            for (const QFileInfo &f : arch.entryInfoList({"update_*.7z", "update_*.7z.part"}, QDir::Files))
+                if (f.lastModified() < limit)
+                    QFile::remove(f.absoluteFilePath());
+        }
+
         const QDir base(QDir::temp().absoluteFilePath("MediaStationUpdater"));
         if (!base.exists()) return;
         const QDateTime limit = QDateTime::currentDateTime().addDays(-1);
@@ -84,8 +106,14 @@ void UpdateManager::onUpdateReceived(const QString &version,
                                             .arg(version, currentVersion()),
                                         NotificationLevel::Info, true, 4000));
         }
+        if (archivePath != m_archivePath)
+            removeReceivedArchive(archivePath);
         return;
     }
+
+    // Пришёл новый архив, а предыдущий ещё ждёт — старый больше не нужен
+    if (!m_archivePath.isEmpty() && m_archivePath != archivePath && !m_preparing)
+        removeReceivedArchive(m_archivePath);
 
     m_newVersion    = version;
     m_archivePath   = archivePath;
@@ -362,6 +390,12 @@ void UpdateManager::acceptUpdate()
 void UpdateManager::declineUpdate()
 {
     qDebug() << "[UpdateManager] User declined update";
+    // Архив весит сотни мегабайт; раньше он оставался во временной папке навсегда.
+    // Если обновление понадобится, сервер отправит его заново.
+    if (!m_preparing) {
+        removeReceivedArchive(m_archivePath);
+        m_archivePath.clear();
+    }
     m_updateReady = false;
     emit updateReadyChanged();
 }

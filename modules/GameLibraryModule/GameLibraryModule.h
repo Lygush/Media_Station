@@ -107,6 +107,8 @@ private:
 
     // Возвращает плитки, удалённые перед архивацией (отмена или ошибка)
     void restoreTilesAfterArchive(const QString &gameId);
+    void clearArchivePending(const QString &installPath);
+    void recoverInterruptedArchives();
     void removeTilesFromStructure(const QStringList &tileLocations, const QString &gameId);
 
     // Возвращает стандартный путь к архиву внутри папки игры:

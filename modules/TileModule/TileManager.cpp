@@ -8,11 +8,13 @@
 #include "NotificationModule.h"
 #include "core/EventBus.h"
 #include "tools/AtomicFile.h"
+#include "tools/GameInfoStore.h"
 
 #include <QStorageInfo>
 #include <QRegularExpression>
 #include <QDebug>
 #include <QDir>
+#include <QCoreApplication>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -83,8 +85,8 @@ void TileManager::initialize(EventBus *bus, SettingsManager * /*settings*/)
 
                 // ── createTile: создать плитку в нужном экране/папке ─────────────────
                 if (ev == "createTile") {
-                    const QString storageKey = data["storageKey"].toString();
-                    bool          isFolder   = data["isFolder"].toBool();
+                    QString storageKey = data["storageKey"].toString();
+                    bool    isFolder   = data["isFolder"].toBool();
 
                     // storageKey должен быть экраном ("games"/"tv") или id папки.
                     // Раньше при восстановлении плиток после отмены архивации сюда
@@ -98,11 +100,17 @@ void TileManager::initialize(EventBus *bus, SettingsManager * /*settings*/)
                                 folderExists = true; break;
                             }
                         }
-                        if (!folderExists) {
-                            qWarning() << "TileManager: createTile ignored, unknown location:" << storageKey;
-                            return;
+                        if (folderExists) {
+                            isFolder = true;
+                        } else {
+                            // Старые установки хранят в tileLocations id плитки,
+                            // а не место. Раньше такая плитка после отмены архивации
+                            // просто пропадала — теперь возвращается на экран игр.
+                            qWarning() << "TileManager: unknown tile location" << storageKey
+                                       << "— placing tile on 'games'";
+                            storageKey = QStringLiteral("games");
+                            isFolder   = false;
                         }
-                        isFolder = true;
                     }
                     const QString gameId     = data["gameId"].toString();
                     const QString tileId     = "lib_" + gameId;
@@ -213,6 +221,81 @@ void TileManager::notify(NotificationLevel level,
         Notifications::makeEvent(msg, level, autoDismiss, duration));
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Пути плиток относительно папки программы.
+//
+// В structure.json пути внутри папки программы (игры, иконки, ярлыки)
+// хранятся с префиксом "$APP/". Тогда перенос всей папки MediaStation
+// на другой диск или в другую папку не ломает плитки. В памяти и в QML
+// пути всегда абсолютные. Префикс выбран явным, чтобы не перепутать его
+// с короткими командами вроде "notepad.exe", которые трогать нельзя.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+const QString kAppPrefix = QStringLiteral("$APP/");
+const QStringList &pathKeys()
+{
+    static const QStringList keys = { QStringLiteral("path"), QStringLiteral("icon"),
+                                      QStringLiteral("installFolder") };
+    return keys;
+}
+
+QString appRoot()
+{
+    return QDir::cleanPath(QCoreApplication::applicationDirPath());
+}
+
+QString resolveAppPath(const QString &stored)
+{
+    if (!stored.startsWith(kAppPrefix))
+        return stored;
+    return QDir::toNativeSeparators(appRoot() + "/" + stored.mid(kAppPrefix.size()));
+}
+
+QString toAppRelative(const QString &path)
+{
+    if (path.isEmpty() || path.startsWith(kAppPrefix) || path.contains(QLatin1String("://")))
+        return path;
+    const QString clean = QDir::cleanPath(QDir::fromNativeSeparators(path));
+    if (!QDir::isAbsolutePath(clean))
+        return path;
+    const QString root = appRoot();
+    if (clean.compare(root, Qt::CaseInsensitive) == 0)
+        return path;
+    if (!clean.startsWith(root + "/", Qt::CaseInsensitive))
+        return path;
+    return kAppPrefix + clean.mid(root.size() + 1);
+}
+
+// Рекурсивно по дереву плиток (папки хранят детей в "children")
+QJsonArray mapTreePaths(const QJsonArray &arr, QString (*fn)(const QString &))
+{
+    QJsonArray out;
+    for (const QJsonValue &v : arr) {
+        if (!v.isObject()) { out.append(v); continue; }
+        QJsonObject obj = v.toObject();
+        for (const QString &k : pathKeys())
+            if (obj.value(k).isString())
+                obj[k] = fn(obj.value(k).toString());
+        if (obj.value("children").isArray())
+            obj["children"] = mapTreePaths(obj.value("children").toArray(), fn);
+        out.append(obj);
+    }
+    return out;
+}
+
+QJsonObject mapStructurePaths(const QJsonObject &structure, QString (*fn)(const QString &))
+{
+    QJsonObject out = structure;
+    for (auto it = structure.begin(); it != structure.end(); ++it)
+        if (it.value().isArray())
+            out[it.key()] = mapTreePaths(it.value().toArray(), fn);
+    return out;
+}
+
+} // namespace
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Загрузка / сохранение structure.json
 // ═════════════════════════════════════════════════════════════════════════════
@@ -224,7 +307,7 @@ void TileManager::loadStructure()
         QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
         f.close();
         if (doc.isObject()) {
-            m_structure = doc.object();
+            m_structure = mapStructurePaths(doc.object(), resolveAppPath);
             for (const QString &screen : s_knownScreens)
                 if (!m_structure.contains(screen))
                     m_structure[screen] = QJsonArray();
@@ -243,7 +326,8 @@ void TileManager::loadStructure()
 
 void TileManager::saveStructure() const
 {
-    if (!AtomicFile::writeJson(m_structurePath, QJsonDocument(m_structure))) {
+    if (!AtomicFile::writeJson(m_structurePath,
+                               QJsonDocument(mapStructurePaths(m_structure, toAppRelative)))) {
         // Критичная ошибка — данные не сохранятся. Уведомляем пользователя.
         notify(NotificationLevel::Error,
                "Ошибка: не удалось сохранить структуру плиток");
@@ -330,19 +414,12 @@ QVariantList TileManager::stripChildren(const QJsonArray &arr)
         obj.remove("children");
 
         // ── Обложка игры (Фаза 1) ──────────────────────────────────────────────
-        if (!obj["installFolder"].toString().isEmpty()) {
-            const QString infoPath = QDir::fromNativeSeparators(obj["installFolder"].toString())
-            + "/game_info.json";
-            QFile f(infoPath);
-            if (f.open(QIODevice::ReadOnly)) {
-                const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
-                f.close();
-                if (doc.isObject()) {
-                    const QString coverPath = doc.object()["coverPath"].toString();
-                    if (!coverPath.isEmpty())
-                        obj["coverPath"] = coverPath;
-                }
-            }
+        const QString installFolder = resolveAppPath(obj["installFolder"].toString());
+        if (!installFolder.isEmpty()) {
+            const QString coverPath = GameInfoStore::resolve(
+                installFolder, GameInfoStore::read(installFolder)["coverPath"].toString());
+            if (!coverPath.isEmpty())
+                obj["coverPath"] = coverPath;
         }
 
         result.append(obj.toVariantMap());
@@ -627,18 +704,12 @@ void TileManager::persistInstallResult(const QString &tileId, bool success,
 
 QVariantMap TileManager::readGameInfo(const QString &installFolder) const
 {
-    if (installFolder.isEmpty())
+    const QString root = resolveAppPath(installFolder);
+    if (root.isEmpty())
         return {};
 
-    const QString infoPath = QDir::fromNativeSeparators(installFolder) + "/game_info.json";
-    QFile f(infoPath);
-    if (!f.open(QIODevice::ReadOnly))
-        return {};
-
-    QJsonParseError err;
-    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-    if (err.error != QJsonParseError::NoError || !doc.isObject())
-        return {};
-
-    return doc.object().toVariantMap();
+    // Обложка/фон/трейлер хранятся относительно папки игры — для QML разворачиваем
+    QVariantMap info = GameInfoStore::read(root).toVariantMap();
+    GameInfoStore::resolveMediaPaths(root, info);
+    return info;
 }

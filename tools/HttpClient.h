@@ -47,4 +47,11 @@ QByteArray get(const QString          &url,
                int                     timeoutMs = kTimeoutDefault,
                const std::atomic<bool> *cancelled = nullptr);
 
+/// То же, но сообщает код ответа: HTTP-статус, либо 0 — сети нет / таймаут /
+/// отмена. Нужен, чтобы не повторять запрос, когда интернета нет вовсе.
+QByteArray get(const QString          &url,
+               int                     timeoutMs,
+               const std::atomic<bool> *cancelled,
+               int                    *httpStatus);
+
 } // namespace HttpClient

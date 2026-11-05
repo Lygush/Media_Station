@@ -10,6 +10,7 @@
 #include "core/EventBus.h"
 #include "NotificationModule.h"
 #include "tools/AtomicFile.h"
+#include "tools/GameInfoStore.h"
 #include "tools/SevenZip.h"
 #include "InstallUtils.h"
 
@@ -33,6 +34,7 @@
 #include <QPointer>
 #include <QThreadPool>
 #include <QSet>
+#include <QTimer>
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Конструктор / деструктор
@@ -69,6 +71,9 @@ void GameLibraryModule::initialize(EventBus *bus, SettingsManager *settings)
                 m_entries[gameId]["tileCount"] = count;
                 emit libraryEntryChanged(gameId, m_entries[gameId]);
             });
+
+    // Даём остальным модулям (TileManager) подписаться на шину
+    QTimer::singleShot(2000, this, &GameLibraryModule::recoverInterruptedArchives);
 }
 
 void GameLibraryModule::shutdown()
@@ -124,47 +129,53 @@ qint64 GameLibraryModule::calcFolderSize(const QString &path)
 
 QVariantMap GameLibraryModule::readGameInfo(const QString &folderPath) const
 {
-    const QString infoPath = folderPath + "/game_info.json";
-    QFile f(infoPath);
-    if (!f.open(QIODevice::ReadOnly)) return {};
-
-    QJsonParseError err;
-    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
-        qWarning() << "GameLibraryModule: bad game_info.json at" << infoPath;
-        return {};
-    }
-    return doc.object().toVariantMap();
+    return GameInfoStore::read(folderPath).toVariantMap();
 }
 
 bool GameLibraryModule::writeGameInfo(const QString &folderPath, const QVariantMap &info) const
 {
     if (folderPath.isEmpty()) return false;
-    QDir().mkpath(folderPath);
+
+    // Поля, за которые отвечает библиотека. Только их она перезаписывает.
+    // Описание, обложки, тип ввода и т.п. пишут другие модули, часто в фоне;
+    // в m_entries их значения могут быть устаревшими, поэтому для таких полей
+    // берём то, что уже лежит в файле, а из m_entries — только если в файле
+    // поля нет (например, при первом создании файла).
+    static const QSet<QString> kOwned = {
+        QStringLiteral("id"),            QStringLiteral("name"),
+        QStringLiteral("type"),          QStringLiteral("executablePath"),
+        QStringLiteral("installPath"),   QStringLiteral("iconPath"),
+        QStringLiteral("tileLocations"), QStringLiteral("installDate"),
+        QStringLiteral("archivePath"),   QStringLiteral("sizeCached"),
+        QStringLiteral("legacyNoMetadata")
+    };
 
     // В m_entries есть служебные поля времени выполнения (_archiveProgress,
-    // _savedTileLocs, available, tileCount…). Раньше они попадали в game_info.json,
-    // и после перезапуска, например, устаревший tileCount не пересчитывался.
-    QVariantMap clean = info;
-    for (auto it = clean.begin(); it != clean.end(); ) {
-        const QString &k = it.key();
-        if (k.startsWith(QLatin1Char('_')) || k == QLatin1String("available")
+    // _savedTileLocs, available, tileCount…) — в файл они не попадают.
+    auto isRuntimeKey = [](const QString &k) {
+        return k.startsWith(QLatin1Char('_')) || k == QLatin1String("available")
             || k == QLatin1String("tileCount") || k == QLatin1String("archiving")
             || k == QLatin1String("archiveProgress") || k == QLatin1String("archiveCurrentFile")
-            || k == QLatin1String("extracting") || k == QLatin1String("extractProgress"))
-            it = clean.erase(it);
-        else
-            ++it;
-    }
+            || k == QLatin1String("extracting") || k == QLatin1String("extractProgress")
+            // отметку прерванной архивации ставят и снимают отдельно — не
+            // возвращаем её в файл из устаревшей копии в памяти
+            || k == QLatin1String("archivePending");
+    };
 
-    const QString infoPath = folderPath + "/game_info.json";
-    // AtomicFile: запись через временный файл с атомарной заменой (раньше было
-    // remove + rename — при сбое между ними файл терялся)
-    if (!AtomicFile::writeJson(infoPath, QJsonDocument(QJsonObject::fromVariantMap(clean)))) {
-        qWarning() << "GameLibraryModule: cannot write" << infoPath;
-        return false;
-    }
-    return true;
+    const QJsonObject src = QJsonObject::fromVariantMap(info);
+    const bool ok = GameInfoStore::modify(folderPath, [&](QJsonObject &obj) {
+        for (auto it = src.begin(); it != src.end(); ++it) {
+            const QString &k = it.key();
+            if (isRuntimeKey(k))
+                continue;
+            if (kOwned.contains(k) || !obj.contains(k))
+                obj.insert(k, it.value());
+        }
+        return true;
+    });
+    if (!ok)
+        qWarning() << "GameLibraryModule: cannot write game_info.json in" << folderPath;
+    return ok;
 }
 
 // ── Путь к архиву внутри папки игры ────────────────────────────────────────
@@ -574,6 +585,16 @@ void GameLibraryModule::archiveGame(const QString &gameId)
         savedTileLocs << v.toString();
     m_entries[gameId]["_savedTileLocs"] = QVariant(savedTileLocs);
 
+    // Список мест плиток записываем в файл ДО их удаления. Если программу
+    // закроют или она упадёт во время архивации, обработчик завершения не
+    // выполнится, и раньше плитки пропадали навсегда — при следующем запуске
+    // recoverInterruptedArchives() вернёт их по этой отметке.
+    {
+        QJsonObject mark;
+        mark["archivePending"] = QJsonArray::fromStringList(savedTileLocs);
+        GameInfoStore::update(installPath, mark);
+    }
+
     // 1. Удаляем плитки.
     removeTilesFromStructure(savedTileLocs, gameId);
 
@@ -622,6 +643,7 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                         // game_info.json остаётся в installPath — папка игры не удаляется.
                         writeGameInfo(installPath, m_entries[gameId]);
                     }
+                    clearArchivePending(installPath);
                     // Удаляем только папку game/ — launcher/ и game_info.json остаются.
                     QDir(installPath + "/game").removeRecursively();
                     qDebug() << "GameLibraryModule: archived successfully:" << gameId;
@@ -718,6 +740,68 @@ void GameLibraryModule::restoreTilesAfterArchive(const QString &gameId)
     m_entries[gameId].remove("_archiveProgress");
     m_entries[gameId].remove("_archiveCurrentFile");
     m_entries[gameId].remove("_savedTileLocs");
+    clearArchivePending(m_entries[gameId].value("installPath").toString());
+}
+
+void GameLibraryModule::clearArchivePending(const QString &installPath)
+{
+    if (installPath.isEmpty()) return;
+    GameInfoStore::modify(installPath, [](QJsonObject &obj) {
+        if (!obj.contains("archivePending"))
+            return false;
+        obj.remove("archivePending");
+        return true;
+    });
+}
+
+// Архивация, прерванная закрытием программы или сбоем: в game_info.json
+// осталась отметка archivePending со списком мест плиток. Игра при этом
+// не тронута (папка game/ удаляется только после успешной архивации) —
+// убираем недописанный архив и возвращаем плитки.
+void GameLibraryModule::recoverInterruptedArchives()
+{
+    const QString basePath = m_settings ? m_settings->installPath() : QString();
+    if (basePath.isEmpty()) return;
+
+    const QPointer<GameLibraryModule> self(this);
+    QThreadPool::globalInstance()->start([this, self, basePath]() {
+        QStringList pending;
+        const QDir base(basePath);
+        for (const QFileInfo &fi : base.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+            const QString fp = QDir::fromNativeSeparators(fi.absoluteFilePath());
+            if (GameInfoStore::read(fp).contains("archivePending"))
+                pending << fp;
+        }
+        if (pending.isEmpty() || !self) return;
+
+        QMetaObject::invokeMethod(self.data(), [this, pending]() {
+            for (const QString &fp : pending) {
+                const QVariantMap info = scanFolder(fp);
+                const QString gameId = info.value("id").toString();
+                if (gameId.isEmpty()
+                    || m_archiveTasks.contains(gameId) || m_extractTasks.contains(gameId))
+                    continue;
+
+                const QStringList locs = GameInfoStore::read(fp)
+                                             .value("archivePending").toVariant().toStringList();
+                m_entries[gameId] = info;
+
+                if (info.value("type").toString() == QLatin1String("archive")) {
+                    // Архивация успела завершиться — отметка просто лишняя
+                    clearArchivePending(fp);
+                    continue;
+                }
+
+                qWarning() << "GameLibraryModule: interrupted archive found, restoring tiles:" << fp;
+                const QString partial = archivePathForGame(fp);
+                QFile::remove(partial);
+                QDir(QFileInfo(partial).absolutePath()).rmdir(".");
+
+                m_entries[gameId]["_savedTileLocs"] = locs;
+                restoreTilesAfterArchive(gameId);   // снимет отметку
+            }
+        }, Qt::QueuedConnection);
+    });
 }
 
 void GameLibraryModule::cancelArchive(const QString &gameId)

@@ -32,8 +32,8 @@
         { G72Keys::kSearch,    84  }, // KEYCODE_SEARCH
         { G72Keys::kHomePage,  3   }, // KEYCODE_HOME (браузерная кнопка Home → Android Home)
         { G72Keys::kFavorites, 174 }, // KEYCODE_BOOKMARK
-        { G72Keys::kVolumeUp,  24  }, // KEYCODE_VOLUME_UP
-        { G72Keys::kVolumeDown,25  }, // KEYCODE_VOLUME_DOWN
+        // Громкость не передаём: она регулируется в Windows (G72KeysModule
+        // пропускает эти клавиши в систему)
     };
 
     for (const auto &entry : kMap)
@@ -47,6 +47,9 @@ void AndroidTVModule::handleRemoteKey(const QString &key)
 {
     // Клавиши нужны эмулятору только когда он показан пользователю
     if (!m_running || !m_emulatorShown) return;
+
+    if (key == QLatin1String(G72Keys::kVolumeUp) || key == QLatin1String(G72Keys::kVolumeDown))
+        return;   // громкость — системная, см. G72KeysModule::keyboardHookProc
 
     // Кнопка Menu — переключает оверлей
     if (key == QLatin1String(G72Keys::kMenu)) {

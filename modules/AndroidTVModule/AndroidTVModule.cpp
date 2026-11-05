@@ -42,8 +42,20 @@ void AndroidTVModule::setMediaStationOpacity(int alpha)
             return;
         }
     }
-    // Окно должно быть WS_EX_LAYERED, иначе SetLayeredWindowAttributes ничего не делает.
     const LONG_PTR ex = GetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE);
+    if (alpha >= 255) {
+        // Полностью видимое окно прозрачность не нужна. Раньше WS_EX_LAYERED
+        // стоял всегда, с запуска программы: лишняя работа композитора DWM на
+        // каждый кадр и для игр, и для ТВ. Снимаем стиль, окно снова обычное.
+        if (ex & WS_EX_LAYERED) {
+            SetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+            RedrawWindow(m_mediaStationHwnd, nullptr, nullptr,
+                         RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+            logToEmulatorFile("MediaStation opacity 255 (layered style removed)");
+        }
+        return;
+    }
+    // Окно должно быть WS_EX_LAYERED, иначе SetLayeredWindowAttributes ничего не делает.
     if (!(ex & WS_EX_LAYERED))
         SetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
 
@@ -207,6 +219,24 @@ void AndroidTVModule::shutdown()
     //    Обработчики отключаем: после shutdown() они не должны трогать UI/шину.
     if (m_emulatorProcess)
         m_emulatorProcess->disconnect(this);
+
+    // Сначала просим эмулятор закрыться самому («emu kill»): так он успевает
+    // дописать userdata-qcow2. Сразу TerminateProcess при выходе из программы
+    // во время просмотра мог оставить образ в «грязном» состоянии.
+#ifdef Q_OS_WIN
+    if ((m_running || m_booting) && m_emulatorPid && QFile::exists(adbPath())) {
+        QProcess emuKill;
+        emuKill.setProcessEnvironment(toolsEnvironment());
+        emuKill.start(adbPath(), {"-s", adbSerial(), "emu", "kill"});
+        emuKill.waitForFinished(1500);
+        if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(m_emulatorPid))) {
+            const DWORD r = WaitForSingleObject(h, 3000);
+            CloseHandle(h);
+            logToEmulatorFile(r == WAIT_OBJECT_0 ? "shutdown: emulator exited after 'emu kill'"
+                                                 : "shutdown: emulator still running, killing");
+        }
+    }
+#endif
     killEmulatorTree();
 
     // 4. DNS-прокси
@@ -233,7 +263,9 @@ void AndroidTVModule::shutdown()
     // 7. Восстанавливаем окно MediaStation
 #ifdef Q_OS_WIN
     if (m_mediaStationHwnd && IsWindow(m_mediaStationHwnd)) {
-        SetLayeredWindowAttributes(m_mediaStationHwnd, 0, 255, LWA_ALPHA);
+        const LONG_PTR ex = GetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE);
+        if (ex & WS_EX_LAYERED)
+            SetWindowLongPtr(m_mediaStationHwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
         SetWindowPos(m_mediaStationHwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         m_mediaStationHwnd = nullptr;
@@ -279,6 +311,10 @@ void AndroidTVModule::setEmulatorShown(bool shown)
     if (m_emulatorShown == shown) return;
     m_emulatorShown = shown;
     emit activeChanged();
+    // Другим модулям (опрос геймпадов) — ТВ на экране или нет
+    if (m_bus)
+        emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("shown"),
+                                QVariantMap{{"shown", shown}});
 }
 
 void AndroidTVModule::updateProfileLock()

@@ -203,6 +203,11 @@ void G72KeysModule::applyCursorState()
                                   Q_ARG(bool, true));
     }
 
+    // Громкость всегда остаётся системной (Windows): раньше в режиме ТВ она
+    // уходила в Android, и получалось две независимые громкости
+    if (vk == VK_VOLUME_UP || vk == VK_VOLUME_DOWN || vk == VK_VOLUME_MUTE)
+        return CallNextHookEx(s_keyboardHook, nCode, wParam, lParam);
+
     if (s_instance->isInputBlocked())
         return 1;
 

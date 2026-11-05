@@ -181,6 +181,7 @@ void CALLBACK AndroidTVModule::s_winEventProc(
         self->logToEmulatorFile(QString("WinEvent: emulator re-exec PID %1 → %2")
                                     .arg(self->m_emulatorPid).arg(pid));
         self->m_emulatorPid = pid;
+        self->applyEmulatorProcessPriority(pid);
     }
 
     if (self->m_emulatorHwnd != hwnd) {
@@ -609,6 +610,7 @@ void AndroidTVModule::startWindowPolling()
             logToEmulatorFile(QString("Polling: emulator re-exec detected, PID %1 → %2")
                                   .arg(m_emulatorPid).arg(actualPid));
             m_emulatorPid = actualPid;
+            applyEmulatorProcessPriority(actualPid);
         }
         logToEmulatorFile(QString("Polling: emulator window HWND=%1 title=\"%2\"")
                               .arg(reinterpret_cast<quintptr>(hwnd)).arg(windowTitle(hwnd)));

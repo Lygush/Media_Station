@@ -49,6 +49,7 @@ struct AndroidTVProfile {
     QString audioDriver               = "dsound";
     QVariant audioTimerMs             = QVariant("auto");   // int (manual) or "auto"
     QVariant dsoundLatencyMs          = QVariant("auto");   // int (manual) or "auto"
+    bool    diagnosticLogcat          = false;   // полный logcat в файл (для диагностики)
 };
 
 class AndroidTVProfileManager : public QAbstractListModel
@@ -77,6 +78,7 @@ public:
         AudioDriverRole,
         AudioTimerMsRole,
         DsoundLatencyMsRole,
+        DiagnosticLogcatRole,
         SizeMbRole
     };
 
@@ -344,6 +346,12 @@ private:
     QTimer   *m_keepTopmostTimer   = nullptr;
     QTimer   *m_positionSyncTimer  = nullptr;
     quint64   m_emulatorPid        = 0;
+    quint64   m_priorityAppliedPid = 0;
+    qint64    m_audioDelayedWrites = 0;   // прошлые значения метрики звука (health check)
+    qint64    m_audioUnderruns     = 0;   // кому уже выставлен приоритет (не повторяем)
+    // Повышенный класс приоритета и отказ от «экономии энергии» Windows для
+    // процесса эмулятора (без этого фоновый qemu попадает на E-ядра/EcoQoS).
+    void applyEmulatorProcessPriority(quint64 pid);
     quint64   m_initialEmulatorPid = 0;
     static constexpr int kWindowPollIntervalMs = 100;
     static constexpr int kWindowPollMaxTries   = 3000;  // 5 минут
@@ -390,4 +398,5 @@ private:
     HWINEVENTHOOK m_winEventHook     = nullptr;
     bool          m_timerResolutionSet = false;
 #endif
+    bool          m_diagnosticLogcat   = false;   // из профиля: писать ли logcat
 };

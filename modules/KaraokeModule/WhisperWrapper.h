@@ -68,6 +68,7 @@ private:
     QLibrary         m_lib;
     whisper_context *m_ctx = nullptr;
     QString          m_lastError;
+    bool             m_dtw = false;   // точное время слов (DTW) включено для этой модели
 
     fn_init_t        m_fnInit         = nullptr;
     fn_ctx_params_t  m_fnDefCtxParams = nullptr;

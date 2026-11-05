@@ -222,7 +222,7 @@ Item {
         property ListModel profileManager: ListModel {
             property string activeProfileId: "p1"
             property bool   locked: false
-            property var    currentProfileData: ({ id: "p1", displayName: "Android TV 14 (Google APIs, x86_64) — system-images;android-34;android-tv;x86", name: "MediaStation TV (Android 14)", resolution: "2560x1440", gpu: "auto", ramMb: 8192, cores: 4, audioDriver: "dsound", audioTimerMs: 100, dsoundLatencyMs: 200 })
+            property var    currentProfileData: ({ id: "p1", displayName: "Android TV 14 (Google APIs, x86_64) — system-images;android-34;android-tv;x86", name: "MediaStation TV (Android 14)", resolution: "2560x1440", gpu: "auto", ramMb: 8192, cores: 4, audioDriver: "dsound", audioTimerMs: 8, dsoundLatencyMs: 60, diagnosticLogcat: false })
             ListElement { name: "MediaStation TV (Android 14)"; profileId: "p1" }
             ListElement { name: "Детский профиль с длинным названием"; profileId: "p2" }
             signal profilesChanged()

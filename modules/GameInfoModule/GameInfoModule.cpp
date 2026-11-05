@@ -7,6 +7,7 @@
 #include "modules/SettingsModule/SettingsManager.h"
 #include "modules/NotificationModule/NotificationModule.h"
 #include "tools/AtomicFile.h"
+#include "tools/GameInfoStore.h"
 #include "LoggerModule.h"
 
 #include <QtConcurrent>
@@ -418,16 +419,9 @@ void GameInfoModule::selectCandidate(const QString &tileId, const QString &appId
 void GameInfoModule::saveToGameInfo(const QString &installFolder, const QVariantMap &meta,
                                     const QString &steamAppId)
 {
-    const QString infoPath = installFolder + "/game_info.json";
-
+    // Меняем только свои поля под общей блокировкой (GameInfoStore): обложки,
+    // трейлер, плитки и тип ввода, записанные другими модулями, не затираются.
     QJsonObject obj;
-    QFile existing(infoPath);
-    if (existing.open(QIODevice::ReadOnly)) {
-        const QJsonDocument doc = QJsonDocument::fromJson(existing.readAll());
-        if (doc.isObject()) obj = doc.object();
-        existing.close();
-    }
-
     obj["description"] = meta.value("description").toString();
     obj["genre"]       = meta.value("genre").toString();
     obj["releaseYear"] = meta.value("releaseYear").toString();
@@ -440,7 +434,7 @@ void GameInfoModule::saveToGameInfo(const QString &installFolder, const QVariant
     if (!steamAppId.isEmpty())
         obj["steamAppId"] = steamAppId;
 
-    if (!AtomicFile::writeJson(infoPath, QJsonDocument(obj)))
+    if (!GameInfoStore::update(installFolder, obj))
         GIM_LOG(Logger::kLevelError,
                 "failed to save game_info.json for: " + installFolder);
 }

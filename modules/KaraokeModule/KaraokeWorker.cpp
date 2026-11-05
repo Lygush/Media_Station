@@ -6,6 +6,11 @@
 #include <QDir>
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QRegularExpression>
+#include <QtEndian>
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 #include "DemucsWrapper.h"
 #include "WhisperWrapper.h"
@@ -47,6 +52,140 @@ static bool runCancellable(QProcess &proc, int timeoutMs, const std::atomic<bool
     return true;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WAV-помощники (16-бит PCM, как пишут ffmpeg и DemucsWrapper)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct WavInfo { int sampleRate = 0; int channels = 0; qint64 dataOffset = -1; qint64 dataBytes = 0; };
+
+static WavInfo readWavInfo(QFile &f)
+{
+    WavInfo wi;
+    const QByteArray hdr = f.read(12);
+    if (hdr.size() < 12 || !hdr.startsWith("RIFF") || hdr.mid(8, 4) != "WAVE") return wi;
+    while (!f.atEnd()) {
+        const QByteArray ch = f.read(8);
+        if (ch.size() < 8) break;
+        const quint32 sz = qFromLittleEndian<quint32>(reinterpret_cast<const uchar *>(ch.constData() + 4));
+        if (ch.startsWith("fmt ")) {
+            const QByteArray fmt = f.read(sz);
+            if (fmt.size() >= 16) {
+                wi.channels   = qFromLittleEndian<quint16>(reinterpret_cast<const uchar *>(fmt.constData() + 2));
+                wi.sampleRate = int(qFromLittleEndian<quint32>(reinterpret_cast<const uchar *>(fmt.constData() + 4)));
+            }
+            if (sz & 1) f.read(1);
+        } else if (ch.startsWith("data")) {
+            wi.dataOffset = f.pos();
+            // ffmpeg при записи в поток может оставить размер 0xFFFFFFFF
+            wi.dataBytes  = (sz == 0xFFFFFFFFu || sz == 0) ? f.size() - wi.dataOffset : qint64(sz);
+            break;
+        } else {
+            f.seek(f.pos() + sz + (sz & 1));
+        }
+    }
+    return wi;
+}
+
+static int wavDurationSec(const QString &path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return 0;
+    const WavInfo wi = readWavInfo(f);
+    if (wi.dataOffset < 0 || wi.sampleRate <= 0 || wi.channels <= 0) return 0;
+    return int(wi.dataBytes / (qint64(wi.sampleRate) * wi.channels * 2));
+}
+
+// RMS по кадрам 20 мс (каналы сводятся в моно)
+static std::vector<float> wavFrameRms(const QString &path)
+{
+    std::vector<float> rms;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return rms;
+    const WavInfo wi = readWavInfo(f);
+    if (wi.dataOffset < 0 || wi.sampleRate <= 0 || wi.channels <= 0) return rms;
+    const int frameSamples = wi.sampleRate / 50;
+    const qint64 frameBytes = qint64(frameSamples) * wi.channels * 2;
+    f.seek(wi.dataOffset);
+    qint64 left = wi.dataBytes;
+    while (left >= frameBytes) {
+        const QByteArray buf = f.read(frameBytes);
+        if (buf.size() < frameBytes) break;
+        left -= frameBytes;
+        const qint16 *p = reinterpret_cast<const qint16 *>(buf.constData());
+        double acc = 0.0;
+        for (int i = 0; i < frameSamples; ++i) {
+            double v = 0.0;
+            for (int c = 0; c < wi.channels; ++c) v += p[i * wi.channels + c];
+            v /= wi.channels * 32768.0;
+            acc += v * v;
+        }
+        rms.push_back(float(std::sqrt(acc / frameSamples)));
+    }
+    return rms;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Проверка синхронизации текста lrclib с вокалом.
+//
+// Тайм-коды lrclib сделаны людьми под конкретную запись. Если у нас другая
+// версия (тишина в начале, другое издание), весь текст сдвинут на секунды.
+// Ищем сдвиг, при котором начала строк лучше всего совпадают с началами
+// пения на дорожке вокала (после Demucs): после метки голос есть, перед — нет.
+// Возвращает сдвиг в мс (+ — текст надо показывать позже) или 0.
+// ─────────────────────────────────────────────────────────────────────────────
+static int estimateLrcOffsetMs(const QString &lrc, const std::vector<float> &frameRms)
+{
+    if (frameRms.size() < 500) return 0;                     // < 10 с звука
+
+    static const QRegularExpression lineRe(QStringLiteral("^\\[(\\d+):(\\d+)\\.(\\d+)\\](.*)$"));
+    std::vector<int> starts;   // мс
+    for (const QString &raw : lrc.split(QLatin1Char('\n'))) {
+        const auto m = lineRe.match(raw.trimmed());
+        if (!m.hasMatch()) continue;
+        if (m.captured(4).trimmed().isEmpty()) continue;      // пустая строка = проигрыш
+        const QString cs = m.captured(3);
+        int frac = cs.toInt();
+        if (cs.length() == 2) frac *= 10; else if (cs.length() == 1) frac *= 100;
+        starts.push_back(m.captured(1).toInt() * 60000 + m.captured(2).toInt() * 1000 + frac);
+    }
+    if (starts.size() < 6) return 0;
+
+    std::vector<float> sorted = frameRms;
+    std::sort(sorted.begin(), sorted.end());
+    const float thr = std::max(0.004f, 0.10f * sorted[sorted.size() * 9 / 10]);
+    const int nF = int(frameRms.size());
+    // Префиксные суммы активных кадров — быстрые запросы «доля голоса в окне»
+    std::vector<int> pre(nF + 1, 0);
+    for (int i = 0; i < nF; ++i) pre[i + 1] = pre[i] + (frameRms[i] > thr ? 1 : 0);
+    auto activeFrac = [&](int fromMs, int toMs) -> double {
+        int a = std::clamp(fromMs / 20, 0, nF), b = std::clamp(toMs / 20, 0, nF);
+        return b > a ? double(pre[b] - pre[a]) / (b - a) : 0.0;
+    };
+    auto score = [&](int off) {
+        double s = 0.0;
+        for (int t : starts) {
+            const int at = t + off;
+            s += activeFrac(at, at + 400) - activeFrac(at - 400, at - 40);
+        }
+        return s / double(starts.size());
+    };
+
+    const double base = score(0);
+    int    bestOff   = 0;
+    double bestScore = base;
+    for (int off = -5000; off <= 5000; off += 40) {
+        const double sc = score(off);
+        if (sc > bestScore + 1e-9) { bestScore = sc; bestOff = off; }
+    }
+    qDebug() << "[KaraokeWorker] синхронизация lrclib: лучший сдвиг" << bestOff
+             << "мс, оценка" << bestScore << "против" << base << "без сдвига";
+    // Сдвигаем, только если улучшение заметное, а сдвиг не мелкий
+    if (std::abs(bestOff) >= 250 && bestScore - base >= 0.12)
+        return bestOff;
+    return 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 KaraokeWorker::KaraokeWorker(const QString          &appDir,
@@ -79,6 +218,13 @@ void KaraokeWorker::run()
     if (!stepFfmpegToWav(m_meta.filePath, tempWav) || isCancelled()) {
         QFile::remove(tempWav);
         return;
+    }
+
+    // Длительность для выбора нужной версии текста на lrclib. Теги
+    // (TagLib) в сборке выключены, и раньше она всегда была 0.
+    if (m_meta.durationSec <= 0) {
+        m_meta.durationSec = wavDurationSec(tempWav);
+        qDebug() << "[KaraokeWorker] длительность трека:" << m_meta.durationSec << "с";
     }
 
     // ── Шаг 2: Demucs → vocals.wav + instrumental.wav ─────────────────────────
@@ -188,7 +334,16 @@ bool KaraokeWorker::stepLrc(const QString &vocalsWav, const QString &lrcOut)
 
         if (r.hasSynced) {
             qDebug() << "[KaraokeWorker] lrclib: syncedLyrics получен";
-            AtomicFile::writeBytes(lrcOut, r.lrc.toUtf8());
+            QString lrc = r.lrc;
+            reportProgress(67, "Проверка синхронизации...");
+            const int offMs = estimateLrcOffsetMs(lrc, wavFrameRms(vocalsWav));
+            if (offMs != 0) {
+                // [offset:] по стандарту LRC: «+» — показывать раньше, поэтому
+                // знак обратный найденному сдвигу
+                lrc.prepend(QString("[offset:%1]\n").arg(-offMs));
+                qDebug() << "[KaraokeWorker] текст сдвинут на" << offMs << "мс";
+            }
+            AtomicFile::writeBytes(lrcOut, lrc.toUtf8());
             return true;
         }
 
@@ -325,5 +480,13 @@ QString KaraokeWorker::onnxDllDir() const
 
 QString KaraokeWorker::demucsModelPath() const
 {
-    return m_appDir + "/models/htdemucs.onnx";
+    // Основное место — внутри tools/ (как у Whisper и LLM): tools/ переносится
+    // при обновлении. Старое место models/ — запасное, для существующих установок.
+    const QString inTools = m_appDir + "/tools/onnxruntime/models/htdemucs.onnx";
+    if (QFile::exists(inTools))
+        return inTools;
+    const QString legacy = m_appDir + "/models/htdemucs.onnx";
+    if (QFile::exists(legacy))
+        return legacy;
+    return inTools;   // для сообщения об ошибке — путь, где модель должна лежать
 }

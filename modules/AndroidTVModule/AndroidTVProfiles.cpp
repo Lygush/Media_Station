@@ -15,6 +15,9 @@
 #include <QUuid>
 #include <QDebug>
 
+// Версия формата аудионастроек в profiles.json (см. load)
+static constexpr int kAudioSettingsVersion = 2;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // AndroidTVProfileManager
 // ══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +65,7 @@ QVariant AndroidTVProfileManager::data(const QModelIndex &index, int role) const
     case AudioDriverRole: return p.audioDriver;
     case AudioTimerMsRole: return p.audioTimerMs;
     case DsoundLatencyMsRole: return p.dsoundLatencyMs;
+    case DiagnosticLogcatRole: return p.diagnosticLogcat;
     case SizeMbRole: return profileSizeMb(p.id);
     default: return QVariant();
     }
@@ -86,6 +90,7 @@ QHash<int, QByteArray> AndroidTVProfileManager::roleNames() const
         {AudioDriverRole, "audioDriver"},
         {AudioTimerMsRole, "audioTimerMs"},
         {DsoundLatencyMsRole, "dsoundLatencyMs"},
+        {DiagnosticLogcatRole, "diagnosticLogcat"},
         {SizeMbRole, "sizeMb"}
     };
 }
@@ -111,6 +116,7 @@ QVariantMap AndroidTVProfileManager::profileToMap(const AndroidTVProfile &p) con
     map["audioDriver"]     = p.audioDriver;
     map["audioTimerMs"]    = p.audioTimerMs;
     map["dsoundLatencyMs"] = p.dsoundLatencyMs;
+    map["diagnosticLogcat"] = p.diagnosticLogcat;
     return map;
 }
 
@@ -350,14 +356,17 @@ bool AndroidTVProfileManager::updateProfileField(const QString &id, const QStrin
         else if (field == "noSnapshotSave") p.noSnapshotSave = value.toBool();
         else if (field == "dnsServer")      p.dnsServer = value.toString();
         else if (field == "audioDriver")    p.audioDriver = value.toString();
+        else if (field == "diagnosticLogcat") p.diagnosticLogcat = value.toBool();
         else if (field == "audioTimerMs" || field == "dsoundLatencyMs") {
             QVariant &target = (field == "audioTimerMs") ? p.audioTimerMs : p.dsoundLatencyMs;
             if (isAutoValue(value)) {
                 target = QVariant(QStringLiteral("auto"));
             } else {
                 bool ok = false;
-                const int v = value.toInt(&ok);
+                int v = value.toInt(&ok);
                 if (!ok || v <= 0) return false;
+                // Период таймера 4–10 мс (= 250–100 Гц), задержка 20–200 мс
+                v = (field == "audioTimerMs") ? qBound(4, v, 10) : qBound(20, v, 200);
                 target = v;
             }
         }
@@ -428,6 +437,8 @@ void AndroidTVProfileManager::load(const QString &baseDir)
     const QString path = profilesFilePath();
 
     QList<AndroidTVProfile> loaded;
+
+    bool migratedAudio = false;
     QString activeId;
 
     QFile f(path);
@@ -464,6 +475,7 @@ void AndroidTVProfileManager::load(const QString &baseDir)
                 p.noSnapshotSave = obj["noSnapshotSave"].toBool(true);
                 p.dnsServer = obj["dnsServer"].toString("8.8.8.8,1.1.1.1");
                 p.audioDriver = obj["audioDriver"].toString("dsound");
+                p.diagnosticLogcat = obj["diagnosticLogcat"].toBool(false);
 
                 // Audio timer: обратная совместимость со старым форматом
                 if (obj.contains("useDefaultAudioTimer")) {
@@ -480,6 +492,19 @@ void AndroidTVProfileManager::load(const QString &baseDir)
                     const QJsonValue dv = obj["dsoundLatencyMs"];
                     p.dsoundLatencyMs = dv.isDouble() ? QVariant(dv.toInt()) : QVariant("auto");
                 }
+
+                // До версии 2 значение «таймера» уходило в QEMU как частота (Гц),
+                // хотя в интерфейсе подписано мс, а задержка DirectSound задавалась
+                // без размера буфера. Ручные значения из старых профилей давали
+                // обратный эффект — сбрасываем их на новые безопасные умолчания.
+                if (obj["audioSettingsVersion"].toInt(1) < kAudioSettingsVersion) {
+                    if (p.audioTimerMs != QVariant("auto") || p.dsoundLatencyMs != QVariant("auto"))
+                        qWarning() << "[AndroidTV] profile" << p.name
+                                   << ": old manual audio settings reset to defaults";
+                    p.audioTimerMs    = QVariant("auto");
+                    p.dsoundLatencyMs = QVariant("auto");
+                    migratedAudio = true;
+                }
                 loaded.append(p);
             }
         }
@@ -493,7 +518,7 @@ void AndroidTVProfileManager::load(const QString &baseDir)
         p.avdName = makeUniqueAvdName(wanted);
         m_profiles.append(p);
     }
-    bool changed = false;
+    bool changed = migratedAudio;
     if (m_profiles.isEmpty()) {
         AndroidTVProfile def = makeDefaultProfile();
         // Если стандартного образа нет — берём первый найденный
@@ -545,6 +570,8 @@ void AndroidTVProfileManager::save()
         obj["audioDriver"] = p.audioDriver;
         obj["audioTimerMs"] = QJsonValue::fromVariant(p.audioTimerMs);
         obj["dsoundLatencyMs"] = QJsonValue::fromVariant(p.dsoundLatencyMs);
+        obj["audioSettingsVersion"] = kAudioSettingsVersion;
+        obj["diagnosticLogcat"] = p.diagnosticLogcat;
         arr.append(obj);
     }
     root["profiles"] = arr;

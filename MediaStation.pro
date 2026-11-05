@@ -39,6 +39,7 @@ SOURCES += \
     core/IModule.cpp                                        \
     core/ModuleHost.cpp                                     \
     tools/AtomicFile.cpp                                    \
+    tools/GameInfoStore.cpp                                 \
     tools/HttpClient.cpp                                    \
     tools/LlamaClient.cpp                                   \
     tools/SevenZip.cpp                                      \
@@ -92,6 +93,7 @@ HEADERS += \
     core/IModule.h                                          \
     core/ModuleHost.h                                       \
     tools/AtomicFile.h                                      \
+    tools/GameInfoStore.h                                   \
     tools/HttpClient.h                                      \
     tools/LlamaClient.h                                     \
     tools/SevenZip.h                                        \

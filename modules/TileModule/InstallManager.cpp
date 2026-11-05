@@ -10,6 +10,7 @@
 #include "NotificationModule.h"
 #include "core/EventBus.h"
 #include "tools/AtomicFile.h"
+#include "tools/GameInfoStore.h"
 
 #include <QCoreApplication>
 #include <QDirIterator>
@@ -753,19 +754,10 @@ void InstallManager::updateLaunchExe(const QString &tileId,
         if (ok) {
             qDebug() << "[InstallManager] updateLaunchExe: OK" << exeRelNative;
 
-            const QString infoPath = gameRoot + "/game_info.json";
-            if (QFile::exists(infoPath)) {
-                QFile f(infoPath);
-                if (f.open(QIODevice::ReadOnly)) {
-                    QJsonParseError err;
-                    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-                    f.close();
-                    if (err.error == QJsonParseError::NoError && doc.isObject()) {
-                        QJsonObject obj = doc.object();
-                        obj["executablePath"] = exeRelNative;
-                        AtomicFile::writeJson(infoPath, QJsonDocument(obj));
-                    }
-                }
+            if (QFile::exists(GameInfoStore::filePath(gameRoot))) {
+                QJsonObject patch;
+                patch["executablePath"] = exeRelNative;
+                GameInfoStore::update(gameRoot, patch);
             }
             // checkDependencies обращается к членам объекта — запускаем его из
             // GUI-потока, а не напрямую из фоновой задачи.
@@ -861,19 +853,13 @@ void InstallManager::checkDependencies(const QString &requestId,
                 if (!searchDir.cdUp()) break;
             }
             if (!gameInfoPath.isEmpty()) {
-                QFile f(gameInfoPath);
-                if (f.open(QIODevice::ReadOnly)) {
-                    QJsonParseError err;
-                    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-                    f.close();
-                    if (err.error == QJsonParseError::NoError && doc.isObject()) {
-                        QJsonObject obj = doc.object();
-                        QJsonArray arr;
-                        for (const QString &t : deps.inputTypes) arr.append(t);
-                        obj["inputTypes"] = arr;
-                        AtomicFile::writeJson(gameInfoPath, QJsonDocument(obj));
-                    }
-                }
+                QJsonArray arr;
+                for (const QString &t : deps.inputTypes) arr.append(t);
+                QJsonObject patch;
+                patch["inputTypes"] = arr;
+                // Только одно поле, под общей блокировкой — не затираем то,
+                // что параллельно пишут модули описания и обложек
+                GameInfoStore::update(QFileInfo(gameInfoPath).absolutePath(), patch);
             }
         }
 

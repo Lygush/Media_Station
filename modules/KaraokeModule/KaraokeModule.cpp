@@ -1,5 +1,7 @@
 // modules/KaraokeModule/KaraokeModule.cpp
 #include "KaraokeModule.h"
+#include <QDateTime>
+#include <QCryptographicHash>
 #include <QRegularExpression>
 
 #include <QCoreApplication>
@@ -368,12 +370,56 @@ void KaraokeModule::onWorkerFinished()
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+// Короткий отпечаток содержимого файла: размер + первые и последние 1 МБ.
+// Быстро даже для больших файлов и не зависит от имени/тегов.
+QString KaraokeModule::fileKey(const QString &filePath) const
+{
+    const QFileInfo fi(filePath);
+    const QString memo = filePath + QLatin1Char('|') + QString::number(fi.size())
+                         + QLatin1Char('|') + QString::number(fi.lastModified().toMSecsSinceEpoch());
+    const auto it = m_fileKeyCache.constFind(memo);
+    if (it != m_fileKeyCache.constEnd()) return *it;
+
+    QCryptographicHash h(QCryptographicHash::Sha1);
+    QFile f(filePath);
+    if (f.open(QIODevice::ReadOnly)) {
+        constexpr qint64 kChunk = 1024 * 1024;
+        h.addData(QByteArray::number(f.size()));
+        h.addData(f.read(kChunk));
+        if (f.size() > 2 * kChunk) { f.seek(f.size() - kChunk); h.addData(f.read(kChunk)); }
+    } else {
+        h.addData(filePath.toUtf8());
+    }
+    const QString key = QString::fromLatin1(h.result().toHex().left(10));
+    m_fileKeyCache.insert(memo, key);
+    return key;
+}
+
 QString KaraokeModule::songCacheDir(const QString &filePath) const
 {
+    // Папка: «Исполнитель - Название [отпечаток]». Раньше ключом было только
+    // «Исполнитель - Название»: две разные записи с одинаковыми тегами (live,
+    // ремастер) получали один кэш, а исправление названия теряло готовый кэш.
+    const QString root = QCoreApplication::applicationDirPath() + "/data/songs";
     const SongMeta meta = readMeta(filePath);
-    const QString dirName = sanitizeDirName(meta.artist) + " - " + sanitizeDirName(meta.title);
-    return QCoreApplication::applicationDirPath()
-           + "/data/songs/" + dirName;
+    const QString base  = sanitizeDirName(meta.artist) + " - " + sanitizeDirName(meta.title);
+    const QString key   = fileKey(filePath);
+    const QString wanted = root + "/" + base + " [" + key + "]";
+    if (QDir(wanted).exists())
+        return wanted;
+
+    // Тот же файл, но название с тех пор исправили — ищем по отпечатку
+    const QStringList byKey = QDir(root).entryList({"* [" + key + "]"}, QDir::Dirs | QDir::NoDotAndDotDot);
+    if (!byKey.isEmpty())
+        return root + "/" + byKey.first();
+
+    // Кэш старого формата (без отпечатка) — используем, если он полный
+    const QString legacy = root + "/" + base;
+    if (QFile::exists(legacy + "/song.lrc") && QFile::exists(legacy + "/vocals.wav")
+        && QFile::exists(legacy + "/instrumental.wav"))
+        return legacy;
+
+    return wanted;
 }
 
 SongMeta KaraokeModule::readMeta(const QString &filePath) const

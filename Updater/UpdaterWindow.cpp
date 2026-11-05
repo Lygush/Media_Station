@@ -300,6 +300,62 @@ bool UpdaterWindow::moveDirectory(const QString &srcPath, const QString &dstPath
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Перенос недостающего: всё, чего нет в новой версии, забираем из старой.
+// Используется для tools/ (мажорное обновление), models/ и logs/: раньше эти
+// папки целиком уходили вместе со старой версией (модель караоке, Android SDK,
+// журналы прошлых запусков).
+// ─────────────────────────────────────────────────────────────────────────────
+bool UpdaterWindow::mergeMissing(const QString &srcPath, const QString &dstPath)
+{
+    QDir srcDir(srcPath);
+    if (!srcDir.exists()) return true;
+    if (!QDir().mkpath(dstPath)) return false;
+
+    bool success = true;
+    const auto entries = srcDir.entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
+    for (const QString &entry : entries) {
+        const QString srcItem = srcPath + "/" + entry;
+        const QString dstItem = dstPath + "/" + entry;
+        const QFileInfo srcInfo(srcItem);
+        const QFileInfo dstInfo(dstItem);
+
+        if (dstInfo.exists()) {
+            // Есть в обоих местах: папки сливаем глубже, файл нового дистрибутива главнее
+            if (srcInfo.isDir() && dstInfo.isDir() && !mergeMissing(srcItem, dstItem))
+                success = false;
+            continue;
+        }
+
+        // Нет в новой версии — переносим. rename мгновенный в пределах тома.
+        if (QDir().rename(srcItem, dstItem))
+            continue;
+
+        bool ok = false;
+        if (srcInfo.isDir())
+            ok = moveDirectory(srcItem, dstItem);
+        else
+            ok = QFile::copy(srcItem, dstItem);
+        if (!ok) {
+            logError("mergeMissing: failed to move " + srcItem);
+            success = false;
+        }
+    }
+    return success;
+}
+
+void UpdaterWindow::migrateFolder(const QString &name)
+{
+    const QString oldPath = m_oldDir + "/" + name;
+    if (!QDir(oldPath).exists()) return;
+    if (mergeMissing(oldPath, m_targetDir + "/" + name)) {
+        logInfo("Folder migrated from old version: " + name);
+    } else {
+        logError("Folder migration incomplete: " + name + " (old version is kept)");
+        m_keepOldDir = true;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Старт обновления
 // ─────────────────────────────────────────────────────────────────────────────
 void UpdaterWindow::startUpdate()
@@ -815,7 +871,26 @@ void UpdaterWindow::doReplaceNow()
         } else {
             logInfo("AVD folder not found in old or new version, skipping AVD migration.");
         }
+
+        // Всё, чего нет в новом tools (Android SDK, системные образы, модели
+        // нейросетей, ffmpeg, DS4Windows…), забираем из старой версии. Раньше
+        // старый tools удалялся целиком вместе с MediaStation_Old_*, и всё, чего
+        // не было в архиве, пропадало — а без интернета это не восстановить.
+        setStatus("Перенос недостающих компонентов из старой папки tools...");
+        QApplication::processEvents();
+        if (mergeMissing(oldToolsPath, newToolsPath)) {
+            logInfo("Missing tools components migrated from old version.");
+        } else {
+            logError("Some tools components could not be migrated; old version is kept.");
+            m_keepOldDir = true;
+        }
     }
+
+    // Модели караоке (старое место models/) и журналы прошлых запусков
+    setStatus("Перенос моделей и журналов...");
+    QApplication::processEvents();
+    migrateFolder("models");
+    migrateFolder("logs");
 
     setProgress(90);
     setStatus("Запуск обновлённого MediaStation...");

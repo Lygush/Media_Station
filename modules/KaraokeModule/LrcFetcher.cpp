@@ -71,22 +71,27 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
     // альбома и длительности нет → lrclib отвечает 400 и текст никогда не
     // находился. В этом случае сразу используем /api/search.
     QByteArray raw;
+    bool offline = false;
     if (!noArtist && !album.trimmed().isEmpty() && durationSec > 0) {
         const QString url = buildUrl(artist, title, album, durationSec);
         qDebug() << "[LrcFetcher] GET" << url;
-        raw = HttpClient::get(url, HttpClient::kTimeoutDefault, cancelled);
+        int status = 0;
+        raw = HttpClient::get(url, HttpClient::kTimeoutDefault, cancelled, &status);
         if (cancelled && cancelled->load())
             return result;
+        offline = (status == 0);   // ответа нет вовсе — сети нет, поиск не поможет
     }
 
-    if (raw.isEmpty()) {
-        // Поиск с повторами: lrclib иногда отвечает 5xx (503)
+    if (raw.isEmpty() && !offline) {
+        // Поиск с повторами: lrclib иногда отвечает 5xx (503). Если ответа нет
+        // совсем (нет интернета), повторять бессмысленно — раньше это стоило
+        // до 6 × 15 с ожидания перед переходом к распознаванию.
         auto search = [&](const QUrlQuery &q) -> QByteArray {
             QUrl url("https://lrclib.net/api/search");
             url.setQuery(q);
             qDebug() << "[LrcFetcher] SEARCH" << url.toString();
             QByteArray found;
-            for (int attempt = 0; attempt < 3 && found.isEmpty(); ++attempt) {
+            for (int attempt = 0; attempt < 3 && found.isEmpty() && !offline; ++attempt) {
                 if (attempt > 0) {
                     qDebug() << "[LrcFetcher] повтор запроса, попытка" << attempt + 1;
                     for (int i = 0; i < 15; ++i) {            // пауза 1.5 с с проверкой отмены
@@ -94,8 +99,11 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
                         QThread::msleep(100);
                     }
                 }
-                found = HttpClient::get(url.toString(), HttpClient::kTimeoutDefault, cancelled);
+                int status = 0;
+                found = HttpClient::get(url.toString(), HttpClient::kTimeoutDefault, cancelled, &status);
                 if (cancelled && cancelled->load()) return {};
+                if (status == 0) offline = true;
+                else if (status < 500) break;          // 4xx повтор не исправит
             }
             return found;
         };
@@ -121,19 +129,42 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
                 return result;
         }
 
+        // ── Выбор варианта ──────────────────────────────────────────────────
+        // У одной песни на lrclib обычно несколько записей (альбомная, live,
+        // remaster, радио-версия). Тайм-коды подходят только к записи той же
+        // длительности. Раньше бралась первая синхронизированная — и при
+        // другой версии текст «уезжал» на секунды.
+        //  1) синхронизированная с длительностью ±3 с — лучший случай;
+        //  2) любая с длительностью ±3 с (текст есть, время — от Whisper);
+        //  3) длительность сильно другая — берём только текст (без времени),
+        //     время слов даст Whisper.
+        //  Если длительность файла неизвестна — как раньше, первая синхронизированная.
+        constexpr double kTol = 3.0;
         const QJsonArray arr = QJsonDocument::fromJson(found).array();
+        auto hasSynced = [](const QJsonObject &o) {
+            return !o.value("syncedLyrics").toString().trimmed().isEmpty();
+        };
+        auto delta = [durationSec](const QJsonObject &o) {
+            return qAbs(o.value("duration").toDouble() - durationSec);
+        };
         QJsonObject best;
+        bool bestTimingOk = false;
+        int  bestRank = -1;   // 3 — синхр. в допуске, 2 — текст в допуске, 1 — вне допуска
         for (const QJsonValue &v : arr) {
             const QJsonObject o = v.toObject();
-            // Предпочитаем синхронизированный текст; при известной длительности —
-            // ближайший по ней вариант
-            const bool synced = !o.value("syncedLyrics").toString().trimmed().isEmpty();
-            const bool bestSynced = !best.value("syncedLyrics").toString().trimmed().isEmpty();
-            if (best.isEmpty() || (synced && !bestSynced)) { best = o; continue; }
-            if (synced == bestSynced && durationSec > 0
-                && qAbs(o.value("duration").toDouble() - durationSec)
-                   < qAbs(best.value("duration").toDouble() - durationSec))
-                best = o;
+            const bool syn   = hasSynced(o);
+            const bool inTol = durationSec <= 0 || delta(o) <= kTol;
+            const int  rank  = inTol ? (syn ? 3 : 2) : 1;
+            if (rank > bestRank
+                || (rank == bestRank && durationSec > 0 && delta(o) < delta(best))) {
+                best = o; bestRank = rank; bestTimingOk = inTol;
+            }
+        }
+        if (!best.isEmpty() && !bestTimingOk && hasSynced(best)) {
+            qDebug() << "[LrcFetcher] ближайший вариант по длительности:"
+                     << best.value("duration").toDouble() << "с против" << durationSec
+                     << "с — тайм-коды не подходят, берём только текст";
+            best.remove("syncedLyrics");
         }
         if (!best.isEmpty())
             raw = QJsonDocument(best).toJson(QJsonDocument::Compact);
@@ -146,6 +177,18 @@ LrcResult LrcFetcher::fetch(const QString          &artist,
         qDebug() << "[LrcFetcher] Пустой ответ (нет сети или трек не найден)";
         result.networkError = true;
         return result;
+    }
+
+    // /api/get вернул запись: проверяем длительность и там
+    {
+        const QJsonObject o = QJsonDocument::fromJson(raw).object();
+        if (durationSec > 0 && o.contains("duration")
+            && qAbs(o.value("duration").toDouble() - durationSec) > 3.0
+            && !o.value("syncedLyrics").toString().trimmed().isEmpty()) {
+            QJsonObject t = o;
+            t.remove("syncedLyrics");
+            raw = QJsonDocument(t).toJson(QJsonDocument::Compact);
+        }
     }
 
     // ── Парсим JSON ───────────────────────────────────────────────────────────

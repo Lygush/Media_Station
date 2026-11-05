@@ -148,13 +148,11 @@ int main(int argc, char *argv[])
     if (mainWindow) {
 #ifdef Q_OS_WIN
         const HWND hwnd = reinterpret_cast<HWND>(mainWindow->winId());
-        // WS_EX_LAYERED нужен AndroidTVModule для прозрачности поверх эмулятора.
-        // TOPMOST здесь НЕ ставим: AndroidTVModule включает его только на время
-        // сессии Android TV, иначе окна запущенных игр оказывались бы под MediaStation.
-        SetWindowLongPtr(hwnd, GWL_EXSTYLE, GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
-        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        // WS_EX_LAYERED (прозрачность поверх эмулятора) AndroidTVModule ставит
+        // сам только на время показа ТВ и снимает после. TOPMOST здесь тоже НЕ
+        // ставим: иначе окна запущенных игр оказывались бы под MediaStation.
         androidTVModule->setMediaStationHwnd(hwnd);
-        qDebug() << "main: main window configured as Layered, HWND =" << hwnd;
+        qDebug() << "main: main window HWND =" << hwnd;
 #endif
     } else {
         qWarning() << "main: failed to get main window for Layered setup";

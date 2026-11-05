@@ -5,6 +5,7 @@
 
 #include "InstallUtils.h"
 #include "tools/AtomicFile.h"
+#include "tools/GameInfoStore.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -244,8 +245,6 @@ void writeGameInfoFile(const QString &gameRootPath,
                        const QString &exePath,
                        const QString &iconPath)
 {
-    const QString infoPath = gameRootPath + "/game_info.json";
-
     QJsonObject obj;
     obj["id"]             = makeFolderGameId(gameRootPath);
     obj["name"]           = title;
@@ -264,24 +263,54 @@ void writeGameInfoFile(const QString &gameRootPath,
     const QString mediaDir = QDir::fromNativeSeparators(gameRootPath) + "/launcher/media";
     QDir().mkpath(mediaDir);
 
-    obj["coverPath"]    = "";
-    obj["backdropPath"] = "";
-    obj["trailerPath"]  = "";
-    obj["mediaFetched"] = false;
+    // Значения по умолчанию для полей, которые потом заполняют GameMediaModule
+    // и GameInfoModule.
+    QJsonObject defaults;
+    defaults["coverPath"]    = "";
+    defaults["backdropPath"] = "";
+    defaults["trailerPath"]  = "";
+    defaults["mediaFetched"] = false;
+    defaults["description"]  = "";
+    defaults["genre"]        = "";
+    defaults["releaseYear"]  = "";
+    defaults["developer"]    = "";
+    defaults["publisher"]    = "";
+    defaults["rating"]       = "";
+    defaults["sysreqMin"]    = "";
+    defaults["sysreqRec"]    = "";
+    defaults["infoFetched"]  = false;
+    defaults["steamAppId"]   = "";   // заполняется GameInfoModule после поиска в Steam
 
-    // ── Метаданные игры (Фаза 3) ─────────────────────────────────────────────
-    obj["description"]  = "";
-    obj["genre"]        = "";
-    obj["releaseYear"]  = "";
-    obj["developer"]    = "";
-    obj["publisher"]    = "";
-    obj["rating"]       = "";
-    obj["sysreqMin"]    = "";
-    obj["sysreqRec"]    = "";
-    obj["infoFetched"]  = false;
-    obj["steamAppId"]   = "";   // заполняется GameInfoModule после поиска в Steam
+    // Переустановка в ту же папку: раньше файл перезаписывался целиком, и уже
+    // скачанные описание, обложки и трейлер терялись. Теперь установочные поля
+    // обновляются, а найденные ранее данные сохраняются (медиа — только если
+    // сами файлы на месте, иначе их нужно скачать заново).
+    const bool ok = GameInfoStore::modify(gameRootPath, [&](QJsonObject &cur) {
+        bool mediaOk = true;
+        for (const QString &k : GameInfoStore::mediaPathKeys()) {
+            const QString stored = cur.value(k).toString();
+            if (stored.isEmpty()) continue;
+            if (!QFile::exists(GameInfoStore::resolve(gameRootPath, stored))) {
+                cur.remove(k);
+                mediaOk = false;
+            }
+        }
+        if (!mediaOk)
+            cur.remove("mediaFetched");
 
-    if (!AtomicFile::writeJson(infoPath, QJsonDocument(obj)))
+        for (auto it = defaults.begin(); it != defaults.end(); ++it)
+            if (!cur.contains(it.key()))
+                cur.insert(it.key(), it.value());
+        for (auto it = obj.begin(); it != obj.end(); ++it) {
+            // Тип ввода, найденный анализатором, не сбрасываем пустым списком
+            if (it.key() == QLatin1String("inputTypes")
+                && !cur.value("inputTypes").toArray().isEmpty())
+                continue;
+            cur.insert(it.key(), it.value());
+        }
+        return true;
+    });
+    if (!ok)
         qWarning() << "InstallUtils::writeGameInfoFile: failed for" << gameRootPath;
 }
 

@@ -113,6 +113,8 @@ private:
     /// Корневая папка кэша для данного трека.
     /// Формат: <appDir>/data/songs/<Artist> - <Title>/
     /// Спецсимволы \ / : * ? " < > | заменяются на _
+    QString fileKey(const QString &filePath) const;   // отпечаток содержимого для ключа кэша
+    mutable QHash<QString, QString> m_fileKeyCache;    // путь|размер|время → отпечаток
     QString songCacheDir(const QString &filePath) const;
 
     /// Метаданные с учётом подтверждённых пользователем названий (overrides).

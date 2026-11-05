@@ -52,6 +52,11 @@ private:
     void launchNew();
     bool copyDirectory(const QString &srcPath, const QString &dstPath);
     bool moveDirectory(const QString &srcPath, const QString &dstPath);
+    // Переносит из srcPath в dstPath только то, чего в dstPath ещё нет
+    // (файлы из нового дистрибутива имеют приоритет). Папки, существующие
+    // в обоих местах, обходятся рекурсивно.
+    bool mergeMissing(const QString &srcPath, const QString &dstPath);
+    void migrateFolder(const QString &name);
 
     // Лог
     void log(const QString &level, const QString &msg);

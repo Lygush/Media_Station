@@ -142,6 +142,14 @@ void AndroidTVModule::loadEmulatorSettings(const AndroidTVProfile &profile)
         screen = getCurrentScreenResolution();
 #endif
         if (screen.width() > 0 && screen.height() > 0) {
+            // Android TV рассчитан на 1080p. На мониторе 1440p/4K эмулятор
+            // рисовал бы в полном разрешении — заметная лишняя нагрузка на
+            // хост (и, как следствие, на звук). Окно растягивается видеокартой.
+            // Пропорции экрана сохраняем, ширину выравниваем до чётной.
+            if (screen.height() > 1080) {
+                const int w = qRound(screen.width() * 1080.0 / screen.height()) & ~1;
+                screen = QSize(w, 1080);
+            }
             m_resolution = QString("%1x%2").arg(screen.width()).arg(screen.height());
             logToEmulatorFile(QString("Resolution '%1' → detected screen resolution %2")
                                   .arg(profile.resolution, m_resolution));
@@ -169,6 +177,7 @@ void AndroidTVModule::loadEmulatorSettings(const AndroidTVProfile &profile)
     m_noSnapshotSave = profile.noSnapshotSave;
     m_dnsServer      = profile.dnsServer;
     m_audioDriver    = profile.audioDriver;
+    m_diagnosticLogcat = profile.diagnosticLogcat;
 
     static const QStringList kValidAudioDrivers = {"dsound", "winaudio"};
     if (!kValidAudioDrivers.contains(m_audioDriver)) {
@@ -924,49 +933,54 @@ void AndroidTVModule::startEmulator()
 
     QProcessEnvironment env = toolsEnvironment();
     env.insert("ANDROID_EMULATOR_RENDERER", "host");
-    env.insert("ANDROID_EMU_MEDIA_DECODER_CUDA_VPX", "1");
+    // ANDROID_EMU_MEDIA_DECODER_CUDA_VPX убран: без NVIDIA бессмыслен, а
+    // нестандартный декодер — лишний источник рывков.
 
-    // Audio timer / DSound latency: только если заданы вручную (int), иначе "auto"
+    // ── Звук ────────────────────────────────────────────────────────────────
+    // Эмулятор собран на QEMU 2.12. Там:
+    //  • QEMU_AUDIO_TIMER_PERIOD — ЧАСТОТА таймера в Гц (по умолчанию 100 Гц =
+    //    10 мс). В профиле хранится период в мс, переводим.
+    //  • QEMU_DSOUND_LATENCY_MILLIS — отступ записи внутри кольцевого буфера
+    //    DirectSound, размер которого задаёт QEMU_DSOUND_BUFSIZE_OUT (по
+    //    умолчанию 16384 байта ≈ 93 мс). Без увеличения буфера большая
+    //    «задержка» после деления по модулю давала запас в несколько мс.
+    // По умолчанию ставим буфер ≈ 370 мс и отступ 60 мс: звук отстаёт на 60 мс
+    // (для ТВ незаметно), зато кратковременные задержки хоста не дают щелчков.
     auto manualInt = [](const QVariant &v, int &out) -> bool {
         if (!v.isValid() || v.isNull()) return false;
-        if (v.typeId() == QMetaType::QString) {
-            bool ok = false;
-            out = v.toString().toInt(&ok);
-            return ok;
-        }
         bool ok = false;
-        out = v.toInt(&ok);
+        out = (v.typeId() == QMetaType::QString) ? v.toString().toInt(&ok) : v.toInt(&ok);
         return ok;
     };
 
-    int audioTimerMs = 0;
-    if (manualInt(profile->audioTimerMs, audioTimerMs) && audioTimerMs > 0) {
-        env.insert("QEMU_AUDIO_TIMER_PERIOD", QString::number(audioTimerMs));
-        logToEmulatorFile(QString("Audio timer override: %1 ms").arg(audioTimerMs));
+    int timerPeriodMs = 0;
+    if (manualInt(profile->audioTimerMs, timerPeriodMs) && timerPeriodMs > 0) {
+        timerPeriodMs = qBound(4, timerPeriodMs, 10);
+        const int hz = qRound(1000.0 / timerPeriodMs);
+        env.insert("QEMU_AUDIO_TIMER_PERIOD", QString::number(hz));
+        logToEmulatorFile(QString("Audio timer: %1 ms (%2 Hz)").arg(timerPeriodMs).arg(hz));
     } else {
-        logToEmulatorFile("Audio timer: auto");
+        logToEmulatorFile("Audio timer: default (10 ms / 100 Hz)");
     }
 
-    int dsoundLatencyMs = 0;
-    if (manualInt(profile->dsoundLatencyMs, dsoundLatencyMs) && dsoundLatencyMs > 0) {
-        env.insert("QEMU_DSOUND_LATENCY_MILLIS", QString::number(dsoundLatencyMs));
-        logToEmulatorFile(QString("DSound latency override: %1 ms").arg(dsoundLatencyMs));
-    } else {
-        logToEmulatorFile("DSound latency: auto");
-    }
+    constexpr int kDsoundBufBytes = 65536;                       // ≈ 371 мс при 44.1 кГц стерео 16 бит
+    constexpr int kDsoundBufMs    = kDsoundBufBytes * 1000 / (44100 * 4);
+    int latencyMs = 60;
+    if (manualInt(profile->dsoundLatencyMs, latencyMs) && latencyMs > 0)
+        latencyMs = qBound(20, latencyMs, kDsoundBufMs * 6 / 10);
+    else
+        latencyMs = 60;
+    env.insert("QEMU_DSOUND_BUFSIZE_OUT",    QString::number(kDsoundBufBytes));
+    env.insert("QEMU_DSOUND_LATENCY_MILLIS", QString::number(latencyMs));
+    logToEmulatorFile(QString("DSound: buffer %1 bytes (~%2 ms), latency %3 ms")
+                          .arg(kDsoundBufBytes).arg(kDsoundBufMs).arg(latencyMs));
 
     logToEmulatorFile("Audio backend: " + m_audioDriver);
 
-#ifdef Q_OS_WIN
-    if (!m_timerResolutionSet) {
-        if (timeBeginPeriod(1) == TIMERR_NOERROR) {
-            m_timerResolutionSet = true;
-            logToEmulatorFile("Timer resolution set to 1 ms (timeBeginPeriod)");
-        } else {
-            logToEmulatorFile("WARNING: timeBeginPeriod(1) failed");
-        }
-    }
-#endif
+    // timeBeginPeriod(1) здесь не вызываем: с Windows 10 2004 разрешение
+    // таймера действует только на вызвавший процесс (MediaStation), эмулятору
+    // оно не помогало. Для процесса эмулятора снимаем ограничения питания в
+    // applyEmulatorProcessPriority().
 
     env.insert("QT_SCALE_FACTOR",             "1");
     env.insert("QT_AUTO_SCREEN_SCALE_FACTOR", "0");
@@ -992,10 +1006,9 @@ void AndroidTVModule::startEmulator()
          << "-accel"      << "on"
          << "-skip-adb-auth"
          << "-no-metrics"
-         << "-audio"      << m_audioDriver
-         << "-feature"    << "GLDirectMem"
-         << "-feature"    << "GLDMA"
-         << "-feature"    << "VulkanNativeSwapchain";
+         << "-audio"      << m_audioDriver;
+    // Экспериментальные -feature GLDirectMem/GLDMA/VulkanNativeSwapchain убраны:
+    // нестандартные режимы рендера — частая причина рывков картинки и звука.
 
     // Часовой пояс хоста (IANA). Время эмулятор и так берёт с хоста, а явный
     // пояс нужен потому, что Windows-имена зон эмулятор распознаёт не всегда.
@@ -1041,80 +1054,10 @@ void AndroidTVModule::startEmulator()
         logImportant(Logger::kLevelInfo, "emulator process started, PID " + QString::number(m_emulatorPid)
                                          + ", waiting for Android to boot");
 
-#ifdef Q_OS_WIN
-        HANDLE hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, static_cast<DWORD>(m_emulatorPid));
-        if (hProc) {
-            if (SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS))
-                logToEmulatorFile("Emulator process priority set to ABOVE_NORMAL");
-            else
-                logToEmulatorFile("WARNING: SetPriorityClass failed, error=" + QString::number(GetLastError()));
-            CloseHandle(hProc);
-        }
-
-        // Через 3 с поднимаем приоритет потоков фактического процесса эмулятора
-        // (emulator.exe перезапускает себя как qemu-system-*.exe; PID уточняется
-        // в WinEvent-хуке / опросе окон).
-        QTimer::singleShot(3000, this, [this]() {
-            if (!m_emulatorPid) return;
-
-            using GetThreadDescFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
-            static auto getThreadDesc = reinterpret_cast<GetThreadDescFn>(
-                reinterpret_cast<void *>(
-                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
-
-            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if (hSnap == INVALID_HANDLE_VALUE) {
-                logToEmulatorFile("WARNING: CreateToolhelp32Snapshot failed for thread boost");
-                return;
-            }
-
-            THREADENTRY32 te = {};
-            te.dwSize = sizeof(te);
-            int boostedNormal = 0;
-            int boostedAudio  = 0;
-
-            if (Thread32First(hSnap, &te)) {
-                do {
-                    if (te.th32OwnerProcessID != static_cast<DWORD>(m_emulatorPid))
-                        continue;
-
-                    HANDLE hThread = OpenThread(
-                        THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
-                        FALSE, te.th32ThreadID);
-                    if (!hThread) continue;
-
-                    bool isAudioThread = false;
-                    if (getThreadDesc) {
-                        PWSTR desc = nullptr;
-                        if (SUCCEEDED(getThreadDesc(hThread, &desc)) && desc) {
-                            const QString name = QString::fromWCharArray(desc);
-                            LocalFree(desc);
-                            if (name.contains(QLatin1String("audio"), Qt::CaseInsensitive) ||
-                                name.contains(QLatin1String("sound"), Qt::CaseInsensitive) ||
-                                name.contains(QLatin1String("winmm"), Qt::CaseInsensitive)) {
-                                isAudioThread = true;
-                                SetThreadPriority(hThread, THREAD_PRIORITY_TIME_CRITICAL);
-                                logToEmulatorFile(
-                                    QString("Audio thread detected: '%1' (TID %2) → TIME_CRITICAL")
-                                        .arg(name).arg(te.th32ThreadID));
-                                ++boostedAudio;
-                            }
-                        }
-                    }
-                    if (!isAudioThread) {
-                        SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
-                        ++boostedNormal;
-                    }
-                    CloseHandle(hThread);
-                } while (Thread32Next(hSnap, &te));
-            }
-            CloseHandle(hSnap);
-
-            logToEmulatorFile(
-                QString("Thread boost complete: %1 × ABOVE_NORMAL, %2 × TIME_CRITICAL (audio)")
-                    .arg(boostedNormal).arg(boostedAudio));
-        });
-#endif
+        // Лаунчер emulator.exe перезапускает себя как qemu-system-*.exe;
+        // настоящий PID приходит позже (WinEvent-хук / опрос окон) и там же
+        // повторно вызывается applyEmulatorProcessPriority.
+        applyEmulatorProcessPriority(m_emulatorPid);
 
         installWinEventHook();
         startWindowPolling();
@@ -1123,6 +1066,63 @@ void AndroidTVModule::startEmulator()
 
     setStatus("Starting emulator...");
     proc->start();
+}
+
+void AndroidTVModule::applyEmulatorProcessPriority(quint64 pid)
+{
+#ifdef Q_OS_WIN
+    if (!pid || pid == m_priorityAppliedPid) return;
+
+    HANDLE h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+                           FALSE, static_cast<DWORD>(pid));
+    if (!h) {
+        logToEmulatorFile(QString("WARNING: OpenProcess(%1) failed for priority, error=%2")
+                              .arg(pid).arg(GetLastError()));
+        return;
+    }
+    m_priorityAppliedPid = pid;
+
+    // Класс приоритета не наследуется дочерним процессом, поэтому выставляем
+    // его именно настоящему qemu, а не лаунчеру. Поток-специфичные приоритеты
+    // (TIME_CRITICAL и т.п.) не трогаем: поиск аудиопотока по имени ни разу
+    // не срабатывал, а чужие потоки с TIME_CRITICAL могут подвесить систему.
+    if (SetPriorityClass(h, ABOVE_NORMAL_PRIORITY_CLASS))
+        logToEmulatorFile(QString("Emulator PID %1 priority → ABOVE_NORMAL").arg(pid));
+    else
+        logToEmulatorFile(QString("WARNING: SetPriorityClass(%1) failed, error=%2")
+                              .arg(pid).arg(GetLastError()));
+
+    // Окно эмулятора лежит под прозрачным окном MediaStation, и Windows
+    // считает процесс фоновым: может включить EcoQoS (E-ядра, сниженная
+    // частота) и игнорировать запросы точного таймера. Явно отказываемся
+    // от этого. Функция есть с Windows 8, нужный класс — с Windows 10 1709;
+    // на старых системах вызов просто вернёт ошибку.
+    struct PowerThrottlingState { ULONG Version; ULONG ControlMask; ULONG StateMask; };
+    using SetProcessInformationFn = BOOL(WINAPI *)(HANDLE, int, LPVOID, DWORD);
+    static const auto setProcInfo = reinterpret_cast<SetProcessInformationFn>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                "SetProcessInformation")));
+    if (setProcInfo) {
+        constexpr int   kProcessPowerThrottling   = 4;      // PROCESS_INFORMATION_CLASS
+        constexpr ULONG kExecutionSpeed           = 0x1;    // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        constexpr ULONG kIgnoreTimerResolution    = 0x4;    // PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        PowerThrottlingState st { 1, kExecutionSpeed | kIgnoreTimerResolution, 0 };
+        if (!setProcInfo(h, kProcessPowerThrottling, &st, sizeof(st))) {
+            // Старые сборки Windows не знают флаг таймера — пробуем без него
+            st.ControlMask = kExecutionSpeed;
+            if (!setProcInfo(h, kProcessPowerThrottling, &st, sizeof(st)))
+                logToEmulatorFile(QString("WARNING: power throttling opt-out failed, error=%1")
+                                      .arg(GetLastError()));
+            else
+                logToEmulatorFile("Emulator power throttling disabled (execution speed)");
+        } else {
+            logToEmulatorFile("Emulator power throttling disabled (execution speed + timer)");
+        }
+    }
+    CloseHandle(h);
+#else
+    Q_UNUSED(pid)
+#endif
 }
 
 void AndroidTVModule::onEmulatorFinished(int exitCode)
@@ -1165,6 +1165,7 @@ void AndroidTVModule::onEmulatorFinished(int exitCode)
     m_emulatorHwnd = nullptr;
 #endif
     m_emulatorPid        = 0;
+    m_priorityAppliedPid = 0;
     m_initialEmulatorPid = 0;
     setEmulatorShown(false);
     setSwitching(false);
@@ -1285,13 +1286,9 @@ void AndroidTVModule::onBootCompleted()
     startHealthCheck();
     if (m_bus) emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("bootCompleted"), {});
 
-    logToEmulatorFile("Setting up ADB reverse port forwarding...");
-    for (const char *port : {"80", "443", "8080", "8443"}) {
-        const QString spec = QStringLiteral("tcp:") + QLatin1String(port);
-        adb({"reverse", spec, spec}, [this, spec](const QString &res) {
-            logToEmulatorFile("adb reverse " + spec + " -> " + res.trimmed());
-        });
-    }
+    // adb reverse tcp:80/443/8080/8443 убран: ничего в программе этими портами
+    // не пользуется, а запросы гостя к localhost:80/443 уходили через adb-туннель
+    // на пустые порты хоста — лишняя работа adbd во время просмотра.
 
     // Блоклист перезапускает adbd (adb root) — logcat стартует после него
     applyBlocklist();
@@ -1352,6 +1349,39 @@ void AndroidTVModule::startHealthCheck()
     });
 
     m_healthCheckTimer->start();
+
+    // ── Метрика звука ─────────────────────────────────────────────────────
+    // Раз в 10 минут спрашиваем AudioFlinger, сколько записей в аудиоустройство
+    // задержалось и сколько было опустошений буфера. Рост этих чисел — это и
+    // есть «заикание»; так его можно сравнивать между настройками, а не на слух.
+    auto *audioStats = new QTimer(m_healthCheckTimer);   // удаляется вместе с ним
+    audioStats->setInterval(10 * 60 * 1000);
+    connect(audioStats, &QTimer::timeout, this, [this]() {
+        if (m_adbUnauthorized) return;
+        adb({"shell", "dumpsys", "media.audio_flinger"}, [this](const QString &out) {
+            static const QRegularExpression kDelayed(QStringLiteral("Delayed writes:\\s*(\\d+)"));
+            static const QRegularExpression kTotal(QStringLiteral("Total writes:\\s*(\\d+)"));
+            static const QRegularExpression kUnder(QStringLiteral("underruns?[=:]\\s*(\\d+)"),
+                                                   QRegularExpression::CaseInsensitiveOption);
+            qint64 delayed = 0, total = 0, under = 0;
+            for (auto it = kDelayed.globalMatch(out); it.hasNext();) delayed += it.next().captured(1).toLongLong();
+            for (auto it = kTotal.globalMatch(out);   it.hasNext();) total   += it.next().captured(1).toLongLong();
+            for (auto it = kUnder.globalMatch(out);   it.hasNext();) under   += it.next().captured(1).toLongLong();
+
+            const qint64 dDelayed = delayed - m_audioDelayedWrites;
+            const qint64 dUnder   = under   - m_audioUnderruns;
+            m_audioDelayedWrites = delayed;
+            m_audioUnderruns     = under;
+            logImportant(Logger::kLevelInfo,
+                         QString("Audio: total writes %1, delayed %2 (+%3), underruns %4 (+%5)")
+                             .arg(total).arg(delayed).arg(qMax<qint64>(0, dDelayed))
+                             .arg(under).arg(qMax<qint64>(0, dUnder)));
+        });
+    });
+    m_audioDelayedWrites = 0;
+    m_audioUnderruns     = 0;
+    audioStats->start();
+
     logToEmulatorFile("Health check started (interval: 30 min, qcow2 limit: "
                       + QString::number(kMaxQcow2SizeMb) + " MB)");
 }
@@ -1540,6 +1570,12 @@ bool AndroidTVModule::resetQcow2()
 void AndroidTVModule::startLogcat()
 {
     if (!m_running) return;
+    // Полный logcat всё время работы ТВ — это постоянная работа adbd в госте,
+    // adb-сервера и GUI-потока программы. Включается в профиле («Диагностика»).
+    if (!m_diagnosticLogcat) {
+        logToEmulatorFile("logcat: off (enable 'Android log' in profile for diagnostics)");
+        return;
+    }
     if (m_logcatProcess && m_logcatProcess->state() != QProcess::NotRunning) {
         logToEmulatorFile("logcat already running");
         return;
@@ -1567,6 +1603,15 @@ void AndroidTVModule::startLogcat()
     connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
         const QByteArray data = proc->readAllStandardOutput();
         if (!data.isEmpty() && m_logcatLogFile.isOpen()) {
+            // Ограничение размера: многочасовая сессия давала сотни МБ
+            constexpr qint64 kMaxLogcatBytes = 64LL * 1024 * 1024;
+            if (m_logcatLogFile.size() > kMaxLogcatBytes) {
+                m_logcatLogStream << "\n=== logcat stopped: file limit 64 MB reached ===\n";
+                m_logcatLogStream.flush();
+                m_logcatLogFile.close();
+                QMetaObject::invokeMethod(this, [this]() { stopLogcat(); }, Qt::QueuedConnection);
+                return;
+            }
             m_logcatLogStream << QString::fromUtf8(data);
             m_logcatLogStream.flush();
         }

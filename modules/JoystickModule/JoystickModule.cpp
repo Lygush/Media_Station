@@ -87,6 +87,16 @@ void JoystickModule::initialize(EventBus *bus, SettingsManager *)
 
     connect(bus, &EventBus::moduleEvent, this,
             [this](const QString &mod, const QString &ev, const QVariantMap &data) {
+                // Android TV на экране: панель геймпадов не видна, а каждый опрос —
+                // несколько запусков DS4WindowsCmd.exe, которые отнимают процессор
+                // у эмулятора (одна из причин рывков звука)
+                if (mod == QLatin1String("androidtv")) {
+                    if (ev == QLatin1String("shown"))
+                        m_androidTvShown = data.value("shown").toBool();
+                    else if (ev == QLatin1String("emulatorClosed") || ev == QLatin1String("launchFailed"))
+                        m_androidTvShown = false;
+                    return;
+                }
                 if (mod != "game") return;
                 if (ev == "inputType")
                     onGameInputType(data["inputTypes"].toStringList());
@@ -485,7 +495,7 @@ void JoystickModule::onPollTimer()
     if (m_pollWatcher && m_pollWatcher->isRunning()) return;
     // Пока идёт игра, панель геймпадов не видна, а каждый опрос — это 4+
     // запуска DS4WindowsCmd.exe (.NET) раз в 5 с, отнимающих процессор у игры
-    if (m_gameRunning) return;
+    if (m_gameRunning || m_androidTvShown) return;
 
     m_pollWatcher = new QFutureWatcher<QList<ControllerInfo>>(this);
     connect(m_pollWatcher, &QFutureWatcher<QList<ControllerInfo>>::finished,

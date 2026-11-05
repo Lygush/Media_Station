@@ -99,6 +99,7 @@ private:
     bool  m_ds4Running = false;
     bool  m_activated  = false;
     bool  m_gameRunning = false;   ///< игра на экране — опрос DS4Windows приостановлен
+    bool  m_androidTvShown = false; ///< Android TV на экране — опрос тоже на паузе
     std::atomic<bool> m_weStartedDs4 { false };
     std::atomic<bool> m_stopping     { false };   ///< true после shutdown(): фоновые задачи обязаны быстро выйти
 

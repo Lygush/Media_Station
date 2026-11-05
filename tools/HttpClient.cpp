@@ -18,6 +18,13 @@ const char *kUserAgent =
 
 QByteArray get(const QString &url, int timeoutMs, const std::atomic<bool> *cancelled)
 {
+    return get(url, timeoutMs, cancelled, nullptr);
+}
+
+QByteArray get(const QString &url, int timeoutMs, const std::atomic<bool> *cancelled,
+               int *httpStatus)
+{
+    if (httpStatus) *httpStatus = 0;
     // Проверяем флаг отмены до отправки запроса
     if (cancelled && cancelled->load())
         return {};
@@ -78,10 +85,14 @@ QByteArray get(const QString &url, int timeoutMs, const std::atomic<bool> *cance
         // Таймаут — не логируем как ошибку, это штатная ситуация
         qDebug() << "HttpClient: timeout after" << timeoutMs << "ms for" << url;
     } else if (reply->error() != QNetworkReply::NoError) {
+        // HTTP 404/5xx тоже приходят как ошибка, но с кодом ответа сервера
+        if (httpStatus)
+            *httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         qWarning() << "HttpClient: error" << reply->errorString() << "for" << url;
     } else {
         const int statusCode =
             reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (httpStatus) *httpStatus = statusCode;
         if (statusCode == 200) {
             data = reply->readAll();
         } else {

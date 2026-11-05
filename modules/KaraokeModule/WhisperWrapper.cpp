@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QHash>
 #include <QDebug>
 #include <QThread>
 #include <QElapsedTimer>
@@ -80,13 +82,43 @@ bool WhisperWrapper::load(const QString &dllDir, const QString &modelPath)
     }
 
     whisper_context_params cparams = m_fnDefCtxParams();
-    qDebug() << "[WhisperWrapper] Загружаем модель:" << modelPath;
+
+    // Время слов по DTW (выравнивание по вниманию модели) заметно точнее
+    // обычных token_timestamps, которые на пении «плывут» на сотни мс.
+    // Набор «голов выравнивания» свой у каждой модели — выбираем по имени
+    // файла; при несовпадении DTW даёт мусор, поэтому для неизвестных
+    // моделей его не включаем. С flash attention DTW в whisper.cpp не работает.
+    const QString modelName = QFileInfo(modelPath).fileName().toLower();
+    whisper_alignment_heads_preset preset = WHISPER_AHEADS_NONE;
+    if (modelName.contains("large-v3-turbo") || modelName.contains("large-v3_turbo"))
+        preset = WHISPER_AHEADS_LARGE_V3_TURBO;
+    else if (modelName.contains("large-v3"))
+        preset = WHISPER_AHEADS_LARGE_V3;
+    else if (modelName.contains("large-v2"))
+        preset = WHISPER_AHEADS_LARGE_V2;
+    else if (modelName.contains("medium") && !modelName.contains(".en"))
+        preset = WHISPER_AHEADS_MEDIUM;
+    if (preset != WHISPER_AHEADS_NONE) {
+        cparams.dtw_token_timestamps = true;
+        cparams.dtw_aheads_preset    = preset;
+        cparams.flash_attn           = false;
+    }
+
+    qDebug() << "[WhisperWrapper] Загружаем модель:" << modelPath
+             << "| DTW:" << (preset != WHISPER_AHEADS_NONE);
     m_ctx = m_fnInit(modelPath.toUtf8().constData(), cparams);
     if (!m_ctx) {
         qWarning() << "[WhisperWrapper] GPU failed, trying CPU";
         cparams.use_gpu = false;
         m_ctx = m_fnInit(modelPath.toUtf8().constData(), cparams);
     }
+    if (!m_ctx && cparams.dtw_token_timestamps) {
+        qWarning() << "[WhisperWrapper] init with DTW failed, retry without DTW";
+        cparams.dtw_token_timestamps = false;
+        cparams.dtw_aheads_preset    = WHISPER_AHEADS_NONE;
+        m_ctx = m_fnInit(modelPath.toUtf8().constData(), cparams);
+    }
+    m_dtw = m_ctx && cparams.dtw_token_timestamps;
     if (!m_ctx) {
         m_lastError = "Не удалось инициализировать контекст";
         qCritical() << "[WhisperWrapper]" << m_lastError;
@@ -163,21 +195,22 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         return result;
     }
 
-    // Самый длинный участок — первым: по нему определяем язык для всей песни
-    std::vector<size_t> order(vad.regions.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    {
-        size_t longest = 0;
-        for (size_t i = 1; i < vad.regions.size(); ++i)
-            if (vad.regions[i].end - vad.regions[i].start
-                > vad.regions[longest].end - vad.regions[longest].start) longest = i;
-        std::swap(order[0], order[longest]);
-    }
+    // Порядок обработки: сначала до трёх самых длинных участков — по ним
+    // голосованием определяем язык всей песни. Раньше язык брался по одному
+    // самому длинному участку, и если там был, например, английский припев
+    // в русской песне — вся песня распознавалась как английская.
+    const int nRegions = int(vad.regions.size());
+    std::vector<int> order(nRegions);
+    for (int i = 0; i < nRegions; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return vad.regions[a].end - vad.regions[a].start > vad.regions[b].end - vad.regions[b].start;
+    });
+    const int kVote = qMin(3, nRegions);
+    std::sort(order.begin() + kVote, order.end());   // остальные — по времени
 
-    QByteArray langCode = "auto";
     const QByteArray promptBytes = initialPrompt.toUtf8();
 
-    auto makeParams = [&]() {
+    auto makeParams = [&](const QByteArray &lang) {
         whisper_full_params params = m_fnFullParams(WHISPER_SAMPLING_BEAM_SEARCH);
         params.n_threads             = qMin(4, QThread::idealThreadCount());
         params.translate             = false;
@@ -192,11 +225,10 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         params.no_timestamps         = false;
         params.token_timestamps      = true;
         params.suppress_nst          = true;     // ♪ и прочие не-речевые токены
-        // "auto" только на первом участке, дальше язык фиксируется
         // Словарь слов песни (из lrclib) — Whisper точнее на редких словах
         if (!promptBytes.isEmpty())
             params.initial_prompt    = promptBytes.constData();
-        params.language              = langCode.constData();
+        params.language              = lang.constData();   // "auto" — определить
         params.detect_language       = false;
         params.beam_search.beam_size = 5;
         params.greedy.best_of        = 5;
@@ -212,18 +244,31 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         return params;
     };
 
-    // Фильтр галлюцинаций — список типичных повторяющихся фраз
-    static const QStringList hallucinations = {
-        "продолжение следует", "субтитр", "titres", "перевод", "редактор",
-        "thanks for watching", "amara.org",
-        "создавал", "dimatorzok", "семкин", "егоров", "корректор"
+    // Фильтр галлюцинаций: целые ФРАЗЫ из титров/субтитров, которые Whisper
+    // выдумывает на тишине и проигрышах. Проверяется текст всего сегмента.
+    // Раньше проверялось вхождение подстроки в каждое слово, и вместе с
+    // мусором выкидывались настоящие слова песни («перевод», «создавал»).
+    static const QStringList kHallucinationPhrases = {
+        "продолжение следует", "субтитры сделал", "субтитры создавал",
+        "субтитры подготовил", "редактор субтитров", "корректор а.",
+        "а.семкин", "а.егорова", "dimatorzok", "amara.org",
+        "thanks for watching", "thank you for watching",
+        "спасибо за просмотр", "подписывайтесь на канал",
+        "sous-titres", "sous-titrage"
+    };
+
+    struct RegionOut {
+        QVector<WhisperWord> words;
+        QByteArray           lang;
+        bool                 ok = false;
     };
 
     TranscribeCallbackData cbData;
-    const int nRegions = int(order.size());
 
-    for (int k = 0; k < nRegions; ++k) {
-        const VoiceActivity::Region &rg = vad.regions[order[k]];
+    // Распознаёт один участок с заданным языком ("auto" — определить)
+    auto runRegion = [&](int k, int regionIdx, const QByteArray &lang) -> RegionOut {
+        RegionOut out;
+        const VoiceActivity::Region &rg = vad.regions[regionIdx];
         const qint64 offsetMs = qint64(rg.start) * 1000 / 16000;
 
         // Копия участка; whisper не принимает аудио короче ~1 с — добиваем тишиной
@@ -237,11 +282,11 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         cbData.cb = nullptr;
         if (progressCb) {
             cbData.cb = [&, k](int p) -> bool {
-                return progressCb((k * 100 + p) / nRegions);
+                return progressCb(qMin(99, (k * 100 + p) / nRegions));
             };
         }
 
-        whisper_full_params params = makeParams();
+        whisper_full_params params = makeParams(lang);
         if (progressCb) {
             params.progress_callback           = progressCallback;
             params.progress_callback_user_data = &cbData;
@@ -250,28 +295,22 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
         }
 
         const int ret = m_fnFull(m_ctx, params, buf.data(), int(buf.size()));
-        if (cbData.cancelled) { result.error = "Отменено"; return result; }
+        if (cbData.cancelled) return out;
         if (ret != 0) {
             qWarning() << "[WhisperWrapper] участок" << k << "whisper_full вернул" << ret;
-            continue;                      // один плохой участок не должен убивать всю песню
+            return out;                    // один плохой участок не должен убивать всю песню
         }
+        out.ok = true;
+        const int langId = m_fnLangId(m_ctx);
+        if (langId >= 0 && m_fnLangStr)
+            out.lang = QByteArray(m_fnLangStr(langId));
 
-        // Язык определяем по самому длинному участку и дальше не меняем
-        if (k == 0) {
-            const int langId = m_fnLangId(m_ctx);
-            if (langId >= 0 && m_fnLangStr) {
-                langCode        = QByteArray(m_fnLangStr(langId));
-                result.language = QString::fromUtf8(langCode);
-                qDebug() << "[WhisperWrapper] язык песни:" << result.language;
-            }
-        }
-
-        // ── Читаем сегменты и группируем токены в слова ──────────────────────
+        // ── Сегменты → слова ─────────────────────────────────────────────────
         // Токен с ведущим пробелом = начало нового слова.
-        const int wordsBefore = result.words.size();
         const int nSeg = m_fnNSegments(m_ctx);
         for (int sIdx = 0; sIdx < nSeg; ++sIdx) {
             const int nTok = m_fnNTokens(m_ctx, sIdx);
+            QVector<WhisperWord> segWords;
 
             // Слово собираем в БАЙТАХ: токен BPE может содержать половину UTF-8
             // символа (кириллица), и пословное декодирование давало «�».
@@ -284,10 +323,6 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
                 curWord.clear();
                 if (w.isEmpty()) return;
 
-                const QString wLow = w.toLower();
-                for (const QString &h : hallucinations)
-                    if (wLow.contains(h)) return;
-
                 const qint64 t0 = offsetMs + curT0;
                 const qint64 t1 = qMax(t0, offsetMs + curT1);
                 // Слово там, где вокала нет (±150 мс) — галлюцинация
@@ -298,7 +333,7 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
                 ww.t0_ms = t0;
                 ww.t1_ms = t1;
                 ww.prob  = 1.0f;
-                result.words.append(ww);
+                segWords.append(ww);
             };
 
             for (int t = 0; t < nTok; ++t) {
@@ -315,22 +350,83 @@ TranscriptResult WhisperWrapper::transcribe(const QString &wav16kPath,
                 if (tok.startsWith(' ') && !curWord.isEmpty())
                     flushWord();
 
-                if (curWord.isEmpty()) curT0 = qint64(td.t0) * 10;
+                if (curWord.isEmpty()) {
+                    // DTW даёт момент начала токена точнее, чем t0
+                    curT0 = (m_dtw && td.t_dtw >= 0) ? qint64(td.t_dtw) * 10
+                                                     : qint64(td.t0) * 10;
+                }
                 curT1 = qint64(td.t1) * 10;
                 curWord += tok.trimmed();
             }
             flushWord();
+
+            // DTW-начало следующего слова — естественный конец предыдущего
+            if (m_dtw) {
+                for (int i = 0; i + 1 < segWords.size(); ++i)
+                    if (segWords[i + 1].t0_ms > segWords[i].t0_ms)
+                        segWords[i].t1_ms = qMin(segWords[i].t1_ms, segWords[i + 1].t0_ms);
+                for (auto &w : segWords)
+                    w.t1_ms = qMax(w.t1_ms, w.t0_ms + 80);
+            }
+
+            // Фраза из титров — отбрасываем сегмент целиком
+            QString segText;
+            for (const auto &w : segWords) segText += w.text.toLower() + QLatin1Char(' ');
+            bool junk = false;
+            for (const QString &h : kHallucinationPhrases)
+                if (segText.contains(h)) { junk = true; break; }
+            if (junk) {
+                qDebug() << "[WhisperWrapper] сегмент-галлюцинация отброшен:" << segText.trimmed();
+                continue;
+            }
+            out.words += segWords;
         }
+
         // Очень короткий участок с 1–2 словами — почти всегда галлюцинация Whisper
         // на остатках звука («ПЕСНЯ», «субтитров», «Thank you» в конце трека)
-        if (result.words.size() - wordsBefore <= 2
-            && (rg.end - rg.start) < 16000 * 4) {
+        if (out.words.size() <= 2 && (rg.end - rg.start) < 16000 * 4) {
             qDebug() << "[WhisperWrapper] участок" << k + 1 << "отброшен как галлюцинация";
-            result.words.resize(wordsBefore);
-            continue;
+            out.words.clear();
         }
+        return out;
+    };
+
+    // ── Голосование за язык ───────────────────────────────────────────────────
+    QVector<RegionOut> voteOut(kVote);
+    QHash<QByteArray, qint64> langWeight;        // язык → суммарная длительность
+    for (int k = 0; k < kVote; ++k) {
+        voteOut[k] = runRegion(k, order[k], "auto");
+        if (cbData.cancelled) { result.error = "Отменено"; return result; }
+        const auto &rg = vad.regions[order[k]];
+        if (voteOut[k].ok && !voteOut[k].lang.isEmpty())
+            langWeight[voteOut[k].lang] += rg.end - rg.start;
+    }
+    QByteArray langCode = "auto";
+    for (auto it = langWeight.constBegin(); it != langWeight.constEnd(); ++it)
+        if (langCode == "auto" || it.value() > langWeight.value(langCode))
+            langCode = it.key();
+    result.language = langCode == "auto" ? QStringLiteral("unknown") : QString::fromUtf8(langCode);
+    qDebug() << "[WhisperWrapper] язык песни:" << result.language << "| голоса:" << langWeight;
+
+    // Участки голосования, распознанные на другом языке, — переделываем
+    for (int k = 0; k < kVote; ++k) {
+        if (voteOut[k].ok && langCode != "auto" && voteOut[k].lang != langCode) {
+            qDebug() << "[WhisperWrapper] участок" << k + 1 << "распознан как" << voteOut[k].lang
+                     << "— повтор на" << langCode;
+            voteOut[k] = runRegion(k, order[k], langCode);
+            if (cbData.cancelled) { result.error = "Отменено"; return result; }
+        }
+        result.words += voteOut[k].words;
+    }
+
+    // ── Остальные участки — с найденным языком ───────────────────────────────
+    for (int k = kVote; k < nRegions; ++k) {
+        const RegionOut ro = runRegion(k, order[k], langCode);
+        if (cbData.cancelled) { result.error = "Отменено"; return result; }
+        result.words += ro.words;
         qDebug() << "[WhisperWrapper] участок" << k + 1 << "/" << nRegions
-                 << "(" << offsetMs / 1000 << "с ) | слов всего:" << result.words.size();
+                 << "(" << qint64(vad.regions[order[k]].start) / 16000 << "с ) | слов всего:"
+                 << result.words.size();
     }
 
     // Участки обрабатывались не по порядку времени

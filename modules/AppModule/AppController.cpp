@@ -25,6 +25,17 @@ AppController::AppController(QObject *parent)
     , m_taskbarWatchdog(new QTimer(this))
     , m_windowLostFallback(new QTimer(this))
 {
+#ifdef Q_OS_WIN
+    // Если прошлый запуск упал во время игры, панель задач осталась скрытой
+    // (её прячет showBlackOverlay). Возвращаем её при старте.
+    for (const wchar_t *cls : { L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd" }) {
+        if (HWND h = FindWindowW(cls, nullptr); h && !IsWindowVisible(h)) {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            qWarning() << "AppController: taskbar was hidden at startup — restored";
+        }
+    }
+#endif
+
     // ── Watchdog: последний рубеж восстановления taskbar ──────────────────────
     m_taskbarWatchdog->setSingleShot(true);
     m_taskbarWatchdog->setInterval(kWatchdogMs);

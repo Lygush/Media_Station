@@ -73,16 +73,30 @@ Item {
 
         var rawLines = text.split("\n")
         var metaRe   = /^\[(ti|ar|al|by|offset|length|re|ve):/
+        var offsetRe = /^\[offset:\s*([+-]?\d+)\s*\]/
         var result   = []
+        // [offset:N] — сдвиг всего текста в мс (по стандарту LRC «+» = раньше).
+        // Его пишут редакторы LRC и проверка синхронизации в KaraokeWorker.
+        var offsetMs = 0
 
         for (var i = 0; i < rawLines.length; i++) {
             var line = rawLines[i].trim()
-            if (line === "" || metaRe.test(line)) continue
+            if (line === "") continue
+            var om = line.match(offsetRe)
+            if (om) { offsetMs = parseInt(om[1]); continue }
+            if (metaRe.test(line)) continue
 
-            var ts = parseTimestamp(line)
-            if (ts < 0) continue
-
-            var rest = line.replace(/^\[\d+:\d+\.\d+\]/, "").trim()
+            // Повторяющаяся строка может иметь несколько меток подряд:
+            // [00:12.34][00:45.67] текст — это одна строка в двух местах песни
+            var stamps = []
+            var head = line
+            var lead
+            while ((lead = head.match(/^\[(\d+:\d+\.\d+)\]/)) !== null) {
+                stamps.push(parseTimestamp("[" + lead[1] + "]"))
+                head = head.substring(lead[0].length)
+            }
+            if (stamps.length === 0) continue
+            var rest = head.trim()
 
             // Inline тайм-коды
             var words = []
@@ -99,7 +113,22 @@ Item {
                 ? words.map(function(w){ return w.text }).join(" ")
                 : rest
 
-            result.push({ startMs: ts, text: plainText, words: words })
+            for (var si = 0; si < stamps.length; si++) {
+                var shift = stamps[si] - stamps[0]   // слова повтора сдвигаются вместе со строкой
+                result.push({
+                    startMs: stamps[si],
+                    text: plainText,
+                    words: words.map(function(w) { return { startMs: w.startMs + shift, text: w.text } })
+                })
+            }
+        }
+
+        if (offsetMs !== 0) {
+            for (var oi = 0; oi < result.length; oi++) {
+                result[oi].startMs = Math.max(0, result[oi].startMs - offsetMs)
+                for (var wi = 0; wi < result[oi].words.length; wi++)
+                    result[oi].words[wi].startMs = Math.max(0, result[oi].words[wi].startMs - offsetMs)
+            }
         }
 
         result.sort(function(a, b){ return a.startMs - b.startMs })
@@ -147,12 +176,15 @@ Item {
         if (!line.words || line.words.length === 0)
             return escHtml(line.text || "")
         var accent = hexColor(Settings.accent(1.0))
+        // Текущее слово выделяется только цветом (ярче спетых). Жирный шрифт
+        // менял ширину слова, и строка «прыгала» при переносе.
+        var current = hexColor(Qt.lighter(Settings.accent(1.0), 1.45))
         var out = []
         for (var i = 0; i < line.words.length; i++) {
             var w = escHtml(line.words[i].text)
             if (activeIdx < 0)           out.push(w)
             else if (i < activeIdx)      out.push('<font color="' + accent + '">' + w + '</font>')
-            else if (i === activeIdx)    out.push('<b><font color="' + accent + '">' + w + '</font></b>')
+            else if (i === activeIdx)    out.push('<font color="' + current + '">' + w + '</font>')
             else                         out.push(w)
         }
         return out.join(" ")
@@ -251,11 +283,27 @@ Item {
         sourceComponent: QtObject {
             property MediaPlayer vocals: MediaPlayer {
                 audioOutput: AudioOutput { volume: 0.6; muted: !root.vocalsOn }
-                onPositionChanged: root.updateLyrics(position)
             }
+            // «Минус» слышно всегда — текст идёт по нему. Раньше текст шёл по
+            // дорожке вокала, а два плеера со временем расходились, и строки
+            // отставали или спешили относительно музыки.
             property MediaPlayer instr: MediaPlayer {
                 audioOutput: AudioOutput { volume: 1.0 }
+                onPositionChanged: root.updateLyrics(position)
             }
+        }
+    }
+
+    // Два независимых плеера накапливают рассинхрон (разные буферы вывода).
+    // Раз в 2 с подтягиваем вокал к «минусу», если разошлись больше чем на 80 мс.
+    Timer {
+        interval: 2000; repeat: true
+        running: root.vPlaying
+        onTriggered: {
+            if (!root.vocalsPlayer || !root.instrPlayer) return
+            var drift = root.vocalsPlayer.position - root.instrPlayer.position
+            if (Math.abs(drift) > 80)
+                root.vocalsPlayer.position = root.instrPlayer.position
         }
     }
     readonly property var vocalsPlayer: playersLoader.item ? playersLoader.item.vocals : null

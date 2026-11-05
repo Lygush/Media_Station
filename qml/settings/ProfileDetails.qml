@@ -184,18 +184,20 @@ Column {
                 visible: audioTimerSwitch.checked
                 opacity: audioTimerSwitch.checked ? 1.0 : 0.0
                 Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
-                value:    typeof root.profileData.audioTimerMs === "number" ? root.profileData.audioTimerMs : 100
-                minValue: 10; maxValue: 500; step: 10
+                // Период в мс; в эмулятор уходит как частота (1000 / мс Гц).
+                // 10 мс — значение QEMU по умолчанию, меньше — чаще будит звук.
+                value:    typeof root.profileData.audioTimerMs === "number" ? root.profileData.audioTimerMs : 10
+                minValue: 4; maxValue: 10; step: 1
                 displaySuffix: " ms"
                 onDecremented: {
                     var cur = root.profileData.audioTimerMs
                     if (typeof cur !== "number") return
-                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", Math.max(10, cur - 10))
+                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", Math.max(4, cur - 1))
                 }
                 onIncremented: {
                     var cur = root.profileData.audioTimerMs
                     if (typeof cur !== "number") return
-                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", Math.min(500, cur + 10))
+                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", Math.min(10, cur + 1))
                 }
             }
             ToggleSwitch {
@@ -208,7 +210,7 @@ Column {
                     // Не присваиваем checked напрямую — это рвёт биндинг, и при
                     // переключении профиля переключатель показывал чужое значение
                     var enable = !audioTimerSwitch.checked
-                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", enable ? 100 : "auto")
+                    root.saveAndRefresh(root.currentProfileId, "audioTimerMs", enable ? 10 : "auto")
                 }
             }
         }
@@ -224,18 +226,20 @@ Column {
                 visible: dsoundLatencySwitch.checked
                 opacity: dsoundLatencySwitch.checked ? 1.0 : 0.0
                 Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
-                value:    typeof root.profileData.dsoundLatencyMs === "number" ? root.profileData.dsoundLatencyMs : 200
-                minValue: 50; maxValue: 1000; step: 25
+                // Запас звука в буфере (буфер ≈ 370 мс). Больше — меньше щелчков,
+                // но звук сильнее отстаёт от картинки. Авто = 60 мс.
+                value:    typeof root.profileData.dsoundLatencyMs === "number" ? root.profileData.dsoundLatencyMs : 60
+                minValue: 20; maxValue: 200; step: 10
                 displaySuffix: " ms"
                 onDecremented: {
                     var cur = root.profileData.dsoundLatencyMs
                     if (typeof cur !== "number") return
-                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", Math.max(50, cur - 25))
+                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", Math.max(20, cur - 10))
                 }
                 onIncremented: {
                     var cur = root.profileData.dsoundLatencyMs
                     if (typeof cur !== "number") return
-                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", Math.min(1000, cur + 25))
+                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", Math.min(200, cur + 10))
                 }
             }
             ToggleSwitch {
@@ -246,9 +250,20 @@ Column {
                 }
                 onToggled: {
                     var enable = !dsoundLatencySwitch.checked
-                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", enable ? 200 : "auto")
+                    root.saveAndRefresh(root.currentProfileId, "dsoundLatencyMs", enable ? 60 : "auto")
                 }
             }
+        }
+    }
+    SectionDivider {}
+
+    // ── Журнал Android (диагностика) ───────────────────────────────────────────
+    SettingsRow {
+        label: Settings.safeTr("android_logcat")
+        ToggleSwitch {
+            checked: root.profileData.diagnosticLogcat === true
+            onToggled: root.saveAndRefresh(root.currentProfileId, "diagnosticLogcat",
+                                           !(root.profileData.diagnosticLogcat === true))
         }
     }
     SectionDivider {}
