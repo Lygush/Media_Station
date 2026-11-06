@@ -68,7 +68,8 @@ Result compress(const QString          &workDir,
                 const QString          &source,
                 const QString          &archivePath,
                 const std::atomic<bool> *cancelFlag  = nullptr,
-                ProgressFn              onProgress   = nullptr);
+                ProgressFn              onProgress   = nullptr,
+                int                     level        = 3);   // -mx: 0 (без сжатия) … 9
 
 /// Разархивирует .7z файл в указанную директорию.
 ///

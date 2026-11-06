@@ -14,9 +14,11 @@
 #include <QDir>
 #include <QQmlEngine>
 #include <QDebug>
+#include <QProcess>
 
 #ifdef Q_OS_WIN
 #  include <windows.h>
+#  include <powrprof.h>   // SetSuspendState
 #endif
 
 AppController::AppController(QObject *parent)
@@ -216,6 +218,71 @@ void AppController::hideBlackOverlay()
 void AppController::quitApplication() const
 {
     QGuiApplication::quit();
+}
+
+// ── Питание ──────────────────────────────────────────────────────────────────
+
+namespace {
+enum class PendingPower { None, Shutdown, Restart };
+PendingPower g_pendingPower = PendingPower::None;
+
+#ifdef Q_OS_WIN
+// ExitWindowsEx требует привилегию SE_SHUTDOWN_NAME в токене процесса.
+// У обычного пользователя она есть, но выключена — включаем.
+bool enableShutdownPrivilege()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const bool ok = LookupPrivilegeValueW(nullptr, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid)
+                    && AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr)
+                    && GetLastError() == ERROR_SUCCESS;
+    CloseHandle(token);
+    return ok;
+}
+#endif
+} // namespace
+
+void AppController::powerAction(const QString &action)
+{
+    qInfo() << "[AppController] power action:" << action;
+    if (action == QLatin1String("sleep")) {
+#ifdef Q_OS_WIN
+        // SetSuspendState(hibernate=FALSE, force=FALSE, wakeupEventsDisabled=FALSE)
+        if (!SetSuspendState(FALSE, FALSE, FALSE))
+            qWarning() << "[AppController] SetSuspendState failed, error" << GetLastError();
+#endif
+        return;
+    }
+    if (action == QLatin1String("shutdown"))      g_pendingPower = PendingPower::Shutdown;
+    else if (action == QLatin1String("restart"))  g_pendingPower = PendingPower::Restart;
+    else { qWarning() << "[AppController] unknown power action" << action; return; }
+
+    // Сначала обычный выход: main() завершит модули (эмулятор — через
+    // `emu kill`, DS4Windows, хуки) и только потом выключит компьютер.
+    QGuiApplication::quit();
+}
+
+/*static*/ void AppController::executePendingPowerAction()
+{
+    if (g_pendingPower == PendingPower::None) return;
+#ifdef Q_OS_WIN
+    const bool restart = (g_pendingPower == PendingPower::Restart);
+    const UINT flags = restart ? EWX_REBOOT : (EWX_SHUTDOWN | EWX_POWEROFF);
+    if (enableShutdownPrivilege()
+        && ExitWindowsEx(flags, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER
+                                | SHTDN_REASON_FLAG_PLANNED))
+        return;
+    qWarning() << "[AppController] ExitWindowsEx failed, error" << GetLastError()
+               << "- trying shutdown.exe";
+    QProcess::startDetached(QStringLiteral("shutdown.exe"),
+                            {restart ? QStringLiteral("/r") : QStringLiteral("/s"),
+                             QStringLiteral("/t"), QStringLiteral("0")});
+#endif
 }
 
 void AppController::shutdown()

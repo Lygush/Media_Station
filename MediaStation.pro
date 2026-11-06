@@ -1,6 +1,24 @@
 # ==================== Основная конфигурация ====================
 QT += core quick gui concurrent network multimedia
+QT += gui-private   # QWindowSystemInterface (RemoteNavigator: щелчок по OK)
 CONFIG += c++20
+
+# ==================== Версия ====================
+# Единственный источник версии — файл app_version.txt в корне репозитория.
+# Не называть его VERSION: на Windows (регистр не важен) он перекрывает
+# стандартный заголовок C++20 <version> — INCLUDEPATH содержит ".".
+# Из него: макрос MEDIASTATION_VERSION (Version.h) и ресурс VERSIONINFO
+# в MediaStation.exe (Свойства → Подробно). Сервер читает версию из exe.
+# QMAKE_INTERNAL_INCLUDED_FILES: при изменении app_version.txt qmake перезапустится сам.
+APP_VERSION = $$cat($$PWD/app_version.txt)
+APP_VERSION = $$first(APP_VERSION)
+isEmpty(APP_VERSION): APP_VERSION = 0.0.0
+VERSION = $$APP_VERSION
+QMAKE_INTERNAL_INCLUDED_FILES += $$PWD/app_version.txt
+DEFINES += MEDIASTATION_VERSION=\\\"$$APP_VERSION\\\"
+QMAKE_TARGET_PRODUCT     = MediaStation
+QMAKE_TARGET_DESCRIPTION = MediaStation
+QMAKE_TARGET_COPYRIGHT   = MediaStation
 
 # Раскомментировать для тестирования уведомлений:
 # DEFINES += DEBUG_NOTIFICATIONS
@@ -52,6 +70,7 @@ SOURCES += \
     modules/AirMouseModule/G72BatteryModule.cpp             \
     modules/AirMouseModule/G72KeysModule.cpp                \
     modules/AppModule/AppController.cpp                     \
+    modules/AppModule/RemoteNavigator.cpp                   \
     modules/AppModule/GameWatcher.cpp                       \
     modules/GameInfoModule/GameInfoFetcher.cpp              \
     modules/GameInfoModule/GameInfoModule.cpp               \
@@ -81,7 +100,6 @@ SOURCES += \
     modules/KaraokeModule/LrcBuilder.cpp                    \
     modules/KaraokeModule/LyricsAligner.cpp                 \
     modules/KaraokeModule/SongNameResolver.cpp              \
-    modules/KaraokeModule/LrcParser.cpp                     \
     modules/KaraokeModule/WhisperWrapper.cpp                \
     modules/KaraokeModule/kiss/kiss_fft.c                        \
     modules/KaraokeModule/kiss/kiss_fftr.c
@@ -101,6 +119,7 @@ HEADERS += \
     modules/AirMouseModule/G72BatteryModule.h               \
     modules/AirMouseModule/G72KeysModule.h                  \
     modules/AppModule/AppController.h                       \
+    modules/AppModule/RemoteNavigator.h                     \
     modules/AppModule/GameWatcher.h                         \
     modules/GameInfoModule/GameInfoFetcher.h                \
     modules/GameInfoModule/GameInfoModule.h                 \
@@ -131,7 +150,6 @@ HEADERS += \
     modules/KaraokeModule/LrcBuilder.h                      \
     modules/KaraokeModule/LyricsAligner.h                   \
     modules/KaraokeModule/SongNameResolver.h                \
-    modules/KaraokeModule/LrcParser.h                       \
     modules/KaraokeModule/WhisperWrapper.h                  \
     modules/KaraokeModule/kiss/kiss_fft.h                        \
     modules/KaraokeModule/kiss/kiss_fftr.h                       \
@@ -158,6 +176,7 @@ win32: CONFIG += windows
 win32: LIBS += -luser32
 win32: LIBS += -lWindowsApp
 win32: LIBS += -lwinmm
+win32: LIBS += -ladvapi32 -lpowrprof   # выключение/сон (AppController::powerAction)
 win32: LIBS += -ldwmapi   # DwmFlush (AndroidTVModule); #pragma comment работает только в MSVC
 
 # ==================== Прочее ====================

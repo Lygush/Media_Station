@@ -13,6 +13,12 @@ Item {
 
     property bool menuVisible: false
 
+    // Кнопка «Меню» на пульте
+    function toggle() {
+        menuVisible = !menuVisible
+        if (menuVisible) closeTimer.start()
+    }
+
     Timer { id: closeTimer; interval: 3000; repeat: false; onTriggered: pm.menuVisible = false }
 
     // ── Кнопка питания ────────────────────────────────────────────────────────
@@ -64,12 +70,16 @@ Item {
         // до «Выключен…» в фиксированных us(250).
         width: Math.max(Settings.us(250),
                         Settings.us(64) + Settings.us(20)
-                        + Math.ceil(Math.max(exitMetrics.advanceWidth, shutdownMetrics.advanceWidth)))
+                        + Math.ceil(Math.max(exitMetrics.advanceWidth, shutdownMetrics.advanceWidth,
+                                             restartMetrics.advanceWidth, sleepMetrics.advanceWidth)))
         height: menuColumn.height
         TextMetrics { id: exitMetrics;     font.family: appFont.name; font.pixelSize: Settings.fs(20); text: Settings.tr("exit") }
         TextMetrics { id: shutdownMetrics; font.family: appFont.name; font.pixelSize: Settings.fs(20); text: Settings.tr("shutdown") }
+        TextMetrics { id: restartMetrics;  font.family: appFont.name; font.pixelSize: Settings.fs(20); text: Settings.tr("restart") }
+        TextMetrics { id: sleepMetrics;    font.family: appFont.name; font.pixelSize: Settings.fs(20); text: Settings.tr("sleep") }
         transformOrigin: Item.TopRight
         visible: false
+        readonly property bool navModal: true   // открытое меню — стрелки только по нему
 
         HoverHandler {
             onHoveredChanged: { if (hovered) closeTimer.stop(); else closeTimer.start() }
@@ -106,76 +116,51 @@ Item {
         Column {
             id: menuColumn; width: parent.width; spacing: Settings.us(8)
 
-            // ── Exit ──────────────────────────────────────────────────────────
-            Item {
-                width: parent.width; height: Settings.us(64)
+            // Выход — только закрыть программу. Выключение и перезагрузка —
+            // сначала закрыть программу (модули завершают эмулятор и т.п.),
+            // потом компьютер (AppController::executePendingPowerAction).
+            PowerMenuItem { label: Settings.tr("exit");     icon: "qrc:/assets/icons/ic_exit.png";    onActivated: Qt.quit() }
+            PowerMenuItem { label: Settings.tr("sleep");    icon: "qrc:/assets/icons/ic_sleep.png";   onActivated: AppController.powerAction("sleep") }
+            PowerMenuItem { label: Settings.tr("restart");  icon: "qrc:/assets/icons/ic_restart.png"; onActivated: AppController.powerAction("restart") }
+            PowerMenuItem { label: Settings.tr("shutdown"); icon: "qrc:/assets/icons/ic_power.png";   onActivated: AppController.powerAction("shutdown") }
+        }
+    }
 
-                Text {
-                    anchors.left: parent.left; anchors.leftMargin: 5
-                    anchors.right: exitButton.left; anchors.rightMargin: 5
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: Settings.tr("exit")
-                    font.family: appFont.name; font.pixelSize: Settings.fs(20)
-                    color: "white"; horizontalAlignment: Text.AlignRight; elide: Text.ElideRight
-                }
-                Item {
-                    id: exitButton; anchors.right: parent.right; width: Settings.us(64); height: Settings.us(64)
-                    scale: 1.0
-                    Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                    Rectangle {
-                        anchors.fill: parent; radius: 10
-                        gradient: Gradient {
-                            GradientStop { position: 0.0; color: "#33FFFFFF" }
-                            GradientStop { position: 0.5; color: "#AA202020" }
-                            GradientStop { position: 1.0; color: "#33FFFFFF" }
-                        }
-                    }
-                    Rectangle { id: exitBorder; anchors.fill: parent; radius: 10; color: "transparent"; border.color: "#80FFFFFF"; border.width: 2 }
-                    Glow { cached: true; visible: opacity > 0;  anchors.fill: exitBorder; source: exitBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: exitMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
-                    Image { anchors.centerIn: parent; width: Settings.us(40); height: Settings.us(40); source: "qrc:/assets/icons/ic_exit.png"; sourceSize.width: 100; sourceSize.height: 100; smooth: true; fillMode: Image.PreserveAspectFit }
-                    MouseArea {
-                        id: exitMA; anchors.fill: parent; hoverEnabled: true
-                        onEntered: exitButton.scale = 1.05
-                        onExited:  exitButton.scale = 1.0
-                        onClicked: { pm.menuVisible = false; Qt.quit() }
-                    }
+    // ── Пункт меню: подпись + кнопка ─────────────────────────────────────────
+    component PowerMenuItem: Item {
+        id: item
+        property string label
+        property url    icon
+        signal activated()
+
+        width: parent ? parent.width : 0; height: Settings.us(64)
+
+        Text {
+            anchors.left: parent.left; anchors.leftMargin: 5
+            anchors.right: itemButton.left; anchors.rightMargin: 5
+            anchors.verticalCenter: parent.verticalCenter
+            text: item.label
+            font.family: appFont.name; font.pixelSize: Settings.fs(20)
+            color: "white"; horizontalAlignment: Text.AlignRight; elide: Text.ElideRight
+        }
+        Item {
+            id: itemButton; anchors.right: parent.right; width: Settings.us(64); height: Settings.us(64)
+            scale: itemMA.containsMouse ? 1.05 : 1.0
+            Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+            Rectangle {
+                anchors.fill: parent; radius: 10
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: "#33FFFFFF" }
+                    GradientStop { position: 0.5; color: "#AA202020" }
+                    GradientStop { position: 1.0; color: "#33FFFFFF" }
                 }
             }
-
-            // ── Shutdown ──────────────────────────────────────────────────────
-            Item {
-                width: parent.width; height: Settings.us(64)
-
-                Text {
-                    anchors.left: parent.left; anchors.leftMargin: 5
-                    anchors.right: shutdownButton.left; anchors.rightMargin: 5
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: Settings.tr("shutdown")
-                    font.family: appFont.name; font.pixelSize: Settings.fs(20)
-                    color: "white"; horizontalAlignment: Text.AlignRight; elide: Text.ElideRight
-                }
-                Item {
-                    id: shutdownButton; anchors.right: parent.right; width: Settings.us(64); height: Settings.us(64)
-                    scale: 1.0
-                    Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                    Rectangle {
-                        anchors.fill: parent; radius: 10
-                        gradient: Gradient {
-                            GradientStop { position: 0.0; color: "#33FFFFFF" }
-                            GradientStop { position: 0.5; color: "#AA202020" }
-                            GradientStop { position: 1.0; color: "#33FFFFFF" }
-                        }
-                    }
-                    Rectangle { id: shutdownBorder; anchors.fill: parent; radius: 10; color: "transparent"; border.color: "#80FFFFFF"; border.width: 2 }
-                    Glow { cached: true; visible: opacity > 0;  anchors.fill: shutdownBorder; source: shutdownBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: shutdownMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
-                    Image { anchors.centerIn: parent; width: Settings.us(40); height: Settings.us(40); source: "qrc:/assets/icons/ic_power.png"; sourceSize.width: 100; sourceSize.height: 100; smooth: true; fillMode: Image.PreserveAspectFit }
-                    MouseArea {
-                        id: shutdownMA; anchors.fill: parent; hoverEnabled: true
-                        onEntered: shutdownButton.scale = 1.05
-                        onExited:  shutdownButton.scale = 1.0
-                        onClicked: { pm.menuVisible = false; Qt.quit() }
-                    }
-                }
+            Rectangle { id: itemBorder; anchors.fill: parent; radius: 10; color: "transparent"; border.color: "#80FFFFFF"; border.width: 2 }
+            Glow { cached: true; visible: opacity > 0; anchors.fill: itemBorder; source: itemBorder; radius: 16; samples: 24; color: Settings.accent(1.0); opacity: itemMA.containsMouse ? 1.0 : 0.0; Behavior on opacity { NumberAnimation { duration: 150 } } }
+            Image { anchors.centerIn: parent; width: Settings.us(40); height: Settings.us(40); source: item.icon; sourceSize.width: 100; sourceSize.height: 100; smooth: true; fillMode: Image.PreserveAspectFit }
+            MouseArea {
+                id: itemMA; anchors.fill: parent; hoverEnabled: true
+                onClicked: { pm.menuVisible = false; item.activated() }
             }
         }
     }

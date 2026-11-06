@@ -47,6 +47,7 @@ public:
     QString      findAppId(const QString &normalizedTitle) const;
     LocalAppInfo findAppInfo(const QString &normalizedTitle) const;
     LocalAppInfo appInfoById(int appid) const;
+    QString      nameById(int appid) const;   // точное название в Steam, пусто если нет
 
     bool isLoaded() const { return m_loaded; }
 

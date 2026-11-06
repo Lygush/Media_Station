@@ -129,7 +129,8 @@ Item {
                 id: mediaPlayer
                 source:      bg._trailerSource
                 videoOutput: videoOutput
-                audioOutput: AudioOutput { volume: 0.0 }
+                // Без audioOutput звук трейлера не декодируется вовсе
+                // (раньше декодировался и выводился с громкостью 0).
 
                 onPlaybackStateChanged: {
                     if (playbackState === MediaPlayer.StoppedState && bg.showTrailer && bg._hasTrailer)

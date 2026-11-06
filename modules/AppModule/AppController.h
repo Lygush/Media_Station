@@ -54,6 +54,12 @@ public:
     Q_INVOKABLE QString parentPath(const QString &path) const;
     Q_INVOKABLE void    launch(const QString &path, const QString &tileId = QString());
     Q_INVOKABLE void    quitApplication() const;
+
+    /// Питание: "shutdown" / "restart" — программа закрывается (модули
+    /// корректно завершают эмулятор и т.п.), затем main() вызывает
+    /// executePendingPowerAction(). "sleep" — сон сразу, без выхода.
+    Q_INVOKABLE void    powerAction(const QString &action);
+    static void         executePendingPowerAction();
     Q_INVOKABLE void    showBlackOverlay();
     Q_INVOKABLE void    hideBlackOverlay();
 

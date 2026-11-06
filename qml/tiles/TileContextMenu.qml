@@ -46,6 +46,7 @@ Item {
     height:  menuCol.implicitHeight + Settings.us(18)
     visible: false
     z:       300
+    readonly property bool navModal: true   // стрелки пульта — только по пунктам меню
 
     function open() {
         visible = true

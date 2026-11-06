@@ -322,6 +322,11 @@ QString LlamaClient::runInference(const QString &systemPrompt, const QString &us
     // Сэмплер
     const llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sparams);
+    // Штраф за повторы (последние 256 токенов) и min_p: на длинных
+    // описаниях 7B-модель иначе иногда зацикливается и повторяет фразы до
+    // лимита токенов. Штраф идёт до температуры — так принято в llama.cpp.
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(256, 1.1f, 0.0f, 0.0f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_min_p(0.05f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.4f));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(0));
 

@@ -201,32 +201,6 @@ Item {
     function cancel()  { cancelled(); close() }
     function onFilePicked(filePath) { iconField.text = filePath }
 
-    function buildExeList(rootDir) {
-        var skip   = ["unins","uninst","setup","install","redist","vcredist","directx","dxsetup","vc_redist","_commonredist"]
-        var result = []; var queue = [rootDir]
-        while (queue.length > 0) {
-            var dir     = queue.shift()
-            var entries = TileManager.listDir(dir, "exe")
-            for (var i = 0; i < entries.length; i++) {
-                if (entries[i].isDir) {
-                    queue.push(entries[i].path.replace(/\\/g, "/"))
-                } else {
-                    var fname = entries[i].name.toLowerCase(); var bad = false
-                    for (var k = 0; k < skip.length; k++)
-                        if (fname.indexOf(skip[k]) !== -1) { bad = true; break }
-                    if (!bad) {
-                        var abs = entries[i].path.replace(/\\/g, "/")
-                        var rel = abs.startsWith(rootDir)
-                                  ? abs.substring(rootDir.length).replace(/^[\/\\]/, "")
-                                  : abs
-                        result.push({ name: entries[i].name, relative: rel })
-                    }
-                }
-            }
-        }
-        return result
-    }
-
     // ── BaseDialog ────────────────────────────────────────────────────────────
     BaseDialog {
         id: base

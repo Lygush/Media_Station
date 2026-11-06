@@ -3,7 +3,8 @@
 // Управление вводом:
 //   • Обработка клавиш пульта G72 (handleRemoteKey)
 //   • Маппинг ключей G72 → Android keycode
-//   • Отправка через постоянный `adb shell` (без запуска adb.exe на каждую клавишу)
+//   • Отправка через консоль эмулятора (`event send`, без JVM в Android);
+//     запасной путь — постоянный `adb shell input keyevent`
 //   • Переключение режима клавиш (notifyKeyMode)
 //   • Публичный Q_INVOKABLE sendRemoteKey для QML
 
@@ -14,6 +15,9 @@
 #include "core/EventBus.h"
 
 #include <QFile>
+#include <QDir>
+#include <QHostAddress>
+#include <QTimer>
 
 // ── Таблица маппинга G72-ключей → Android keycodes ───────────────────────────
 
@@ -165,6 +169,13 @@ void AndroidTVModule::stopKeyShell()
 
 void AndroidTVModule::sendAndroidKey(int keyCode)
 {
+    if (m_consoleInput && sendKeyViaConsole(keyCode))
+        return;
+    queueAdbKey(keyCode);
+}
+
+void AndroidTVModule::queueAdbKey(int keyCode)
+{
     logToEmulatorFile(QString("[Input] keyevent %1").arg(keyCode));
 
     if (m_pendingKeys.size() >= kMaxPendingKeys) {
@@ -206,6 +217,202 @@ void AndroidTVModule::flushPendingKeys()
     }
     // Запасной путь — разовый вызов
     adb(QStringList{"shell", "input", "keyevent"} + codes);
+}
+
+// ── Консоль эмулятора ────────────────────────────────────────────────────────
+// `input keyevent` в Android — это запуск app_process (JVM): 200–500 мс CPU
+// гостя на каждую пачку нажатий, отсюда рывки звука при листании.
+// Консоль эмулятора (TCP 127.0.0.1:<consolePort>) принимает
+// `event send EV_KEY:<код>:1 EV_KEY:<код>:0` и кладёт событие прямо в
+// виртуальную клавиатуру — как будто нажали клавишу в окне эмулятора.
+//
+// Через консоль идут только частые клавиши (стрелки, OK, Назад) с
+// однозначной раскладкой (Generic.kl / qwerty.kl). Остальные — старым путём.
+// Любой сбой консоли (нет соединения, неверный токен, KO на команды) —
+// переключение на adb до следующего запуска ТВ, с записью в журнал.
+
+/*static*/ int AndroidTVModule::androidKeyToLinuxKey(int androidKeyCode)
+{
+    switch (androidKeyCode) {
+    case 19: return 103;   // DPAD_UP     ← KEY_UP
+    case 20: return 108;   // DPAD_DOWN   ← KEY_DOWN
+    case 21: return 105;   // DPAD_LEFT   ← KEY_LEFT
+    case 22: return 106;   // DPAD_RIGHT  ← KEY_RIGHT
+    case 23: return 232;   // DPAD_CENTER ← KEY_REPLY (в Generic.kl и qwerty.kl = DPAD_CENTER)
+    case 4:  return 158;   // BACK        ← KEY_BACK
+    default: return -1;
+    }
+}
+
+// Токен лежит в %USERPROFILE%\.emulator_console_auth_token (эмулятор создаёт
+// его сам при первом запуске). Пустой файл = авторизация выключена.
+/*static*/ QByteArray AndroidTVModule::readConsoleAuthToken()
+{
+    QFile f(QDir::homePath() + QStringLiteral("/.emulator_console_auth_token"));
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    return f.readAll().trimmed();
+}
+
+bool AndroidTVModule::sendKeyViaConsole(int androidKeyCode)
+{
+    if (m_consoleState == ConsoleState::Failed) return false;
+    const int linuxKey = androidKeyToLinuxKey(androidKeyCode);
+    if (linuxKey < 0) return false;
+
+    if (m_consoleState != ConsoleState::Ready) {
+        if (m_consolePending.size() >= kMaxPendingKeys)
+            m_consolePending.removeFirst();
+        m_consolePending.append(androidKeyCode);
+        if (m_consoleState == ConsoleState::Off) startConsole();
+        return true;
+    }
+
+    const QByteArray code = QByteArray::number(linuxKey);
+    m_console->write("event send EV_KEY:" + code + ":1 EV_KEY:" + code + ":0\n");
+    return true;
+}
+
+void AndroidTVModule::startConsole()
+{
+    stopConsole();
+    m_consoleState = ConsoleState::Connecting;
+    m_consoleBuf.clear();
+    m_consoleAuthNeeded  = false;
+    m_consoleKoCount     = 0;
+    m_consoleReadyLogged = false;
+
+    m_console = new QTcpSocket(this);
+    QTcpSocket *sock = m_console;
+
+    connect(sock, &QTcpSocket::connected, this, [this, sock]() {
+        if (m_console != sock) return;
+        m_consoleState = ConsoleState::Banner;
+    });
+    connect(sock, &QTcpSocket::readyRead, this, [this, sock]() {
+        if (m_console == sock) onConsoleReadyRead();
+    });
+    connect(sock, &QTcpSocket::errorOccurred, this, [this, sock](QAbstractSocket::SocketError) {
+        if (m_console != sock) return;
+        if (m_consoleState == ConsoleState::Ready
+            && sock->error() == QAbstractSocket::RemoteHostClosedError) {
+            // Эмулятор закрыл соединение (перезапуск) — переподключимся
+            // при следующем нажатии.
+            logToEmulatorFile("[Input] console closed by emulator");
+            m_console = nullptr;
+            m_consoleState = ConsoleState::Off;
+            sock->deleteLater();
+            return;
+        }
+        failConsole(QStringLiteral("socket error: ") + sock->errorString());
+    });
+
+    // Соединение и рукопожатие — не дольше 3 с, иначе работаем через adb
+    QTimer::singleShot(3000, sock, [this, sock]() {
+        if (m_console == sock && m_consoleState != ConsoleState::Ready)
+            failConsole(QStringLiteral("handshake timeout"));
+    });
+
+    logToEmulatorFile(QString("[Input] connecting to emulator console :%1").arg(m_consolePort));
+    sock->connectToHost(QHostAddress::LocalHost, quint16(m_consolePort));
+}
+
+void AndroidTVModule::onConsoleReadyRead()
+{
+    m_consoleBuf += m_console->readAll();
+
+    // Протокол: строки текста; каждый ответ заканчивается строкой «OK» или
+    // «KO: …». Приветствие тоже заканчивается «OK».
+    for (;;) {
+        const int nl = m_consoleBuf.indexOf('\n');
+        if (nl < 0) break;
+        const QByteArray line = m_consoleBuf.left(nl).trimmed();
+        m_consoleBuf.remove(0, nl + 1);
+        if (line.isEmpty()) continue;
+
+        const bool ok = (line == "OK");
+        const bool ko = line.startsWith("KO");
+
+        switch (m_consoleState) {
+        case ConsoleState::Banner:
+            if (line.contains("Authentication required")) {
+                m_consoleAuthNeeded = true;
+            } else if (ok && m_consoleAuthNeeded) {
+                const QByteArray token = readConsoleAuthToken();
+                if (token.isEmpty()) {
+                    failConsole(QStringLiteral("auth token not found in %1").arg(QDir::homePath()));
+                    return;
+                }
+                m_console->write("auth " + token + "\n");
+                m_consoleState = ConsoleState::Auth;
+            } else if (ok) {
+                m_consoleState = ConsoleState::Ready;
+            }
+            break;
+        case ConsoleState::Auth:
+            if (ok) {
+                m_consoleState = ConsoleState::Ready;
+            } else if (ko) {
+                failConsole(QStringLiteral("auth rejected: ") + QString::fromUtf8(line));
+                return;
+            }
+            break;
+        case ConsoleState::Ready:
+            if (ko) {
+                logToEmulatorFile("[Input] console: " + QString::fromUtf8(line.left(200)));
+                // Несколько отказов подряд — эта версия эмулятора не принимает
+                // события так: дальше через adb.
+                if (++m_consoleKoCount >= 3) {
+                    failConsole(QStringLiteral("event send rejected"));
+                    return;
+                }
+            } else if (ok) {
+                m_consoleKoCount = 0;
+            }
+            break;
+        default:
+            break;
+        }
+
+        if (m_consoleState == ConsoleState::Ready && !m_consoleReadyLogged) {
+            m_consoleReadyLogged = true;
+            logToEmulatorFile("[Input] emulator console ready");
+        }
+        if (m_consoleState == ConsoleState::Ready && !m_consolePending.isEmpty()) {
+            const QList<int> pending = m_consolePending;
+            m_consolePending.clear();
+            for (int k : pending) sendKeyViaConsole(k);
+        }
+    }
+}
+
+void AndroidTVModule::failConsole(const QString &reason)
+{
+    logToEmulatorFile("[Input] emulator console unavailable (" + reason
+                      + "), falling back to adb input keyevent");
+    if (m_console) {
+        QTcpSocket *sock = m_console;
+        m_console = nullptr;
+        sock->disconnect(this);
+        sock->abort();
+        sock->deleteLater();
+    }
+    m_consoleState = ConsoleState::Failed;
+    const QList<int> pending = m_consolePending;
+    m_consolePending.clear();
+    for (int k : pending) queueAdbKey(k);
+}
+
+void AndroidTVModule::stopConsole()
+{
+    m_consolePending.clear();
+    m_consoleBuf.clear();
+    m_consoleState = ConsoleState::Off;
+    if (!m_console) return;
+    QTcpSocket *sock = m_console;
+    m_console = nullptr;
+    sock->disconnect(this);
+    sock->abort();
+    sock->deleteLater();
 }
 
 // ── Уведомление G72KeysModule о смене режима ─────────────────────────────────

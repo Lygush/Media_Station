@@ -66,6 +66,7 @@ QVariant AndroidTVProfileManager::data(const QModelIndex &index, int role) const
     case AudioTimerMsRole: return p.audioTimerMs;
     case DsoundLatencyMsRole: return p.dsoundLatencyMs;
     case DiagnosticLogcatRole: return p.diagnosticLogcat;
+    case ConsoleInputRole: return p.consoleInput;
     case SizeMbRole: return profileSizeMb(p.id);
     default: return QVariant();
     }
@@ -91,6 +92,7 @@ QHash<int, QByteArray> AndroidTVProfileManager::roleNames() const
         {AudioTimerMsRole, "audioTimerMs"},
         {DsoundLatencyMsRole, "dsoundLatencyMs"},
         {DiagnosticLogcatRole, "diagnosticLogcat"},
+        {ConsoleInputRole, "consoleInput"},
         {SizeMbRole, "sizeMb"}
     };
 }
@@ -117,6 +119,7 @@ QVariantMap AndroidTVProfileManager::profileToMap(const AndroidTVProfile &p) con
     map["audioTimerMs"]    = p.audioTimerMs;
     map["dsoundLatencyMs"] = p.dsoundLatencyMs;
     map["diagnosticLogcat"] = p.diagnosticLogcat;
+    map["consoleInput"]    = p.consoleInput;
     return map;
 }
 
@@ -357,6 +360,7 @@ bool AndroidTVProfileManager::updateProfileField(const QString &id, const QStrin
         else if (field == "dnsServer")      p.dnsServer = value.toString();
         else if (field == "audioDriver")    p.audioDriver = value.toString();
         else if (field == "diagnosticLogcat") p.diagnosticLogcat = value.toBool();
+        else if (field == "consoleInput")     p.consoleInput = value.toBool();
         else if (field == "audioTimerMs" || field == "dsoundLatencyMs") {
             QVariant &target = (field == "audioTimerMs") ? p.audioTimerMs : p.dsoundLatencyMs;
             if (isAutoValue(value)) {
@@ -476,6 +480,7 @@ void AndroidTVProfileManager::load(const QString &baseDir)
                 p.dnsServer = obj["dnsServer"].toString("8.8.8.8,1.1.1.1");
                 p.audioDriver = obj["audioDriver"].toString("dsound");
                 p.diagnosticLogcat = obj["diagnosticLogcat"].toBool(false);
+                p.consoleInput = obj["consoleInput"].toBool(true);
 
                 // Audio timer: обратная совместимость со старым форматом
                 if (obj.contains("useDefaultAudioTimer")) {
@@ -572,6 +577,7 @@ void AndroidTVProfileManager::save()
         obj["dsoundLatencyMs"] = QJsonValue::fromVariant(p.dsoundLatencyMs);
         obj["audioSettingsVersion"] = kAudioSettingsVersion;
         obj["diagnosticLogcat"] = p.diagnosticLogcat;
+        obj["consoleInput"] = p.consoleInput;
         arr.append(obj);
     }
     root["profiles"] = arr;

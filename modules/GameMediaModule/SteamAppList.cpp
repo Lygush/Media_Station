@@ -291,3 +291,8 @@ SteamAppList::LocalAppInfo SteamAppList::appInfoById(int appid) const
 {
     return m_appInfo.value(appid);
 }
+
+QString SteamAppList::nameById(int appid) const
+{
+    return m_appName.value(appid);
+}

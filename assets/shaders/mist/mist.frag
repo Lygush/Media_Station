@@ -18,14 +18,18 @@ float hash(vec2 p) {
     return fract(p.x * p.y);
 }
 
+// Номер клетки заворачивается по модулю 289: аргумент hash() остаётся малым,
+// и через часы работы (время растёт) узор не начинает «рябить квадратами»
+// из-за потери точности float. Соседи берутся тоже по модулю — без шва.
 float noise(vec2 p) {
-    vec2 i = floor(p);
+    vec2 i  = mod(floor(p), 289.0);
+    vec2 i1 = mod(i + 1.0, 289.0);
     vec2 f = fract(p);
     vec2 u = f * f * (3.0 - 2.0 * f);
     float a = hash(i);
-    float b = hash(i + vec2(1.0, 0.0));
-    float c = hash(i + vec2(0.0, 1.0));
-    float d = hash(i + vec2(1.0, 1.0));
+    float b = hash(vec2(i1.x, i.y));
+    float c = hash(vec2(i.x, i1.y));
+    float d = hash(i1);
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
@@ -44,6 +48,14 @@ float fbm(vec2 p) {
 
 void main() {
     vec2 uv = coord;
+
+    // Верхние 36 % экрана всегда прозрачны (маска высоты и базовый слой там
+    // равны нулю) — не считаем там ~130 вычислений шума на пиксель.
+    if (uv.y < 0.36) {
+        fragColor = vec4(0.0);
+        return;
+    }
+
     float t = time * speed;
 
     // ── Высотная маска: струи только в нижней половине ───────────────────────

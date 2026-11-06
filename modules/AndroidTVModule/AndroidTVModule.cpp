@@ -213,6 +213,7 @@ void AndroidTVModule::shutdown()
 
     // 2. Вспомогательные процессы adb
     stopKeyShell();
+    stopConsole();
     stopLogcat();
 
     // 3. Эмулятор — синхронно, но быстро (TerminateProcess по всему дереву).

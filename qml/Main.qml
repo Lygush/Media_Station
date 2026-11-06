@@ -96,17 +96,29 @@ Window {
         property real scale: 2.5
         property real speed: 0.35
 
-        // ~30 fps, медленное накопление времени
-        // Дымка анимируется только когда её видно: раньше таймер 30 кадров/с
-        // работал и под запущенной игрой / Android TV, и при выключенной дымке —
-        // окно медиацентра перерисовывалось целиком без остановки
+        // Дымка размытая — считаем её в текстуре вдвое меньшей по каждой
+        // стороне и растягиваем: работы шейдера в 4 раза меньше, на глаз
+        // не отличить (тонкие струйки ещё шире 1 пикселя текстуры).
+        layer.enabled:     visible
+        layer.smooth:      true
+        layer.textureSize: Qt.size(Math.max(1, Math.round(width / 2)),
+                                   Math.max(1, Math.round(height / 2)))
+
+        // ~30 кадров/с. Время — по часам, а не «+0.033 за срабатывание»:
+        // при подтормаживании дымка не замирает и не дёргается. Заворот раз в
+        // 3 часа (шум в шейдере устойчив к большим значениям, но float
+        // uniform — нет). FrameAnimation здесь не используется сознательно:
+        // она перерисовывала бы всё окно с частотой экрана (60–144 Гц).
+        // Дымка анимируется только когда её видно: под игрой / Android TV и
+        // при выключенной дымке окно медиацентра не перерисовывается.
+        property double _startMs: Date.now()
         Timer {
             interval: 33
             running:  mistEffect.visible && !root.gameRunning
                       && Qt.application.state === Qt.ApplicationActive
                       && !(typeof AndroidTV !== "undefined" && AndroidTV && AndroidTV.active)
             repeat:   true
-            onTriggered: mistEffect.time += 0.033
+            onTriggered: mistEffect.time = ((Date.now() - mistEffect._startMs) / 1000.0) % 10800.0
         }
 
         vertexShader:   "qrc:/assets/shaders/mist/mist.vert.qsb"
@@ -390,6 +402,8 @@ Window {
             fadeInMediaCenter.stop()
             transitionOverlay.opacity = 0
             console.warn("Launch failed for", tileId, ":", reason)
+            NotificationModule.post(Settings.tr("launch_failed") + ": "
+                                    + root._launchFailReason(reason), "error", true, 7000)
         }
     }
 
@@ -440,27 +454,72 @@ Window {
 
         function onMenuPressed() {
             if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
-            if (powerMenu && typeof powerMenu.open === "function") {
-                powerMenu.open()
-            } else {
-                if (powerMenu) powerMenu.visible = true
-            }
+            // Раньше здесь ставилось powerMenu.visible = true (а меню и так
+            // видимо — открывается по menuVisible), кнопка ничего не делала.
+            powerMenu.toggle()
         }
 
-        // Стрелки пульта прокручивают текущий экран (если он это умеет)
+        // Стрелки пульта переводят рамку фокуса (RemoteNavigator, C++).
+        // Если в этом направлении ничего нет — прокрутка экрана, как раньше:
+        // так открываются плитки, которые были за краем.
         function onUpPressed() {
             if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
+            if (RemoteNav.move("up")) return
             if (stack.currentItem && typeof stack.currentItem.scrollBy === "function")
                 stack.currentItem.scrollBy(-1)
         }
         function onDownPressed() {
             if (root.gameRunning) return   // пульт управляет игрой, а не скрытым меню
+            if (RemoteNav.move("down")) return
             if (stack.currentItem && typeof stack.currentItem.scrollBy === "function")
                 stack.currentItem.scrollBy(1)
         }
-        function onLeftPressed()  {}
-        function onRightPressed() {}
-        function onSelectPressed(){}
+        // Влево/вправо в поле ввода двигают курсор в тексте
+        function onLeftPressed() {
+            if (root.gameRunning || RemoteNav.textInputFocused()) return
+            RemoteNav.move("left")
+        }
+        function onRightPressed() {
+            if (root.gameRunning || RemoteNav.textInputFocused()) return
+            RemoteNav.move("right")
+        }
+        // OK/Enter — щелчок по элементу под рамкой. Без рамки ничего не делаем:
+        // кнопка ОК аэромыши — это обычный щелчок мыши.
+        function onSelectPressed() {
+            if (root.gameRunning) return
+            RemoteNav.activate()
+        }
+    }
+
+    // ── Рамка фокуса для навигации стрелками ───────────────────────────────
+    // Выше диалогов (z 500) и всплывающих окон Qt Quick Controls.
+    Rectangle {
+        id: remoteFocusRing
+        z: 2000000
+        readonly property real pad: Settings.us(4)
+        visible: RemoteNav.active && !root.gameRunning
+        x: RemoteNav.targetRect.x - pad
+        y: RemoteNav.targetRect.y - pad
+        width:  RemoteNav.targetRect.width  + 2 * pad
+        height: RemoteNav.targetRect.height + 2 * pad
+        radius: Settings.us(12)
+        color: "transparent"
+        border.width: Math.max(2, Settings.us(3))
+        border.color: Settings.accent(1.0)
+        Behavior on x      { enabled: remoteFocusRing.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+        Behavior on y      { enabled: remoteFocusRing.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+        Behavior on width  { enabled: remoteFocusRing.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+        Behavior on height { enabled: remoteFocusRing.visible; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+    }
+
+    // Причины из GameWatcher (C++) — техническим английским; пользователю — коротко
+    function _launchFailReason(reason) {
+        var r = String(reason || "")
+        if (r.indexOf("did not finish") >= 0)  return Settings.tr("launch_fail_previous")
+        if (r.indexOf("PowerShell") >= 0)      return Settings.tr("launch_fail_script")
+        if (r.indexOf("no PID") >= 0)          return Settings.tr("launch_fail_no_process")
+        if (r.indexOf("exited") >= 0)          return Settings.tr("launch_fail_exited")
+        return r
     }
 
     function launchGame(path, tileId) {
@@ -547,6 +606,10 @@ Window {
     }
 
     function goBack() {
+        // «Назад» сначала закрывает то, что открыто поверх экрана
+        if (powerMenu.menuVisible) { powerMenu.menuVisible = false; return }
+        if (root.promptDialog && root.promptDialog.visible
+            && typeof root.promptDialog.close === "function") { root.promptDialog.close(); return }
         var cur = stack.currentItem
         if (cur && typeof cur.closeDialogs === "function" && cur.closeDialogs()) return
         if (stack.depth > 1) {
@@ -690,12 +753,6 @@ Window {
         if (stack.currentItem && stack.currentItem.screenTitle === Settings.tr("karaoke"))
             return
         stack.push(_own(karaokeScreenComponent.createObject(stack)))
-    }
-
-    function openAndroidTVScreen() {
-        if (stack.currentItem && stack.currentItem.screenTitle === Settings.tr("android_tv"))
-            return
-        stack.push(androidTVScreenComponent)
     }
 
     Connections {

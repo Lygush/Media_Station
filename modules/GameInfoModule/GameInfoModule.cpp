@@ -109,6 +109,13 @@ void GameInfoModule::onFetchRequested(const QVariantMap &data)
 {
     if (m_fetching) {
         GIM_LOG(Logger::kLevelWarning, "already fetching, ignoring new request");
+        // Раньше запрос молча пропадал: нажатие на другой игре «ничего не делало»
+        if (m_bus)
+            emit m_bus->moduleEvent(
+                QLatin1String(Notifications::kModule), QLatin1String(Notifications::kEventShow),
+                Notifications::makeEvent(
+                    QStringLiteral("Нейросеть занята описанием другой игры — повторите позже"),
+                    NotificationLevel::Warning, true, 5000));
         return;
     }
 
@@ -249,7 +256,7 @@ void GameInfoModule::doFetch(const QString &tileId,
     QMetaObject::invokeMethod(this, [this]() { setStage("fetching"); }, Qt::QueuedConnection);
 
     GameInfoFetcher fetcher;
-    const auto    fetchResult = fetcher.fetch(title, installFolder);
+    const auto    fetchResult = fetcher.fetch(title, installFolder, chosenAppId);
     const QString sourceText  = fetchResult.sourceText;
     const QString steamAppId  = chosenAppId.isEmpty() ? fetchResult.steamAppId : chosenAppId;
 

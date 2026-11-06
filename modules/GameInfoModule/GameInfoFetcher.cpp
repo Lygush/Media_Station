@@ -420,44 +420,73 @@ QString GameInfoFetcher::fetchMetacritic(const QString &normalizedTitle, QString
     return text.isEmpty() ? QString() : QString("[Metacritic]\n") + text;
 }
 
-GameInfoFetcher::FetchResult GameInfoFetcher::fetch(const QString &title, const QString &/*installFolder*/)
+GameInfoFetcher::FetchResult GameInfoFetcher::fetch(const QString &title, const QString &/*installFolder*/,
+                                                    const QString &knownAppId)
 {
-    const QString normalized = TitleNormalizer::normalize(title);
-    qDebug() << "GameInfoFetcher::fetch normalized title:" << normalized;
-
     QStringList parts;
     QString steamAppId;
+
+    // Название для поиска: если appId выбран, берём точное название из Steam —
+    // иначе Wikipedia находила статью по похожему названию другой игры.
+    QString searchTitle = title;
+    const SteamAppList &appList = SteamAppList::instance();
+    if (!knownAppId.isEmpty() && appList.isLoaded()) {
+        const QString steamName = appList.nameById(knownAppId.toInt());
+        if (!steamName.isEmpty())
+            searchTitle = steamName;
+    }
+    const QStringList variants = TitleNormalizer::searchVariants(searchTitle);
+    qDebug() << "GameInfoFetcher::fetch search variants:" << variants
+             << "known appId:" << knownAppId;
 
     // ── 0. Локальный список (без сети, быстро) ────────────────────────────────
     // Даёт приоритетный appId и краткое описание для контекста LLM.
     // appId из локального списка не перезаписывается другими источниками.
-    {
-        QString localAppId;
-        const QString localText = fetchLocalAppInfo(normalized, localAppId);
-        if (!localAppId.isEmpty()) {
+    if (!knownAppId.isEmpty()) {
+        steamAppId = knownAppId;
+        if (appList.isLoaded()) {
+            const SteamAppList::LocalAppInfo info = appList.appInfoById(knownAppId.toInt());
+            QStringList local;
+            if (!info.shortDescription.isEmpty())
+                local << "Описание: " + info.shortDescription;
+            if (info.metacriticScore >= 0)
+                local << "Metacritic: " + QString::number(info.metacriticScore, 'f', 0) + "/100";
+            if (!info.releaseDate.isEmpty())
+                local << "Дата выхода: " + info.releaseDate;
+            if (!local.isEmpty())
+                parts << QStringLiteral("[Local DB]\n") + local.join("\n");
+        }
+    } else {
+        for (const QString &v : variants) {
+            QString localAppId;
+            const QString localText = fetchLocalAppInfo(v, localAppId);
+            if (localAppId.isEmpty()) continue;
             steamAppId = localAppId; // приоритетный appId
             if (!localText.isEmpty()) {
                 parts << localText;
                 qDebug() << "GameInfoFetcher: Local DB OK, appId:" << steamAppId;
             }
+            break;
         }
     }
 
-    // ── 1. Wikipedia RU (основной) ────────────────────────────────────────────
-    const QString wikiText = fetchWikipedia(normalized);
-    if (!wikiText.isEmpty()) {
-        parts << wikiText;
-        qDebug() << "GameInfoFetcher: Wikipedia RU OK";
-    } else {
-        qDebug() << "GameInfoFetcher: Wikipedia RU failed, trying EN";
-        const QString wikiEnText = fetchWikipediaEn(normalized);
-        if (!wikiEnText.isEmpty()) {
-            parts << wikiEnText;
-            qDebug() << "GameInfoFetcher: Wikipedia EN OK";
-        } else {
-            qDebug() << "GameInfoFetcher: Wikipedia unavailable";
+    // ── 1. Wikipedia RU (основной), затем EN ─────────────────────────────────
+    // По полному названию, без подзаголовка — только если по полному пусто.
+    QString wikiText;
+    for (const QString &v : variants) {
+        wikiText = fetchWikipedia(v);
+        if (!wikiText.isEmpty()) { qDebug() << "GameInfoFetcher: Wikipedia RU OK:" << v; break; }
+    }
+    if (wikiText.isEmpty()) {
+        for (const QString &v : variants) {
+            wikiText = fetchWikipediaEn(v);
+            if (!wikiText.isEmpty()) { qDebug() << "GameInfoFetcher: Wikipedia EN OK:" << v; break; }
         }
     }
+    if (!wikiText.isEmpty())
+        parts << wikiText;
+    else
+        qDebug() << "GameInfoFetcher: Wikipedia unavailable";
 
     // ── 2. Steam ──────────────────────────────────────────────────────────────
     // Цель: получить страницу магазина как второй источник для LLM.
@@ -481,7 +510,10 @@ GameInfoFetcher::FetchResult GameInfoFetcher::fetch(const QString &title, const 
         } else {
             // appId неизвестен — делаем storesearch (он сам загружает страницу)
             QString steamFoundId;
-            steamText = fetchSteam(normalized, steamFoundId);
+            for (const QString &v : variants) {
+                steamText = fetchSteam(v, steamFoundId);
+                if (!steamText.isEmpty() || !steamFoundId.isEmpty()) break;
+            }
             if (!steamFoundId.isEmpty())
                 steamAppId = steamFoundId;
         }

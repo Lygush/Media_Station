@@ -18,7 +18,11 @@ public:
     // Вызывается из фонового потока.
     // Возвращает текст источников и steamAppId.
     // sourceText пустой — источники не найдены (LLM работает из своих знаний).
-    FetchResult fetch(const QString &title, const QString &installFolder);
+    // knownAppId — выбранный пользователем (или найденный точно) appId: тогда
+    // и страница Steam, и поиск в Wikipedia идут по этой игре, а не по
+    // собственному поиску сборщика по названию.
+    FetchResult fetch(const QString &title, const QString &installFolder,
+                      const QString &knownAppId = QString());
 
 private:
     // Локальный список (первый источник — быстрее сети)

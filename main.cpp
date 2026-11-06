@@ -26,6 +26,8 @@
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickWindow>
 #include <QCursor>
 #include <QPixmap>
 #include <QDebug>
@@ -42,6 +44,7 @@
 #include "TileManager.h"
 #include "NetworkModule.h"
 #include "AppController.h"
+#include "RemoteNavigator.h"
 #include "JoystickModule.h"
 #include "NotificationModule.h"
 #include "G72BatteryModule.h"
@@ -136,6 +139,10 @@ int main(int argc, char *argv[])
 
     host.initializeAll();
 
+    // Навигация стрелками пульта/клавиатуры (рамка фокуса в Main.qml)
+    RemoteNavigator remoteNav;
+    engine.rootContext()->setContextProperty(QStringLiteral("RemoteNav"), &remoteNav);
+
     engine.load(QUrl("qrc:/qml/Main.qml"));
     if (engine.rootObjects().isEmpty()) {
         qCritical() << "main: failed to load Main.qml";
@@ -145,6 +152,7 @@ int main(int argc, char *argv[])
     }
 
     QWindow *mainWindow = qobject_cast<QWindow*>(engine.rootObjects().first());
+    remoteNav.setWindow(qobject_cast<QQuickWindow*>(mainWindow));
     if (mainWindow) {
 #ifdef Q_OS_WIN
         const HWND hwnd = reinterpret_cast<HWND>(mainWindow->winId());
@@ -193,5 +201,7 @@ int main(int argc, char *argv[])
     host.shutdownAll();
     // 2) Удаляем QML до модулей, на которые он ссылается
     delete enginePtr;
+    // 3) «Выключить»/«Перезагрузить» из меню питания — после того, как всё закрыто
+    AppController::executePendingPowerAction();
     return rc;
 }

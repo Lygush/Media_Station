@@ -25,6 +25,8 @@ Item {
         function hideBlackOverlay() {}
         function showBlackOverlay() {}
         function launch(path, tileId) {}
+        function powerAction(action) {}
+        function quitApplication() {}
         function parentPath(p) { var i = p.lastIndexOf("/"); return i > 0 ? p.substring(0, i) : "" }
     }
 
@@ -191,6 +193,7 @@ Item {
         function show(c) {} function hide() {} function exitAndroidTV() {}
     }
     property QtObject notification: QtObject {
+        function post(message, level, autoDismiss, durationMs) {}
         property string message: "Установка завершена: The Elder Scrolls V: Skyrim Special Edition — Anniversary Upgrade"
         property int    level: 0
         property bool   autoDismiss: false
@@ -222,7 +225,7 @@ Item {
         property ListModel profileManager: ListModel {
             property string activeProfileId: "p1"
             property bool   locked: false
-            property var    currentProfileData: ({ id: "p1", displayName: "Android TV 14 (Google APIs, x86_64) — system-images;android-34;android-tv;x86", name: "MediaStation TV (Android 14)", resolution: "2560x1440", gpu: "auto", ramMb: 8192, cores: 4, audioDriver: "dsound", audioTimerMs: 8, dsoundLatencyMs: 60, diagnosticLogcat: false })
+            property var    currentProfileData: ({ id: "p1", displayName: "Android TV 14 (Google APIs, x86_64) — system-images;android-34;android-tv;x86", name: "MediaStation TV (Android 14)", resolution: "2560x1440", gpu: "auto", ramMb: 8192, cores: 4, audioDriver: "dsound", audioTimerMs: 8, dsoundLatencyMs: 60, diagnosticLogcat: false, consoleInput: true })
             ListElement { name: "MediaStation TV (Android 14)"; profileId: "p1" }
             ListElement { name: "Детский профиль с длинным названием"; profileId: "p2" }
             signal profilesChanged()

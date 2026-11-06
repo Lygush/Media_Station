@@ -35,6 +35,9 @@ Item {
 
     property bool closeOnClickOutside: true
 
+    // Навигация стрелками (RemoteNavigator) — только внутри открытого диалога
+    readonly property bool navModal: true
+
     // Анимировать изменения dialogHeight (включается после open, выключается во время close).
     property bool animateResize: false
 

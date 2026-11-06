@@ -24,6 +24,7 @@ Item {
     anchors.fill: parent
     visible: false
     z: 200
+    readonly property bool navModal: true   // стрелки пульта — только по пунктам меню
 
     property int    activeIndex:  -1
     property string activeGameId: ""

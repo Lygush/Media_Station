@@ -63,6 +63,16 @@ static Result runProcess(const QString          &binary,
     static const QRegularExpression kProgressRe(QStringLiteral(R"(\s*(\d+)%)"));
 
     QProcess proc;
+    // stderr читается в цикле вместе с stdout: раньше его забирали только в
+    // конце, и при тысячах предупреждений (заблокированные файлы при
+    // архивации) буфер канала переполнялся — 7z зависал на записи.
+    QByteArray stderrTail;
+    constexpr int kStderrTailMax = 16 * 1024;
+    auto drainStderr = [&]() {
+        stderrTail += proc.readAllStandardError();
+        if (stderrTail.size() > kStderrTailMax)
+            stderrTail = stderrTail.right(kStderrTailMax);
+    };
     if (!workDir.isEmpty())
         proc.setWorkingDirectory(workDir);
 
@@ -74,6 +84,7 @@ static Result runProcess(const QString          &binary,
     }
 
     while (!proc.waitForFinished(200)) {
+        drainStderr();
         // Проверяем флаг отмены каждые 200 мс
         if (cancelFlag && cancelFlag->load()) {
             proc.kill();
@@ -81,7 +92,10 @@ static Result runProcess(const QString          &binary,
             return Cancelled;
         }
 
-        if (!onProgress) continue;
+        if (!onProgress) {
+            proc.readAllStandardOutput();   // не даём переполниться и stdout
+            continue;
+        }
 
         // Читаем stdout — 7zr пишет прогресс туда при -bsp1.
         // Прогресс перерисовывается на месте через '\b'/'\r', а не '\n' —
@@ -113,8 +127,9 @@ static Result runProcess(const QString          &binary,
     const int  exitCode = proc.exitCode();
 
     proc.readAllStandardOutput();
+    drainStderr();
     if (crashed || exitCode != 0) {
-        const QString err = QString::fromLocal8Bit(proc.readAllStandardError()).trimmed();
+        const QString err = QString::fromLocal8Bit(stderrTail).trimmed();
         qWarning() << "SevenZip:" << (crashed ? "process crashed" : "process exited with code")
                    << (crashed ? QString() : QString::number(exitCode))
                    << "args:" << args
@@ -133,7 +148,8 @@ Result compress(const QString          &workDir,
                 const QString          &source,
                 const QString          &archivePath,
                 const std::atomic<bool> *cancelFlag,
-                ProgressFn              onProgress)
+                ProgressFn              onProgress,
+                int                     level)
 {
     if (cancelFlag && cancelFlag->load())
         return Cancelled;
@@ -144,17 +160,17 @@ Result compress(const QString          &workDir,
         return NotFound;
     }
 
-    // -bsp1 — прогресс в stdout
-    // -mqs=on — сортировка для лучшего сжатия
+    // -bsp1 — прогресс в stdout, -mmt=on — все ядра.
+    // Уровень по умолчанию 3, а не 9: файлы игр в основном уже сжаты, а -mx=9
+    // на десятках ГБ — часы работы и ~0.7 ГБ ОЗУ на поток при разнице в
+    // размере в несколько процентов.
     const QStringList args = {
         QStringLiteral("a"),
         QStringLiteral("-t7z"),
         QStringLiteral("-m0=lzma2"),
-        QStringLiteral("-mx=9"),
-        QStringLiteral("-mfb=64"),
-        QStringLiteral("-md=32m"),
+        QStringLiteral("-mx=%1").arg(qBound(0, level, 9)),
+        QStringLiteral("-mmt=on"),
         QStringLiteral("-ms=on"),
-        QStringLiteral("-mqs=on"),
         QStringLiteral("-bsp1"),
         archivePath,
         source

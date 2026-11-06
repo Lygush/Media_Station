@@ -146,6 +146,12 @@ void JoystickModule::shutdown()
     }
     pendingStartup.waitForFinished();
     pendingPoll.waitForFinished();
+    // Смена профиля после закрытия игры: задачи держат `this`. С m_stopping
+    // runCmdSync выходит за доли секунды — ждём, чтобы не обратиться к
+    // удалённому модулю при выходе сразу после игры.
+    for (QFuture<void> &f : m_profileTasks)
+        f.waitForFinished();
+    m_profileTasks.clear();
 
     // Если мы запустили DS4Windows — останавливаем его асинхронно.
     // QThreadPool::globalInstance() живёт до конца приложения,
@@ -558,9 +564,12 @@ void JoystickModule::loadProfile(const QString &requestedProfile) const
         profileName = QString::fromLatin1(kProfileDefault);
     }
 
+    m_profileTasks.erase(std::remove_if(m_profileTasks.begin(), m_profileTasks.end(),
+                                        [](const QFuture<void> &f) { return f.isFinished(); }),
+                         m_profileTasks.end());
     for (const ControllerInfo &c : m_controllers) {
         const QString cmd = QString("LoadProfile.%1.%2").arg(c.slot).arg(profileName);
-        QThreadPool::globalInstance()->start([this, cmd]() { runCmdSync(cmd); });
+        m_profileTasks.append(QtConcurrent::run([this, cmd]() { runCmdSync(cmd); }));
     }
 }
 

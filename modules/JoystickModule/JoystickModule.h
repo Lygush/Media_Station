@@ -27,6 +27,7 @@
 #pragma once
 
 #include <QObject>
+#include <QFuture>
 #include <QHash>
 #include <QMutex>
 #include <QTimer>
@@ -101,7 +102,9 @@ private:
     bool  m_gameRunning = false;   ///< игра на экране — опрос DS4Windows приостановлен
     bool  m_androidTvShown = false; ///< Android TV на экране — опрос тоже на паузе
     std::atomic<bool> m_weStartedDs4 { false };
-    std::atomic<bool> m_stopping     { false };   ///< true после shutdown(): фоновые задачи обязаны быстро выйти
+    std::atomic<bool> m_stopping     { false };
+    /// Смена профиля DS4 в пуле потоков (держит `this`): shutdown() их дожидается
+    mutable QList<QFuture<void>> m_profileTasks;   // mutable: loadProfile() const   ///< true после shutdown(): фоновые задачи обязаны быстро выйти
 
     QTimer *m_pollTimer = nullptr;
 

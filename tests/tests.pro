@@ -9,6 +9,8 @@ SUBDIRS = \
     unit/tst_gamelibrarymodule_scan \
     unit/tst_joystickmodule_mock \
     unit/tst_network_protocol \
+    unit/tst_titlenormalizer \
+    unit/tst_remotenavigator \
     integration/tst_installmanager_local
 
 # G72BatteryModule использует WinRT — собирается только MSVC

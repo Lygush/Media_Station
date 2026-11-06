@@ -268,6 +268,19 @@ Column {
     }
     SectionDivider {}
 
+    // ── Ввод пульта через консоль эмулятора ───────────────────────────────────
+    // Выключить, если стрелки/OK в Android TV перестали работать: тогда
+    // нажатия идут старым путём (adb shell input keyevent).
+    SettingsRow {
+        label: Settings.safeTr("android_console_input")
+        ToggleSwitch {
+            checked: root.profileData.consoleInput !== false
+            onToggled: root.saveAndRefresh(root.currentProfileId, "consoleInput",
+                                           root.profileData.consoleInput === false)
+        }
+    }
+    SectionDivider {}
+
     // ── Используемое место + кнопки ───────────────────────────────────────────
     SettingsRow {
         label: Settings.safeTr("used_space")

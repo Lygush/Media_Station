@@ -21,6 +21,8 @@
 #include <QDir>
 #include <QSettings>
 #include <QVariantMap>
+#include <QTcpSocket>
+#include <QByteArray>
 
 #ifdef Q_OS_WIN
 #  include <windows.h>
@@ -50,6 +52,7 @@ struct AndroidTVProfile {
     QVariant audioTimerMs             = QVariant("auto");   // int (manual) or "auto"
     QVariant dsoundLatencyMs          = QVariant("auto");   // int (manual) or "auto"
     bool    diagnosticLogcat          = false;   // полный logcat в файл (для диагностики)
+    bool    consoleInput              = true;    // кнопки пульта через консоль эмулятора
 };
 
 class AndroidTVProfileManager : public QAbstractListModel
@@ -79,6 +82,7 @@ public:
         AudioTimerMsRole,
         DsoundLatencyMsRole,
         DiagnosticLogcatRole,
+        ConsoleInputRole,
         SizeMbRole
     };
 
@@ -264,6 +268,16 @@ private:
     void flushPendingKeys();
     void startKeyShell();
     void stopKeyShell();
+    // Консоль эмулятора (TCP localhost:<consolePort>): `event send` кладёт
+    // нажатие прямо в виртуальную клавиатуру — без JVM в Android.
+    static int androidKeyToLinuxKey(int androidKeyCode);
+    bool sendKeyViaConsole(int androidKeyCode);
+    void startConsole();
+    void stopConsole();
+    void onConsoleReadyRead();
+    void failConsole(const QString &reason);
+    static QByteArray readConsoleAuthToken();
+    void queueAdbKey(int androidKeyCode);   // старый путь: adb shell input keyevent
 
 #ifdef Q_OS_WIN
     void hideExtraEmulatorWindows(DWORD pid, HWND mainHwnd);
@@ -375,6 +389,16 @@ private:
     QString       m_keyShellBuf;
     static constexpr int kMaxPendingKeys   = 8;
     static constexpr int kKeyBatchStuckMs  = 2000;
+
+    enum class ConsoleState { Off, Connecting, Banner, Auth, Ready, Failed };
+    QTcpSocket   *m_console       = nullptr;
+    ConsoleState  m_consoleState  = ConsoleState::Off;
+    QByteArray    m_consoleBuf;
+    QList<int>    m_consolePending;   // нажатия до готовности консоли
+    bool          m_consoleInput  = true;   // из профиля
+    bool          m_consoleAuthNeeded  = false;
+    bool          m_consoleReadyLogged = false;
+    int           m_consoleKoCount     = 0;
 
     bool m_overlayOpen        = false;
     bool m_overlayCooldown    = false;

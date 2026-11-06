@@ -178,6 +178,7 @@ void AndroidTVModule::loadEmulatorSettings(const AndroidTVProfile &profile)
     m_dnsServer      = profile.dnsServer;
     m_audioDriver    = profile.audioDriver;
     m_diagnosticLogcat = profile.diagnosticLogcat;
+    m_consoleInput     = profile.consoleInput;
 
     static const QStringList kValidAudioDrivers = {"dsound", "winaudio"};
     if (!kValidAudioDrivers.contains(m_audioDriver)) {
@@ -285,6 +286,7 @@ void AndroidTVModule::stop()
 
     restoreMediaStation();
     stopKeyShell();
+    stopConsole();
     stopLogcat();
     adb({"emu", "kill"}, {}, 5000);
 
@@ -1144,6 +1146,7 @@ void AndroidTVModule::onEmulatorFinished(int exitCode)
     stopHealthCheck();
     stopLogcat();
     stopKeyShell();
+    stopConsole();
     removeWinEventHook();
     stopPositionSyncTimer();
     stopDnsProxy();

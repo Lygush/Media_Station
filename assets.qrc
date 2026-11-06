@@ -2,6 +2,8 @@
     <qresource prefix="/">
         <file>assets/background.png</file>
         <file>assets/icons/ic_power.png</file>
+        <file>assets/icons/ic_restart.png</file>
+        <file>assets/icons/ic_sleep.png</file>
         <file>assets/icons/ic_back.png</file>
         <file>assets/icons/ic_games.png</file>
         <file>assets/icons/ic_calendar.png</file>

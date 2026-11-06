@@ -61,6 +61,18 @@ void NotificationModule::shutdown()
 
 // ── Очередь ───────────────────────────────────────────────────────────────────
 
+void NotificationModule::post(const QString &message, const QString &level,
+                              bool autoDismiss, int durationMs)
+{
+    if (message.trimmed().isEmpty()) return;
+    NotificationItem item;
+    item.message     = message;
+    item.level       = Notifications::levelFromString(level);
+    item.autoDismiss = autoDismiss;
+    item.duration    = qBound(1000, durationMs, 60000);
+    enqueue(item);
+}
+
 void NotificationModule::enqueue(const NotificationItem &item)
 {
     // Одинаковые сообщения подряд (например, повторяющиеся ошибки сети) не

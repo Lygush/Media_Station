@@ -5,6 +5,7 @@
 #include "core/EventBus.h"
 #include "LoggerModule.h"
 #include "NotificationModule.h"
+#include "Version.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -18,10 +19,6 @@
 #include <QDateTime>
 #include <QtConcurrent/QtConcurrent>
 #include <QFutureWatcher>
-
-#ifndef MEDIASTATION_VERSION
-#  define MEDIASTATION_VERSION "1.0.0"
-#endif
 
 // Архивы обновлений, принятые по сети, лежат в %TEMP%/MediaStation_Update
 // (NetworkModule::prepareUpdateArchivePath). Удаляем только файлы оттуда,

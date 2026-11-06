@@ -15,11 +15,13 @@
 #include <QQuickWindow>
 #include <QQuickItem>
 #include <QTimer>
+#include <QCursor>
 #include <QDir>
 #include <QFile>
 #include <QImage>
 #include <QEventLoop>
 #include <QElapsedTimer>
+#include "RemoteNavigator.h"
 #include <cstdio>
 #include <functional>
 #include <algorithm>
@@ -158,12 +160,16 @@ int main(int argc, char *argv[])
     ctx->setContextProperty("LoggerModule",   &dummy);
     ctx->setContextProperty("G72Keys",        obj("g72Keys"));
     ctx->setContextProperty("InstallManager", &dummy);
+    // Настоящий навигатор: проверяем и рамку фокуса. Живёт дольше движка QML.
+    RemoteNavigator &remoteNav = *new RemoteNavigator(&app);
+    ctx->setContextProperty("RemoteNav", &remoteNav);
 
     engine.load(QUrl("qrc:/qml/Main.qml"));
     if (engine.rootObjects().isEmpty()) return 2;
     auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!win) return 3;
     QObject *root = win;
+    remoteNav.setWindow(win);
 
     struct Config { QString tag; double scale; int font; QString lang; };
     const QList<Config> configs = {
@@ -199,6 +205,10 @@ int main(int argc, char *argv[])
         { "15b_tile_menu",  "root.openScreen(Settings.tr('Games'), 'games', false)",                       1200 },
         { "15c_new_shortcut", "root.openScreen(Settings.tr('Games'), 'games', false)",                     1200 },
         { "16_power_menu",  "powerMenu.menuVisible = true",                                                900 },
+        // Навигация стрелками: рамка фокуса на плитках, в меню питания и в диалоге
+        { "19_nav_games",   "root.openScreen(Settings.tr('Games'), 'games', false)",                       1200 },
+        { "19b_nav_power",  "powerMenu.toggle()",                                                          900 },
+        { "19c_nav_prompt", "root.promptDialog.show({title:'Удаление', message:'Удалить ярлык?', buttons:[{label:'Отмена',role:'cancel',action:function(){}},{label:'Удалить',role:'danger',action:function(){}}]})", 900 },
         { "17_notification", "NotificationModule.visible = true; NotificationModule.showRequested()",     1100 },
         { "18_update",      "UpdateManager.updateReady = true",                                            1100 },
         { "08_prompt",      "root.promptDialog.show({title:'Удаление', message:'Удалить «The Elder Scrolls V: Skyrim Special Edition — Anniversary Upgrade» вместе с файлами? Это действие нельзя отменить.', buttons:[{label:'Отмена',role:'cancel',action:function(){}},{label:'Удалить только ярлык',role:'primary',action:function(){}},{label:'Удалить вместе с файлами',role:'danger',action:function(){}}]})", 900 },
@@ -226,6 +236,7 @@ int main(int argc, char *argv[])
             for (const Shot &s : shots) {
                 if (!wanted(s.name)) continue;
                 js(root, "stack.pop(null)");
+                remoteNav.clear();
                 js(root, "powerMenu.menuVisible = false");
                 js(root, "NotificationModule.visible = false; NotificationModule.hideRequested()");
                 js(root, "UpdateManager.updateReady = false");
@@ -248,6 +259,21 @@ int main(int argc, char *argv[])
                 if (qEnvironmentVariableIsSet("SNAP_PERF"))
                     std::fprintf(stderr, "PERF %-22s open %4lld ms, frames %3d in %d ms, worst frame %lld ms\n",
                                  qPrintable(s.name), openMs, frames, s.waitMs, worst);
+                if (s.name.startsWith("19")) {
+                    // Курсор — в левый верхний угол окна, затем стрелки
+                    QCursor::setPos(win->mapToGlobal(QPoint(1, 1)));
+                    const QStringList keys = s.name == "19_nav_games" ? QStringList{"down", "down", "right"}
+                                            : s.name == "19b_nav_power" ? QStringList{"down", "down"}
+                                            : QStringList{"down", "right"};
+                    for (const QString &k : keys) { remoteNav.move(k); wait(150); }
+                    QQuickItem *t = remoteNav.target();
+                    std::fprintf(stderr, "NAV %-16s target %s rect %.0f,%.0f %.0fx%.0f\n",
+                                 qPrintable(s.name),
+                                 t ? t->metaObject()->className() : "none",
+                                 remoteNav.targetRect().x(), remoteNav.targetRect().y(),
+                                 remoteNav.targetRect().width(), remoteNav.targetRect().height());
+                    wait(300);
+                }
                 if (s.name == "15c_new_shortcut") {
                     js(root, "stack.currentItem.editDialog.open({type:'shortcut', kind:'app', title:'', icon:'', path:'', id:''})");
                     wait(1000);

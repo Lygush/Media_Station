@@ -20,7 +20,7 @@
   <Controller7>Default</Controller7>
   <Controller8>Default</Controller8>
   <LastChecked>01.01.0001 00:00:00</LastChecked>
-  <CheckWhen>24</CheckWhen>
+  <CheckWhen>0</CheckWhen>
   <Notifications>2</Notifications>
   <ProfileChangedNotification>False</ProfileChangedNotification>
   <DisconnectBTAtStop>False</DisconnectBTAtStop>

@@ -113,6 +113,10 @@ public:
     bool    autoDismiss() const { return m_current.autoDismiss; }
     int     duration()    const { return m_current.duration; }
 
+    /// Показать уведомление из QML (текст уже переведён на стороне QML).
+    /// level: "info" / "warning" / "error".
+    Q_INVOKABLE void post(const QString &message, const QString &level = QStringLiteral("info"),
+                          bool autoDismiss = true, int durationMs = 5000);
     Q_INVOKABLE void onDismissed();
     Q_INVOKABLE void dismiss();
 
