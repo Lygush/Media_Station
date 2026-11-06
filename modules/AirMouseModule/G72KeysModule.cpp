@@ -192,7 +192,12 @@ void G72KeysModule::applyCursorState()
     const int  vk     = static_cast<int>(kb->vkCode);
     const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
 
-    const char *keyName = vkToKeyName(vk);
+    // Esc с обычной клавиатуры в режиме ТВ = кнопка «Меню» пульта (оверлей с
+    // выходом из Android TV). Раньше Esc ловила только горячая клавиша в QML —
+    // она срабатывает, лишь когда фокус у окна MediaStation, а при показе ТВ
+    // фокус может оказаться у эмулятора. Вне режима ТВ Esc не трогаем.
+    const bool escAsMenu = (vk == VK_ESCAPE) && s_instance->m_emulatorMode;
+    const char *keyName = escAsMenu ? G72Keys::kMenu : vkToKeyName(vk);
     if (!keyName)
         return CallNextHookEx(s_keyboardHook, nCode, wParam, lParam);
 
@@ -259,7 +264,10 @@ void G72KeysModule::applyCursorState()
 void G72KeysModule::processKey(int vkCode, bool isDown)
 {
     if (!isDown) return;
-    const char *keyName = vkToKeyName(vkCode);
+    // Esc приходит сюда только из режима ТВ (см. keyboardHookProc). Если режим
+    // уже закончился, пока событие шло через очередь, — ничего не делаем.
+    if (vkCode == VK_ESCAPE && !m_emulatorMode && !m_overlayOpen) return;
+    const char *keyName = (vkCode == VK_ESCAPE) ? G72Keys::kMenu : vkToKeyName(vkCode);
     if (!keyName) return;
     dispatchKey(keyName);
 }

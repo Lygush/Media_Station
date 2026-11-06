@@ -254,6 +254,25 @@ Item {
         }
     }
 
+    // Обложка загружена на странице игры (кнопка «Получить информацию»):
+    // раньше плитка обновлялась только после повторного входа на экран —
+    // модель плиток читается из game_info.json лишь в loadData().
+    // «?v=…» в адресе — чтобы Image не взял из кэша старую картинку, если
+    // новая обложка записана в тот же файл cover.jpg.
+    Connections {
+        target: typeof GameMediaModule !== "undefined" ? GameMediaModule : null
+        ignoreUnknownSignals: true
+        function onMediaFetched(tileId, media) {
+            if (!media || !media.coverPath) return
+            for (var i = 0; i < tilesModel.count; i++) {
+                if (tilesModel.get(i).id === tileId) {
+                    tilesModel.setProperty(i, "coverPath", media.coverPath + "?v=" + Date.now())
+                    break
+                }
+            }
+        }
+    }
+
     Connections {
         target: TileManager
 

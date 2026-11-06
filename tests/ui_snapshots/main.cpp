@@ -208,6 +208,8 @@ int main(int argc, char *argv[])
         // Навигация стрелками: рамка фокуса на плитках, в меню питания и в диалоге
         { "19_nav_games",   "root.openScreen(Settings.tr('Games'), 'games', false)",                       1200 },
         { "19b_nav_power",  "powerMenu.toggle()",                                                          900 },
+        // Обложка, полученная на странице игры, появляется на плитке сразу
+        { "20_cover_refresh", "root.openScreen(Settings.tr('Games'), 'games', false)",                    1200 },
         { "19c_nav_prompt", "root.promptDialog.show({title:'Удаление', message:'Удалить ярлык?', buttons:[{label:'Отмена',role:'cancel',action:function(){}},{label:'Удалить',role:'danger',action:function(){}}]})", 900 },
         { "17_notification", "NotificationModule.visible = true; NotificationModule.showRequested()",     1100 },
         { "18_update",      "UpdateManager.updateReady = true",                                            1100 },
@@ -259,6 +261,13 @@ int main(int argc, char *argv[])
                 if (qEnvironmentVariableIsSet("SNAP_PERF"))
                     std::fprintf(stderr, "PERF %-22s open %4lld ms, frames %3d in %d ms, worst frame %lld ms\n",
                                  qPrintable(s.name), openMs, frames, s.waitMs, worst);
+                if (s.name == "20_cover_refresh") {
+                    js(root, "GameMediaModule.mediaFetched('t1', {coverPath: 'qrc:/assets/background.png'})");
+                    wait(600);
+                    js(root, "(function(){ var t = stack.currentItem.tilesModel;"
+                             " for (var i = 0; i < t.count; i++) if (t.get(i).id === 't1')"
+                             " console.log('COVER t1 =', t.get(i).coverPath) })()");
+                }
                 if (s.name.startsWith("19")) {
                     // Курсор — в левый верхний угол окна, затем стрелки
                     QCursor::setPos(win->mapToGlobal(QPoint(1, 1)));
