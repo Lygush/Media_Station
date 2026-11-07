@@ -9,6 +9,9 @@
 #include <QVariantMap>
 #include <QString>
 
+#include <atomic>
+#include <thread>
+
 #ifdef Q_OS_WIN
 #  include <windows.h>
 #endif
@@ -17,6 +20,9 @@ namespace G72Keys {
 constexpr auto kModule    = "g72keys";
 constexpr auto kEventKey  = "keyPressed";
 constexpr auto kEventMode = "modeChanged";
+// Переустановить хук клавиатуры, чтобы он снова стал первым в цепочке
+// (см. G72KeysModule::reinstallKeyboardHook)
+constexpr auto kEventReinstallHook = "reinstallHook";
 
 constexpr auto kHome      = "home";
 constexpr auto kBack      = "back";
@@ -91,13 +97,34 @@ private:
     static LRESULT CALLBACK mouseHookProc(int nCode, WPARAM wParam, LPARAM lParam);
     static HHOOK s_keyboardHook;
     static HHOOK s_mouseHook;
+
+    // LL-хуки живут в своём потоке со своим циклом сообщений. Раньше они
+    // стояли в GUI-потоке: любая задержка интерфейса дольше
+    // LowLevelHooksTimeout (декодирование кадров анимации загрузки ТВ,
+    // waitForFinished, тяжёлый QML) — и Windows 7+ молча снимает хук. После
+    // этого пульт и Esc в Android TV «умирали» до перезапуска программы.
+    void startHookThread();
+    void stopHookThread();
+    void hookThreadMain();
+    void requestHookReinstall();          // из любого потока
+    static void reinstallKeyboardHook();  // только в потоке хуков
+    static constexpr UINT kMsgReinstallHook = WM_APP + 1;
+    // В режиме ТВ хук переустанавливается периодически: окно эмулятора,
+    // став активным, может поставить свой перехватчик ПОСЛЕ нашего — он
+    // тогда вызывается первым и съедает клавиши (симптом: Esc и стрелки
+    // не работают, пока не нажать Win).
+    static constexpr UINT kHookRefreshMs = 2000;
+    std::atomic<bool>   m_loggedTvKey { false };   // диагностика: первая клавиша в режиме ТВ
+    std::thread         m_hookThread;
+    std::atomic<DWORD>  m_hookThreadId { 0 };
 #endif
 
-    static G72KeysModule *s_instance;
+    static std::atomic<G72KeysModule *> s_instance;
 
-    bool      m_emulatorMode   = false;
-    bool      m_overlayOpen    = false;
-    bool      m_overlayClosing = false; // cooldown после закрытия оверлея
+    // Флаги читаются из потока хуков — поэтому atomic
+    std::atomic<bool> m_emulatorMode   { false };
+    std::atomic<bool> m_overlayOpen    { false };
+    std::atomic<bool> m_overlayClosing { false }; // cooldown после закрытия оверлея
     bool      m_cursorHidden   = false;
     bool      m_shutdownDone   = false;
     EventBus *m_bus            = nullptr;

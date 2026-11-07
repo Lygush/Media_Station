@@ -11,6 +11,8 @@
 #include "tools/GameInfoStore.h"
 
 #include <QStorageInfo>
+#include <QPointer>
+#include <QtConcurrent/QtConcurrentRun>
 #include <QRegularExpression>
 #include <QDebug>
 #include <QDir>
@@ -541,7 +543,29 @@ int TileManager::countTilesById(const QString &tileId) const
 // Файловая система
 // ═════════════════════════════════════════════════════════════════════════════
 
-QVariantList TileManager::listDrives()
+void TileManager::listDirAsync(const QString &requestId, const QString &path,
+                               const QString &filterExts)
+{
+    QPointer<TileManager> self(this);
+    // listDir/listDrives не трогают состояние объекта — безопасно в пуле потоков
+    (void)QtConcurrent::run([self, requestId, path, filterExts]() {
+        const QVariantList entries = path.isEmpty() ? TileManager::listDrivesImpl()
+                                                    : TileManager::listDirImpl(path, filterExts);
+        if (self)
+            QMetaObject::invokeMethod(self.data(), [self, requestId, entries]() {
+                if (self) emit self->dirListReady(requestId, entries);
+            }, Qt::QueuedConnection);
+    });
+}
+
+QVariantList TileManager::listDrives() { return listDrivesImpl(); }
+
+QVariantList TileManager::listDir(const QString &path, const QString &filterExts)
+{
+    return listDirImpl(path, filterExts);
+}
+
+QVariantList TileManager::listDrivesImpl()
 {
     QVariantList result;
     const QList<QStorageInfo> volumes = QStorageInfo::mountedVolumes();
@@ -570,7 +594,7 @@ QVariantList TileManager::listDrives()
     return result;
 }
 
-QVariantList TileManager::listDir(const QString &path, const QString &filterExts)
+QVariantList TileManager::listDirImpl(const QString &path, const QString &filterExts)
 {
     QVariantList result;
     const QDir dir(path);

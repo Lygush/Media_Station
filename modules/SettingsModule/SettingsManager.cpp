@@ -48,6 +48,18 @@ QString SettingsManager::installPath() const
     return p.isEmpty() ? defaultInstallPath() : p;
 }
 
+QString SettingsManager::archivePath() const
+{
+    return m_settings.value("archivePath", QString()).toString().trimmed();
+}
+
+void SettingsManager::setArchivePath(const QString &path)
+{
+    if (archivePath() == path.trimmed()) return;
+    m_settings.setValue("archivePath", path.trimmed());
+    emit archivePathChanged();
+}
+
 double SettingsManager::uiScale() const
 {
     return m_settings.value("uiScale", 1.0).toDouble();

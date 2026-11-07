@@ -1,4 +1,5 @@
 // modules/GameInfoModule/GameInfoModule.cpp
+#include "tools/LocalModelPaths.h"
 #include "GameInfoModule.h"
 #include "GameInfoFetcher.h"
 #include "tools/LlamaClient.h"
@@ -289,17 +290,8 @@ void GameInfoModule::doFetch(const QString &tileId,
     // загружаем её заново, если объект есть, но модель не в памяти.
     if (!m_llama->isReady()) {
 
-        const QString modelPath = QSettings("MediaStation", "MediaStation")
-            .value("llamaModelPath").toString();
+        const QString resolvedPath = LocalModels::llamaModelPath();
 
-        const QString resolvedPath = modelPath.isEmpty()
-            ? QCoreApplication::applicationDirPath()
-              + "/tools/llama/models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
-            : modelPath;
-
-        GIM_LOG(Logger::kLevelInfo,
-                QString("LlamaClient: model path from settings: \"%1\"").arg(
-                    modelPath.isEmpty() ? "(empty, using default)" : modelPath));
         GIM_LOG(Logger::kLevelInfo,
                 QString("LlamaClient: resolved path: \"%1\"").arg(resolvedPath));
 

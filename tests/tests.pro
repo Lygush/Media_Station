@@ -15,3 +15,9 @@ SUBDIRS = \
 
 # G72BatteryModule использует WinRT — собирается только MSVC
 win32-msvc*: SUBDIRS += unit/tst_g72battery_mock
+# Поддельный adb в этом тесте — bash-скрипт, поэтому только не-Windows
+!win32: SUBDIRS += unit/tst_androidtv_console
+# Клиент gRPC эмулятора против настоящего сервера (python3 + grpcio; без них — пропуск)
+SUBDIRS += unit/tst_emulator_grpc
+SUBDIRS += unit/tst_audiotags
+SUBDIRS += unit/tst_adguardhome

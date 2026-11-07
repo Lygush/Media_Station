@@ -11,6 +11,7 @@ Item {
         property bool   fullscreen:      false
         property string language:        "ru"
         property string installPath:     "C:/MediaStation/data/games"
+        property string archivePath:     ""
         property double uiScale:         1.0
         property int    fontOffset:      0
         property bool   enableFogShader: false
@@ -62,6 +63,8 @@ Item {
         function listFolderTiles(k, f) { return [] }
         function listDrives() { return [ { name: "C:", path: "C:/" }, { name: "D: Игры и очень длинная метка тома", path: "D:/" } ] }
         function listDir(p, f) { return [] }
+        signal dirListReady(string requestId, var entries)
+        function listDirAsync(id, p, f) { dirListReady(id, p === "" ? listDrives() : listDir(p, f)) }
         function readGameInfo(folder) { return { name: "Cyberpunk 2077", description: "Длинное описание игры. ".repeat(20),
                                                  developer: "CD PROJEKT RED", genres: ["RPG", "Action"], releaseYear: 2020 } }
         function isInstalling(id) { return id === "net_x" }
@@ -101,6 +104,9 @@ Item {
     // ── GameLibraryModule ────────────────────────────────────────────────────
     property QtObject gameLibrary: QtObject {
         property bool scanning: false
+        property bool compressAvailable: true
+        signal compressProgress(string gameId, real progress)
+        signal compressFinished(string gameId, bool success, bool compressed)
         signal scanFinished(var entries)
         signal libraryEntryChanged(string gameId, var entry)
         signal archiveProgress(string gameId, real progress, string currentFile)
@@ -110,17 +116,19 @@ Item {
         signal folderSizeReady(string gameId, var bytes)
         signal tileCreated(string gameId, bool success)
         function currentEntries() { return [
-            { id: "a1", gameId: "a1", name: "Cyberpunk 2077", type: "installed", available: true, installPath: "C:/g/1", sizeCached: 72000000000, tileCount: 1, iconPath: "" },
+            { id: "a1", gameId: "a1", name: "Cyberpunk 2077", type: "installed", available: true, installPath: "C:/g/1", sizeCached: 72000000000, tileCount: 1, iconPath: "", compressed: true },
             { id: "a2", gameId: "a2", name: "The Elder Scrolls V: Skyrim Special Edition — Anniversary Upgrade", type: "archive", available: true, installPath: "C:/g/2", archivePath: "C:/g/2/archive/x.7z", sizeCached: 18000000000, tileCount: 0, iconPath: "" },
             { id: "a3", gameId: "a3", name: "Ведьмак 3: Дикая Охота — Издание «Игра года»", type: "installed", available: true, installPath: "C:/g/3", sizeCached: 50000000000, tileCount: 2, iconPath: "", archiving: true, archiveProgress: 0.37, archiveCurrentFile: "game/content/patch0/bundles/very_long_file_name_texture.bundle" },
             { id: "a4", gameId: "a4", name: "Steam", type: "external", available: false, installPath: "C:/g/6", sizeCached: -1, tileCount: 1, iconPath: "" },
-            { id: "a5", gameId: "a5", name: "Hollow Knight", type: "installed", available: true, installPath: "C:/g/5", sizeCached: 9000000000, tileCount: 1, iconPath: "", legacyNoMetadata: true }
+            { id: "a5", gameId: "a5", name: "Hollow Knight", type: "installed", available: true, installPath: "C:/g/5", sizeCached: 9000000000, tileCount: 1, iconPath: "", legacyNoMetadata: true },
+            { id: "a6", gameId: "a6", name: "Baldur's Gate 3", type: "installed", available: true, installPath: "C:/g/7", sizeCached: 120000000000, tileCount: 1, iconPath: "", compressing: true, compressProgress: 0.62 }
         ] }
         function scanLibrary() { scanFinished(currentEntries()) }
         function archiveGame(id) {} function cancelArchive(id) {} function cancelExtract(id) {}
         function createTile(id, k, f) {} function deleteGame(id) {} function extractGame(id, k, s, f) {}
         function openFolder(p) {} function reassignPath(id, p) {} function regenerateMetadata(id) {}
         function requestFolderSize(id, p) {}
+        function compressGame(id, c) {} function cancelCompress(id) {}
     }
 
     // ── JoystickModule ───────────────────────────────────────────────────────
@@ -218,6 +226,13 @@ Item {
         property bool   running: false
         property string status: ""
         property int    qcow2SizeMb: 3400
+        property bool   adBlockEnabled: true
+        property string adBlockState: "running"
+        property bool   adBlockBusy: false
+        property real   adBlockDownload: -1
+        function downloadAdBlock() {}
+        function refreshAdBlockState() {} function installAdBlock() {}
+        function uninstallAdBlock() {} function openAdBlockPanel() {}
         signal emulatorReadyBehind()
         signal emulatorClosed()
         signal emulatorRestoringMediaStation()

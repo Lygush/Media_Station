@@ -1,4 +1,5 @@
 // settings/GamesSection.qml
+// Папка установки игр и папка архивов — отдельно (можно на разных дисках).
 import QtQuick
 import QtQuick.Controls.Basic 2.15
 import QtQuick.Dialogs
@@ -8,35 +9,69 @@ import "../base"
 Column {
     spacing: 0
 
-    FolderDialog {
-        id: installFolderDialog
-        title: Settings.safeTr("install_path")
-        currentFolder: {
-            var p = Settings.installPath
-            return (p && p !== "") ? "file:///" + p.replace(/\\/g, "/") : "file:///C:/"
+    // Квадратная кнопка с иконкой (обзор, сброс)
+    component IconButton: Item {
+        id: btn
+        property string icon: ""
+        signal clicked()
+        width: Settings.us(36); height: Settings.us(36)
+        Rectangle {
+            anchors.fill: parent; radius: 9
+            color: btnMA.containsMouse ? Settings.accent(0.4) : Settings.accent(0.2)
+            border.color: Settings.accent(0.4); border.width: 1
+            Behavior on color { ColorAnimation { duration: 120 } }
         }
-        onAccepted: {
-            var path = selectedFolder.toString().replace(/^file:\/\/\//, "")
-            if (path.length > 0 && path[1] !== ":") path = "/" + path
-            Settings.installPath = path
+        Image {
+            anchors.centerIn: parent
+            source: btn.icon
+            width: Settings.us(18); height: Settings.us(18)
+            sourceSize.width: 100; sourceSize.height: 100
+            fillMode: Image.PreserveAspectFit
+        }
+        MouseArea {
+            id: btnMA; anchors.fill: parent; hoverEnabled: true
+            onClicked: btn.clicked()
         }
     }
 
-    SettingsRow {
-        label: Settings.safeTr("install_path")
+    // Строка «путь + обзор (+ сброс)». value — текущий путь, placeholder —
+    // подсказка для пустого значения, chosen(path) — выбран новый путь.
+    component FolderRow: SettingsRow {
+        id: row
+        property string value: ""
+        property string placeholder: ""
+        property bool   allowReset: false     // пустое значение допустимо (кнопка сброса)
+        signal chosen(string path)
+
+        // Свойством, а не дочерним элементом: содержимое SettingsRow уходит в
+        // Row.children, куда невизуальный FolderDialog не положить
+        property FolderDialog folderDialog: FolderDialog {
+            title: row.label
+            currentFolder: (row.value && row.value !== "")
+                           ? "file:///" + row.value.replace(/\\/g, "/") : "file:///C:/"
+            onAccepted: {
+                var path = selectedFolder.toString().replace(/^file:\/\/\//, "")
+                if (path.length > 0 && path[1] !== ":") path = "/" + path
+                row.chosen(path)
+            }
+        }
+
         Row {
             spacing: Settings.us(8)
 
             TextField {
-                id: installPathField
+                id: pathField
                 width: Settings.us(280); height: Settings.us(36)
                 color: "white"; font.pixelSize: Settings.fs(13)
-                text: Settings.installPath
-                placeholderText:      "C:/Games"
+                text: row.value
+                placeholderText:      row.placeholder
                 placeholderTextColor: Settings.accent(0.4)
                 verticalAlignment:    Text.AlignVCenter
                 leftPadding:  Settings.us(10); rightPadding: Settings.us(10)
-                onEditingFinished: if (text.trim() !== "") Settings.installPath = text.trim()
+                onEditingFinished: {
+                    var t = text.trim()
+                    if (t !== "" || row.allowReset) row.chosen(t)
+                }
                 background: Rectangle {
                     radius: 9; clip: true
                     gradient: Gradient {
@@ -45,7 +80,7 @@ Column {
                     }
                     Rectangle {
                         anchors.fill: parent; radius: 9; color: "transparent"
-                        border.color: installPathField.activeFocus
+                        border.color: pathField.activeFocus
                                       ? Settings.accent(0.9) : Settings.accent(0.33)
                         border.width: 1.5
                         Behavior on border.color { ColorAnimation { duration: 150 } }
@@ -53,26 +88,33 @@ Column {
                 }
             }
 
-            Item {
-                width: Settings.us(36); height: Settings.us(36)
-                Rectangle {
-                    anchors.fill: parent; radius: 9
-                    color: browseMA.containsMouse ? Settings.accent(0.4) : Settings.accent(0.2)
-                    border.color: Settings.accent(0.4); border.width: 1
-                    Behavior on color { ColorAnimation { duration: 120 } }
-                }
-                Image {
-                    anchors.centerIn: parent
-                    source: "qrc:/assets/icons/ic_folder.png"
-                    width: Settings.us(18); height: Settings.us(18)
-                    sourceSize.width: 100; sourceSize.height: 100
-                    fillMode: Image.PreserveAspectFit
-                }
-                MouseArea {
-                    id: browseMA; anchors.fill: parent; hoverEnabled: true
-                    onClicked: installFolderDialog.open()
-                }
+            IconButton {
+                icon: "qrc:/assets/icons/ic_folder.png"
+                onClicked: row.folderDialog.open()
+            }
+            IconButton {
+                visible: row.allowReset && row.value !== ""
+                icon: "qrc:/assets/icons/ic_delete.png"
+                onClicked: row.chosen("")
             }
         }
+    }
+
+    FolderRow {
+        label: Settings.safeTr("install_path")
+        value: Settings.installPath
+        placeholder: "C:/Games"
+        onChosen: function(path) { if (path !== "") Settings.installPath = path }
+    }
+
+    // Архивы — отдельно: можно держать на другом диске, тогда архивации не
+    // нужно двойное место на диске с игрой. Пусто — как раньше, внутри папки
+    // игры (<игра>/archive/).
+    FolderRow {
+        label: Settings.safeTr("archive_path")
+        value: Settings.archivePath
+        placeholder: Settings.safeTr("archive_path_default")
+        allowReset: true
+        onChosen: function(path) { Settings.archivePath = path }
     }
 }

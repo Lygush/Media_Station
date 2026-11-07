@@ -14,6 +14,7 @@ QtObject {
     property bool   fullscreen:      SettingsManager.fullscreen
     property string language:        SettingsManager.language
     property string installPath:     SettingsManager.installPath
+    property string archivePath:     SettingsManager.archivePath
     property double uiScale:         SettingsManager.uiScale
     property int    fontOffset:      SettingsManager.fontOffset
     property bool   enableFogShader: SettingsManager.enableFogShader
@@ -34,6 +35,7 @@ QtObject {
     onFullscreenChanged:      SettingsManager.fullscreen      = fullscreen
     onLanguageChanged:        SettingsManager.language        = language
     onInstallPathChanged:     SettingsManager.installPath     = installPath
+    onArchivePathChanged:     SettingsManager.archivePath     = archivePath
     onUiScaleChanged:         SettingsManager.uiScale         = uiScale
     onFontOffsetChanged:      SettingsManager.fontOffset      = fontOffset
     onEnableFogShaderChanged: SettingsManager.enableFogShader = enableFogShader

@@ -171,8 +171,21 @@ void CALLBACK AndroidTVModule::s_winEventProc(
     if (!self->isEmulatorMainWindow(hwnd)) {
         // Побочное окно эмулятора (панель инструментов и т.п.) — прячем, пока
         // эмулятор не показан, чтобы оно не мелькало поверх рабочего стола.
-        if (knownPid && !self->m_emulatorShown && IsWindowVisible(hwnd) && hwnd != self->m_emulatorHwnd)
+        // emulator.exe перезапускает себя как qemu-system-*.exe, и панель
+        // создаёт уже НОВЫЙ процесс, которого ещё нет в m_emulatorPid — раньше
+        // такое окно не узнавалось и «проскакивало» поверх MediaStation (оно
+        // само TOPMOST). Дерево процессов строим только для Qt-окон: события
+        // SHOW приходят от всех окон системы.
+        if (self->m_emulatorShown || !IsWindowVisible(hwnd) || hwnd == self->m_emulatorHwnd) return;
+        const bool ours = knownPid
+            || (self->m_initialEmulatorPid
+                && windowClass(hwnd).startsWith(QLatin1String("Qt"))
+                && self->isEmulatorProcess(pid));
+        if (ours) {
             ShowWindow(hwnd, SW_HIDE);
+            self->logToEmulatorFile(QString("WinEvent: hid emulator side window class='%1'")
+                                        .arg(windowClass(hwnd)));
+        }
         return;
     }
     if (!knownPid && !self->isEmulatorProcess(pid)) return;
@@ -250,9 +263,14 @@ HWND AndroidTVModule::findMediaStationWindow() const
 
 QSize AndroidTVModule::getCurrentScreenResolution() const
 {
-    // Монитор, на котором находится MediaStation (а не всегда основной)
-    if (m_mediaStationHwnd && IsWindow(m_mediaStationHwnd)) {
-        HMONITOR mon = MonitorFromWindow(m_mediaStationHwnd, MONITOR_DEFAULTTOPRIMARY);
+    // Монитор, на котором находится MediaStation (а не всегда основной).
+    // При первом запуске ТВ m_mediaStationHwnd ещё пуст — раньше тогда брался
+    // основной монитор (1920x1080), а MediaStation был на 2560x1440: эмулятор
+    // рисовал 1080p, растянутое на 1440p.
+    HWND ms = (m_mediaStationHwnd && IsWindow(m_mediaStationHwnd)) ? m_mediaStationHwnd
+                                                                  : findMediaStationWindow();
+    if (ms) {
+        HMONITOR mon = MonitorFromWindow(ms, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFOEXW mi = {};
         mi.cbSize = sizeof(mi);
         if (GetMonitorInfoW(mon, &mi)) {
@@ -297,14 +315,16 @@ void AndroidTVModule::hideExtraEmulatorWindows(DWORD pid, HWND mainHwnd)
     }, reinterpret_cast<LPARAM>(&ctx));
 }
 
-void AndroidTVModule::positionEmulatorBehindMediaStation(HWND hwnd)
+// Окно эмулятора до показа ТВ держится СКРЫТЫМ (попытка 06.11 держать его
+// видимым под MediaStation с самой загрузки дала чёрный экран: окно
+// показывалось раньше, чем эмулятор сам его показал и создал GL-окно картинки).
+void AndroidTVModule::placeEmulatorUnderMediaStation(HWND hwnd, bool show)
 {
     if (!hwnd || !IsWindow(hwnd)) return;
     if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd)) {
         m_mediaStationHwnd = findMediaStationWindow();
         if (!m_mediaStationHwnd) return;
     }
-    if (m_emulatorShown) return;   // уже показан — не скрываем
 
     // Без рамки и заголовка
     LONG_PTR style   = GetWindowLongPtr(hwnd, GWL_STYLE);
@@ -314,8 +334,7 @@ void AndroidTVModule::positionEmulatorBehindMediaStation(HWND hwnd)
     SetWindowLongPtr(hwnd, GWL_STYLE, style);
     SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
 
-    // Прячем до позиционирования (без мелькания)
-    ShowWindow(hwnd, SW_HIDE);
+    if (!show) ShowWindow(hwnd, SW_HIDE);   // прячем до позиционирования (без мелькания)
 
     RECT msRect;
     GetWindowRect(m_mediaStationHwnd, &msRect);
@@ -324,19 +343,230 @@ void AndroidTVModule::positionEmulatorBehindMediaStation(HWND hwnd)
     const int w = msRect.right - msRect.left;
     const int h = msRect.bottom - msRect.top;
 
-    // SWP_FRAMECHANGED — иначе изменение стиля не применяется
-    SetWindowPos(hwnd, nullptr, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    // HWND_NOTOPMOST — под всеми TOPMOST (т.е. под MediaStation) и снимает
+    // TOPMOST, если эмулятор поставил его себе сам («Always on top»).
+    // SWP_FRAMECHANGED — иначе смена стиля не применяется.
+    SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid) hideExtraEmulatorWindows(pid, hwnd);
 
-    logToEmulatorFile(QString("Emulator positioned under MediaStation at (%1,%2) %3x%4")
-                          .arg(x).arg(y).arg(w).arg(h));
+    if (show) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
+    logToEmulatorFile(QString("Emulator %1 under MediaStation at (%2,%3) %4x%5")
+                          .arg(show ? "shown" : "placed (hidden)").arg(x).arg(y).arg(w).arg(h));
+}
+
+void AndroidTVModule::positionEmulatorBehindMediaStation(HWND hwnd)
+{
+    if (m_emulatorShown) return;   // уже показан — не скрываем
+    placeEmulatorUnderMediaStation(hwnd, false);
     startPositionSyncTimer();
 }
+
+// Снимок окна эмулятора без вывода на экран (MediaStation сверху, BitBlt с
+// экрана не годится). PW_RENDERFULLCONTENT берёт картинку у DWM, включая
+// дочернее GL-окно. Сетка 32×18 — проверка доли белых/чёрных точек.
+bool AndroidTVModule::sampleEmulatorContent(HWND hwnd, int *whitePct, int *blackPct) const
+{
+#ifndef PW_RENDERFULLCONTENT
+#  define PW_RENDERFULLCONTENT 0x00000002
+#endif
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    RECT rc;
+    if (!GetClientRect(hwnd, &rc)) return false;
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    if (w < 64 || h < 64) return false;
+
+    HDC screenDc = GetDC(nullptr);
+    HDC memDc    = CreateCompatibleDC(screenDc);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;          // сверху вниз
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(screenDc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool ok = false;
+    if (bmp && bits) {
+        HGDIOBJ old = SelectObject(memDc, bmp);
+        ok = PrintWindow(hwnd, memDc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+        if (ok) {
+            GdiFlush();
+            const auto *px = static_cast<const quint32 *>(bits);
+            int white = 0, black = 0, total = 0;
+            for (int gy = 0; gy < 18; ++gy) {
+                for (int gx = 0; gx < 32; ++gx) {
+                    const int sx = (gx * 2 + 1) * w / 64;
+                    const int sy = (gy * 2 + 1) * h / 36;
+                    const quint32 c = px[sy * w + sx];
+                    const int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+                    if (r >= 235 && g >= 235 && b >= 235) ++white;
+                    else if (r <= 12 && g <= 12 && b <= 12) ++black;
+                    ++total;
+                }
+            }
+            *whitePct = white * 100 / total;
+            *blackPct = black * 100 / total;
+        }
+        SelectObject(memDc, old);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+    return ok;
+}
+
+bool AndroidTVModule::forceForeground(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    HWND fg = GetForegroundWindow();
+    if (fg == hwnd) return true;
+
+    // SetForegroundWindow из «неактивного» процесса Windows может отклонить
+    // (окно только мигает на панели задач). Присоединяемся к вводу активного
+    // потока — тогда смена активного окна разрешена.
+    const DWORD myThread = GetCurrentThreadId();
+    const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const bool attached = fgThread && fgThread != myThread
+                          && AttachThreadInput(myThread, fgThread, TRUE);
+    SetForegroundWindow(hwnd);
+    if (GetWindowThreadProcessId(hwnd, nullptr) == myThread) SetFocus(hwnd);
+    if (attached) AttachThreadInput(myThread, fgThread, FALSE);
+    if (GetForegroundWindow() == hwnd) return true;
+
+    // Не вышло: клавиши пульта поглощает наш хук, и Windows не считает их
+    // вводом нашему процессу — смена активного окна запрещена. Нажатие Alt
+    // снимает запрет. Ввод обрабатывается АСИНХРОННО, поэтому Alt держим
+    // нажатым и повторяем попытку несколько раз (раньше Alt нажимался и
+    // отпускался до попытки — и не помогал, журнал 07.11).
+    INPUT alt = {};
+    alt.type = INPUT_KEYBOARD; alt.ki.wVk = VK_MENU;
+    SendInput(1, &alt, sizeof(INPUT));
+    bool ok = false;
+    // Паузы короткие: это поток интерфейса, и длинное ожидание само давало
+    // рывок анимации оверлея
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+        Sleep(attempt == 0 ? 1 : 8);
+        SetForegroundWindow(hwnd);
+        ok = (GetForegroundWindow() == hwnd);
+    }
+    alt.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &alt, sizeof(INPUT));
+    if (ok) return true;
+
+    // Последний способ — SwitchToThisWindow (им пользуется Alt+Tab)
+    SwitchToThisWindow(hwnd, TRUE);
+    Sleep(15);
+    if (GetForegroundWindow() == hwnd) return true;
+
+    HWND now = GetForegroundWindow();
+    wchar_t cls[64] = {};
+    if (now) GetClassNameW(now, cls, 63);
+    logToEmulatorFile(QString("forceForeground failed, foreground class='%1'")
+                          .arg(QString::fromWCharArray(cls)));
+    return false;
+}
+
+void AndroidTVModule::bringMediaStationToForeground()
+{
+    if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd))
+        m_mediaStationHwnd = findMediaStationWindow();
+    if (!m_mediaStationHwnd) return;
+    if (!forceForeground(m_mediaStationHwnd))
+        logToEmulatorFile("WARNING: MediaStation could not take foreground");
+}
+
+void AndroidTVModule::focusEmulator()
+{
+    if (!m_emulatorHwnd || !IsWindow(m_emulatorHwnd)) return;
+    if (!forceForeground(m_emulatorHwnd))
+        logToEmulatorFile("WARNING: emulator could not take foreground");
+}
+
+void AndroidTVModule::hideMediaStationForTv()
+{
+    if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd) || !m_emulatorShown) return;
+    // Сначала эмулятор активный — пока MediaStation ещё виден (у активного
+    // процесса есть право передать активность), потом прячем MediaStation.
+    focusEmulator();
+    ShowWindow(m_mediaStationHwnd, SW_HIDE);
+    m_msHiddenForTv = true;
+    // Эмулятор, став активным, может поставить свой перехватчик клавиатуры
+    // поверх нашего. Переустанавливаем наш сразу и ещё раз чуть позже (окно
+    // эмулятора обрабатывает активацию асинхронно); дальше — каждые 2 с.
+    requestKeyHookReinstall();
+    QTimer::singleShot(400, this, [this]() { if (m_msHiddenForTv) requestKeyHookReinstall(); });
+    logToEmulatorFile(QString("MediaStation hidden, emulator is foreground=%1")
+                          .arg(GetForegroundWindow() == m_emulatorHwnd));
+}
+
+void AndroidTVModule::showMediaStationOverTv()
+{
+    if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd)) return;
+    if (!m_msHiddenForTv) return;
+    // Невидимым (alpha 0) и поверх всех; затем — активным (см. ниже).
+    // Клавиши в любом случае идут через глобальный хук.
+    applyMediaStationAlpha(0);
+    SetWindowPos(m_mediaStationHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    m_msHiddenForTv = false;
+    // Пока активно полноэкранное окно эмулятора, его GPU-вывод перекрывает
+    // даже окна «поверх всех» — оверлей был не виден, пока не нажать Win
+    // (журнал 07.11). Win просто делал эмулятор неактивным; делаем то же:
+    // на время оверлея активен MediaStation. После закрытия оверлея
+    // hideMediaStationForTv() вернёт активность эмулятору.
+    bringMediaStationToForeground();
+
+    // Первое открытие оверлея — эмулятор за ним был чёрным (07.11): после
+    // смены активного окна его GL-окно не перерисовывается, пока гость не
+    // пришлёт новый кадр (меню Android неподвижно). Просим перерисовку
+    // сразу и ещё раз, когда смена режима вывода закончится.
+    auto redrawEmulator = [this]() {
+        if (m_emulatorHwnd && IsWindow(m_emulatorHwnd))
+            RedrawWindow(m_emulatorHwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+    };
+    redrawEmulator();
+    QTimer::singleShot(120, this, redrawEmulator);
+}
+
+// Курсор над окном эмулятора был бы виден (над MediaStation он скрыт через
+// Qt). Убираем его к правому краю экрана, а хук мыши в режиме ТВ не даёт его
+// двигать (G72KeysModule); на выходе возвращаем на место.
+void AndroidTVModule::parkCursor()
+{
+    if (m_cursorParked) return;
+    POINT pt;
+    if (!GetCursorPos(&pt)) return;
+    m_savedCursorX = pt.x;
+    m_savedCursorY = pt.y;
+    RECT r = {};
+    if (m_mediaStationHwnd && IsWindow(m_mediaStationHwnd)) GetWindowRect(m_mediaStationHwnd, &r);
+    else { r.right = GetSystemMetrics(SM_CXSCREEN); r.bottom = GetSystemMetrics(SM_CYSCREEN); }
+    SetCursorPos(r.right - 1, (r.top + r.bottom) / 2);
+    m_cursorParked = true;
+}
+
+void AndroidTVModule::restoreCursor()
+{
+    if (!m_cursorParked) return;
+    SetCursorPos(m_savedCursorX, m_savedCursorY);
+    m_cursorParked = false;
+}
+
+#else
+
+void AndroidTVModule::bringMediaStationToForeground() {}
+void AndroidTVModule::focusEmulator() {}
+void AndroidTVModule::hideMediaStationForTv() {}
+void AndroidTVModule::showMediaStationOverTv() {}
+void AndroidTVModule::parkCursor() {}
+void AndroidTVModule::restoreCursor() {}
 
 #endif // Q_OS_WIN
 
@@ -423,50 +653,20 @@ void AndroidTVModule::applyFullscreenAndSwitch()
         }
     }
 
-    // 1. Эмулятор: без рамки, на месте MediaStation, пока скрыт
-    RECT msRect;
-    GetWindowRect(m_mediaStationHwnd, &msRect);
-    const int x = msRect.left;
-    const int y = msRect.top;
-    const int w = msRect.right - msRect.left;
-    const int h = msRect.bottom - msRect.top;
-
-    LONG_PTR style = GetWindowLongPtr(m_emulatorHwnd, GWL_STYLE);
-    style &= ~LONG_PTR(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-    SetWindowLongPtr(m_emulatorHwnd, GWL_STYLE, style);
-    SetWindowPos(m_emulatorHwnd, nullptr, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED);
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(m_emulatorHwnd, &pid);
-    if (pid) hideExtraEmulatorWindows(pid, m_emulatorHwnd);
-
-    // 2. Показываем эмулятор под (непрозрачным пока) MediaStation
+    // 1. Эмулятор: без рамки, на месте MediaStation, показан ПОД ним
+    //    (MediaStation в это время — чёрное затемнение, непрозрачный)
+    placeEmulatorUnderMediaStation(m_emulatorHwnd, true);
     setEmulatorShown(true);
-    ShowWindow(m_emulatorHwnd, SW_SHOWNOACTIVATE);
-    InvalidateRect(m_emulatorHwnd, nullptr, FALSE);
-    UpdateWindow(m_emulatorHwnd);
     startPositionSyncTimer();
 
-    // 3. Через кадр (16 мс) делаем MediaStation прозрачным — эмулятор уже отрисован
-    QTimer::singleShot(16, this, [this]() {
-        if (!m_running || !m_emulatorShown) {
-            setSwitching(false);
-            return;
-        }
-        setMediaStationOpacity(0);
+    // 2. Перерисовка вместе с дочерним GL-окном (картинка гостя — в нём).
+    //    Без RDW_UPDATENOW: синхронная перерисовка чужого окна могла бы
+    //    подвесить GUI-поток, если эмулятор занят.
+    RedrawWindow(m_emulatorHwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 
-        // Фокус остаётся на MediaStation: оверлей и клавиши обрабатываются здесь
-        if (m_mediaStationHwnd) {
-            SetForegroundWindow(m_mediaStationHwnd);
-            SetFocus(m_mediaStationHwnd);
-        }
-
-        logToEmulatorFile(QString("applyFullscreenAndSwitch: emulator visible=%1")
-                              .arg(m_emulatorHwnd && IsWindowVisible(m_emulatorHwnd)));
-        notifyKeyMode(true);
-        setSwitching(false);
-    });
+    // 3. Пульт работает сразу; проявляем, когда эмулятор нарисовал картинку
+    notifyKeyMode(true);
+    revealWhenEmulatorPainted();
 
 #else
     logToEmulatorFile("applyFullscreenAndSwitch: not supported on this platform");
@@ -474,20 +674,87 @@ void AndroidTVModule::applyFullscreenAndSwitch()
 #endif
 }
 
+// Сразу после ShowWindow окно эмулятора белое (фон окна Qt), пока гость не
+// пришлёт кадр. Раньше MediaStation становился прозрачным через 16 мс — белая
+// заливка. Теперь чёрное затемнение держится, пока снимок окна не перестанет
+// быть белым (не дольше kRevealMaxWaitMs), затем плавное проявление.
+void AndroidTVModule::revealWhenEmulatorPainted()
+{
+    if (!m_revealTimer) {
+        m_revealTimer = new QTimer(this);
+        m_revealTimer->setInterval(kRevealPollMs);
+        connect(m_revealTimer, &QTimer::timeout, this, [this]() {
+            if (!m_running || !m_emulatorShown) {
+                m_revealTimer->stop();
+                setSwitching(false);
+                return;
+            }
+            const qint64 waited = m_revealClock.elapsed();
+            if (waited < kRevealMinWaitMs) return;
+
+            int white = -1, black = -1;
+#ifdef Q_OS_WIN
+            const bool sampled = sampleEmulatorContent(m_emulatorHwnd, &white, &black);
+#else
+            const bool sampled = false;
+#endif
+            ++m_revealChecks;
+            const bool painted = sampled && white < 50;
+            const bool timeout = waited >= kRevealMaxWaitMs;
+            if (!painted && !timeout && sampled) return;   // ещё белое — ждём
+
+            m_revealTimer->stop();
+            logToEmulatorFile(QString("reveal after %1 ms, %2 checks: %3 (white %4%, black %5%)")
+                                  .arg(waited).arg(m_revealChecks)
+                                  .arg(!sampled ? "snapshot failed" : painted ? "painted" : "TIMEOUT")
+                                  .arg(white).arg(black));
+
+            parkCursor();
+            fadeMediaStationOpacity(0, kRevealFadeMs, [this]() {
+                // Схема B: эмулятор — активное окно, MediaStation спрятан
+                hideMediaStationForTv();
+                logToEmulatorFile(QString("applyFullscreenAndSwitch: emulator visible=%1")
+#ifdef Q_OS_WIN
+                                      .arg(m_emulatorHwnd && IsWindowVisible(m_emulatorHwnd)));
+#else
+                                      .arg(false));
+#endif
+                setSwitching(false);
+            });
+        });
+    }
+    m_revealChecks = 0;
+    m_revealClock.start();
+    m_revealTimer->start();
+}
+
 void AndroidTVModule::restoreMediaStation()
 {
     const bool wasShown = m_emulatorShown;
     setEmulatorShown(false);
+    // Проявление ТВ могло быть ещё в процессе — его завершение уже не наступит
+    if (m_revealTimer) m_revealTimer->stop();
+    stopMediaStationFade();
+    setSwitching(false);
 
 #ifdef Q_OS_WIN
     if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd))
         m_mediaStationHwnd = findMediaStationWindow();
 
+    // Сначала MediaStation непрозрачный (под ним чёрное затемнение) и снова
+    // видимый (схема B прятала его на время ТВ), потом прячем эмулятор —
+    // иначе на кадр мелькал рабочий стол
+    if (m_mediaStationHwnd) {
+        setMediaStationOpacity(255);
+        if (m_msHiddenForTv || !IsWindowVisible(m_mediaStationHwnd))
+            ShowWindow(m_mediaStationHwnd, SW_SHOWNA);
+        m_msHiddenForTv = false;
+    }
+    restoreCursor();
     if (m_emulatorHwnd && IsWindow(m_emulatorHwnd))
         ShowWindow(m_emulatorHwnd, SW_HIDE);
 
     if (m_mediaStationHwnd) {
-        setMediaStationOpacity(255);
         // Пока эмулятор жив (работает «за» MediaStation) — держим TOPMOST,
         // после его закрытия флаг снимает onEmulatorFinished().
         if (m_running || m_booting)
@@ -495,7 +762,7 @@ void AndroidTVModule::restoreMediaStation()
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         else
             releaseMediaStationTopmost();
-        if (wasShown) SetForegroundWindow(m_mediaStationHwnd);
+        if (wasShown) bringMediaStationToForeground();
 
         DwmFlush();
         InvalidateRect(m_mediaStationHwnd, nullptr, TRUE);

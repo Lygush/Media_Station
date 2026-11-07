@@ -3,6 +3,8 @@
 // Запуск / остановка эмулятора, подготовка AVD, взаимодействие с adb.
 
 #include "AndroidTVModule.h"
+#include "AdGuardHome.h"
+#include "tools/LocalModelPaths.h"
 #include <QPointer>
 #include "LoggerModule.h"
 #include "core/EventBus.h"
@@ -24,6 +26,8 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QDebug>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QRegularExpression>
 #include <memory>
 
@@ -37,11 +41,6 @@ QString AndroidTVModule::adbPath() const
 QString AndroidTVModule::emulatorPath() const
 {
     return m_appDir + "/tools/android-sdk/emulator/emulator.exe";
-}
-
-QString AndroidTVModule::dnsProxyPath() const
-{
-    return m_appDir + "/tools/dnsproxy/dnsproxy.exe";
 }
 
 QString AndroidTVModule::avdHomePath() const
@@ -230,6 +229,7 @@ void AndroidTVModule::launch()
     m_lastBootPollOut.clear();
     m_emulatorLinesForwarded = 0;
     m_emuReportedBoot   = false;
+    m_emuDiscoveryFile.clear();
     m_unauthorizedPolls = 0;
     m_adbUnauthorized   = false;
     logImportant(Logger::kLevelInfo, "launching Android TV emulator with profile " + profile->name
@@ -245,7 +245,7 @@ void AndroidTVModule::launch()
     startKeepTopmostTimer();
 
     loadEmulatorSettings(*profile);
-    startDnsProxy();
+    startAdBlockProbe();
 
     // Эмулятор стартует ПОСЛЕ перезапуска adb-сервера, иначе первый запуск
     // заметно лагает (adb переподключается к уже работающему эмулятору).
@@ -256,7 +256,9 @@ void AndroidTVModule::launch()
         }
         logImportant(Logger::kLevelInfo, QString("adb server restarted (%1 ms), starting emulator")
                                              .arg(m_launchTimer.elapsed()));
-        startEmulator();
+        // Проверка AdGuard Home (≤ 700 мс) обычно успевает раньше adb
+        if (m_adBlockProbePending) m_afterAdBlockProbe = [this]() { startEmulator(); };
+        else                       startEmulator();
     });
 }
 
@@ -275,7 +277,7 @@ void AndroidTVModule::stop()
     // Эмулятор ещё не успел стартовать (идёт перезапуск adb) — просто отменяем запуск.
     if (!m_emulatorProcess || m_emulatorProcess->state() == QProcess::NotRunning) {
         stopKeepTopmostTimer();
-        stopDnsProxy();
+        m_afterAdBlockProbe = nullptr;
         setBooting(false);
         setRunning(false);
         setStatus("");
@@ -312,7 +314,7 @@ void AndroidTVModule::failLaunch(const QString &userStatus, const QString &logMe
     stopBootPolling();
     stopWindowPolling();
     removeWinEventHook();
-    stopDnsProxy();
+    m_afterAdBlockProbe = nullptr;
     setBooting(false);
     setRunning(false);
     setStatus(userStatus);
@@ -321,85 +323,6 @@ void AndroidTVModule::failLaunch(const QString &userStatus, const QString &logMe
     if (m_bus)
         emit m_bus->moduleEvent(QStringLiteral("androidtv"), QStringLiteral("launchFailed"),
                                 QVariantMap{{"reason", userStatus}});
-}
-
-// ── DNS proxy ────────────────────────────────────────────────────────────────
-// ВНИМАНИЕ: эмулятор получает DNS через -dns-server (порт всегда 53), поэтому
-// dnsproxy на порту 5300 эмулятором не используется. Оставлен как задел; если
-// он не установлен — просто пропускается.
-
-void AndroidTVModule::startDnsProxy()
-{
-    if (!QFile::exists(dnsProxyPath())) {
-        logToEmulatorFile("dnsproxy.exe not found, skipping");
-        m_dnsProxyPort = 0;
-        return;
-    }
-    if (m_dnsProxyProcess && m_dnsProxyProcess->state() != QProcess::NotRunning) {
-        logToEmulatorFile("DNS proxy already running");
-        return;
-    }
-    if (m_dnsProxyProcess) {
-        m_dnsProxyProcess->deleteLater();
-        m_dnsProxyProcess = nullptr;
-    }
-
-    m_dnsProxyPort = 5300;
-
-    QStringList upstreams;
-    for (const QString &s : m_dnsServer.split(',', Qt::SkipEmptyParts))
-        if (!s.trimmed().isEmpty()) upstreams << s.trimmed();
-    if (!upstreams.contains("8.8.8.8")) upstreams << "8.8.8.8";
-    if (!upstreams.contains("1.1.1.1")) upstreams << "1.1.1.1";
-
-    QStringList args;
-    args << "-l" << "127.0.0.1" << "-p" << QString::number(m_dnsProxyPort);
-    for (const QString &u : upstreams) args << "-u" << u;
-    args << "--cache";
-
-    logToEmulatorFile(QString("dnsproxy config: port %1, upstreams: %2")
-                          .arg(m_dnsProxyPort).arg(upstreams.join(", ")));
-
-    m_dnsProxyProcess = new QProcess(this);
-    m_dnsProxyProcess->setProgram(dnsProxyPath());
-    m_dnsProxyProcess->setArguments(args);
-    m_dnsProxyProcess->setWorkingDirectory(m_appDir + "/tools");
-    m_dnsProxyProcess->setProcessChannelMode(QProcess::MergedChannels);
-
-    QProcess *proc = m_dnsProxyProcess;
-    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
-        const QString out = QString::fromUtf8(proc->readAllStandardOutput()).trimmed();
-        if (!out.isEmpty()) logToEmulatorFile("[dnsproxy] " + out);
-    });
-    connect(proc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus) {
-        if (m_dnsProxyPort != 0) {
-            logImportant(Logger::kLevelWarning, "DNS proxy exited unexpectedly with code " + QString::number(code));
-            m_dnsProxyPort = 0;
-        }
-    });
-    connect(proc, &QProcess::started, this, [this, proc]() {
-        logToEmulatorFile("DNS proxy started PID " + QString::number(proc->processId()) +
-                          " on port " + QString::number(m_dnsProxyPort));
-    });
-    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError e) {
-        if (e == QProcess::FailedToStart) {
-            logImportant(Logger::kLevelWarning, "failed to start dnsproxy: " + proc->errorString());
-            m_dnsProxyPort = 0;
-        }
-    });
-
-    // Без waitForStarted(): не блокируем GUI-поток
-    proc->start();
-}
-
-void AndroidTVModule::stopDnsProxy()
-{
-    if (m_dnsProxyProcess && m_dnsProxyProcess->state() != QProcess::NotRunning) {
-        m_dnsProxyPort = 0;
-        m_dnsProxyProcess->kill();
-        m_dnsProxyProcess->waitForFinished(2000);
-        logToEmulatorFile("DNS proxy stopped");
-    }
 }
 
 // ── AVD preparation ──────────────────────────────────────────────────────────
@@ -756,6 +679,24 @@ void AndroidTVModule::checkEmulatorAdbKey(const QString &pubKey)
 
 void AndroidTVModule::scanEmulatorOutput(const QString &out)
 {
+    // Эмулятор не понял флаги gRPC — запоминаем, следующий запуск без них
+    if (m_grpcPort > 0 && out.contains(QLatin1String("grpc"), Qt::CaseInsensitive)
+        && (out.contains(QLatin1String("unknown option"), Qt::CaseInsensitive)
+            || out.contains(QLatin1String("invalid option"), Qt::CaseInsensitive)
+            || out.contains(QLatin1String("unrecognized"), Qt::CaseInsensitive))) {
+        const QString key = emulatorBuildKey();
+        if (!key.isEmpty()) {
+            QSettings st = LocalModels::appSettings();
+            st.setValue("androidtv/grpcUnsupportedFor", key);
+        }
+        logImportant(Logger::kLevelError,
+                     "Emulator does not support -grpc options — Android TV will start without "
+                     "gRPC next time (restart Android TV)");
+    }
+    // Файл обнаружения (в нём токен gRPC): «Advertising in: C:\...\pid_720.ini»
+    static const QRegularExpression reAdv(QStringLiteral(R"(Advertising in: (\S+\.ini))"));
+    const QRegularExpressionMatch ma = reAdv.match(out);
+    if (ma.hasMatch()) m_emuDiscoveryFile = QDir::fromNativeSeparators(ma.captured(1));
     static const QRegularExpression reKey(QStringLiteral(R"(Sending adb public key \[([^\]]+)\])"));
     static const QRegularExpression reBoot(QStringLiteral(R"(Boot completed in (\d+) ms)"));
     const QRegularExpressionMatch mk = reKey.match(out);
@@ -992,9 +933,12 @@ void AndroidTVModule::startEmulator()
     proc->setProgram(emulatorPath());
     proc->setWorkingDirectory(QFileInfo(emulatorPath()).absolutePath());
 
-    const QString dnsArg = m_dnsServer.trimmed().isEmpty() ? QStringLiteral("8.8.8.8,1.1.1.1")
-                                                           : m_dnsServer.trimmed();
-    logToEmulatorFile("Using DNS: " + dnsArg);
+    // AdGuard Home ответил — весь DNS эмулятора через него (блокировка
+    // рекламы); иначе DNS из профиля
+    const QString profileDns = m_dnsServer.trimmed().isEmpty() ? QStringLiteral("8.8.8.8,1.1.1.1")
+                                                               : m_dnsServer.trimmed();
+    const QString dnsArg = m_adBlockDns.isEmpty() ? profileDns : m_adBlockDns;
+    logToEmulatorFile("Using DNS: " + dnsArg + (m_adBlockDns.isEmpty() ? "" : " (AdGuard Home)"));
 
     QStringList args;
     args << "-avd"        << profile->avdName
@@ -1009,6 +953,16 @@ void AndroidTVModule::startEmulator()
          << "-skip-adb-auth"
          << "-no-metrics"
          << "-audio"      << m_audioDriver;
+
+    // gRPC эмулятора — быстрый ввод с пульта (EmulatorGrpcClient). Токен —
+    // тот же, что у консоли. Если эта сборка эмулятора флаги не понимает
+    // (запомнено при прошлом запуске) — без них.
+    m_grpcPort = 0;
+    if (!grpcDisabled()) {
+        m_grpcPort = pickFreeGrpcPort();
+        if (m_grpcPort > 0)
+            args << "-grpc" << QString::number(m_grpcPort) << "-grpc-use-token";
+    }
     // Экспериментальные -feature GLDirectMem/GLDMA/VulkanNativeSwapchain убраны:
     // нестандартные режимы рендера — частая причина рывков картинки и звука.
 
@@ -1149,7 +1103,6 @@ void AndroidTVModule::onEmulatorFinished(int exitCode)
     stopConsole();
     removeWinEventHook();
     stopPositionSyncTimer();
-    stopDnsProxy();
 #ifdef Q_OS_WIN
     if (m_timerResolutionSet) {
         timeEndPeriod(1);
@@ -1293,8 +1246,10 @@ void AndroidTVModule::onBootCompleted()
     // не пользуется, а запросы гостя к localhost:80/443 уходили через adb-туннель
     // на пустые порты хоста — лишняя работа adbd во время просмотра.
 
-    // Блоклист перезапускает adbd (adb root) — logcat стартует после него
-    applyBlocklist();
+    // Блокировка рекламы — AdGuard Home на стороне Windows (см. startAdBlockProbe);
+    // запись /system/etc/hosts через adb root убрана: на образах с Google Play
+    // она не работала, а adb root перезапускал adbd
+    startLogcat();
     emit emulatorReadyBehind();
 }
 
@@ -1450,70 +1405,6 @@ void AndroidTVModule::adb(const QStringList &args, std::function<void(QString)> 
     adbRaw(QStringList{QStringLiteral("-s"), adbSerial()} + args, std::move(callback), timeoutMs);
 }
 
-// ── Blocklist (/system/etc/hosts) ────────────────────────────────────────────
-// Запись в /system возможна только при -writable-system и root-adb (образы
-// без Google Play). Раньше push делался без root и всегда завершался ошибкой.
-
-void AndroidTVModule::applyBlocklist()
-{
-    if (!m_writableSystem) {
-        logToEmulatorFile("blocklist: profile has writable system disabled, skipping");
-        startLogcat();
-        return;
-    }
-
-    QFile list(blocklistPath());
-    if (!list.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        logToEmulatorFile("blocklist not found (" + blocklistPath() + "), skipping");
-        startLogcat();
-        return;
-    }
-
-    QStringList entries;
-    entries << "127.0.0.1 localhost" << "::1 ip6-localhost";
-
-    QTextStream in(&list);
-    while (!in.atEnd()) {
-        const QString line = in.readLine().trimmed();
-        if (line.isEmpty() || line.startsWith('#')) continue;
-        entries << "0.0.0.0 " + line.section(QRegularExpression("\\s+"), 0, 0);
-    }
-
-    const QString tmpDir  = m_appDir + "/tools/android-tv/config";
-    const QString tmpPath = tmpDir + "/hosts.tmp";
-    QDir().mkpath(tmpDir);
-    QFile tmp(tmpPath);
-    if (!tmp.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-        logImportant(Logger::kLevelError, "cannot write temp hosts file: " + tmpPath);
-        startLogcat();
-        return;
-    }
-    QTextStream out(&tmp);
-    for (const auto &e : entries) out << e << "\n";
-    tmp.close();
-
-    logToEmulatorFile(QString("blocklist: pushing %1 entries to /system/etc/hosts").arg(entries.size()));
-
-    adb({"root"}, [this, tmpPath](const QString &rootOut) {
-        logToEmulatorFile("adb root: " + rootOut.trimmed());
-        if (rootOut.contains(QLatin1String("cannot run as root"), Qt::CaseInsensitive)) {
-            logToEmulatorFile("blocklist: production image (no root) — hosts cannot be modified");
-            startLogcat();
-            return;
-        }
-        adb({"wait-for-device"}, [this, tmpPath](const QString &) {
-            adb({"remount"}, [this, tmpPath](const QString &remountOut) {
-                logToEmulatorFile("adb remount: " + remountOut.trimmed());
-                adb({"push", QDir::toNativeSeparators(tmpPath), "/system/etc/hosts"},
-                    [this](const QString &pushOut) {
-                        logToEmulatorFile("hosts push: " + pushOut.trimmed());
-                        startLogcat();
-                    }, 20000);
-            }, 20000);
-        }, 30000);
-    }, 15000);
-}
-
 // ── qcow2 ────────────────────────────────────────────────────────────────────
 
 void AndroidTVModule::refreshQcow2Size()
@@ -1645,10 +1536,150 @@ void AndroidTVModule::stopLogcat()
         logToEmulatorFile("Stopping logcat...");
         // У adb.exe нет обработчика WM_CLOSE → terminate() на Windows бесполезен
         m_logcatProcess->kill();
-        m_logcatProcess->waitForFinished(2000);
+        // Файл журнала закроет обработчик finished; ждём только при выходе из программы
+        if (m_shutdownDone) m_logcatProcess->waitForFinished(2000);
     } else if (m_logcatLogFile.isOpen()) {
         m_logcatLogStream << "=== logcat ended (forced) ===\n\n";
         m_logcatLogStream.flush();
         m_logcatLogFile.close();
     }
+}
+
+// ── Блокировка рекламы: AdGuard Home (аудит §23) ─────────────────────────────
+
+namespace {
+void notifyUser(EventBus *bus, const QString &text, bool error)
+{
+    if (!bus) return;
+    emit bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
+                          Notifications::makeEvent(text, error ? NotificationLevel::Error
+                                                               : NotificationLevel::Info, true, 6000));
+}
+} // namespace
+
+bool AndroidTVModule::adBlockEnabled() const
+{
+    return LocalModels::appSettings().value(QStringLiteral("androidtv/adBlock"), true).toBool();
+}
+
+void AndroidTVModule::setAdBlockEnabled(bool on)
+{
+    if (on == adBlockEnabled()) return;
+    LocalModels::appSettings().setValue(QStringLiteral("androidtv/adBlock"), on);
+    logImportant(Logger::kLevelInfo, QString("ad blocking %1 (applies on next TV launch)").arg(on ? "on" : "off"));
+    emit adBlockChanged();
+}
+
+void AndroidTVModule::refreshAdBlockState()
+{
+    const QString st = m_adGuard ? AdGuardHome::stateName(m_adGuard->serviceState()) : QStringLiteral("missing");
+    if (st != m_adBlockState) {
+        m_adBlockState = st;
+        emit adBlockChanged();
+    }
+}
+
+void AndroidTVModule::startAdBlockProbe()
+{
+    m_adBlockDns.clear();
+    m_afterAdBlockProbe = nullptr;
+    m_adBlockProbePending = false;
+    if (!adBlockEnabled()) { logToEmulatorFile("ad blocking: off in settings"); return; }
+    if (!m_adGuard || !m_adGuard->isInstalled()) {
+        logToEmulatorFile("ad blocking: AdGuard Home not installed (" +
+                          (m_adGuard ? m_adGuard->exePath() : QString()) + ")");
+        return;
+    }
+    m_adBlockProbePending = true;
+    // До 3 попыток: служба могла только что запуститься
+    auto attempt = std::make_shared<std::function<void(int)>>();
+    *attempt = [this, attempt](int n) {
+    AdGuardHome::probeDns(QString::fromLatin1(AdGuardHome::kDnsHost), AdGuardHome::kDnsPort, 700, this,
+                          [this, attempt, n](bool ok, int ms) {
+        if (!ok && n < 3) { QTimer::singleShot(150, this, [attempt, n]() { (*attempt)(n + 1); }); return; }
+        m_adBlockProbePending = false;
+        if (ok) {
+            m_adBlockDns = QString::fromLatin1(AdGuardHome::kDnsHost);
+            logToEmulatorFile(QString("ad blocking: AdGuard Home answers on %1:53 (%2 ms)")
+                                  .arg(m_adBlockDns).arg(ms));
+        } else {
+            refreshAdBlockState();
+            logImportant(Logger::kLevelWarning,
+                         QString("ad blocking: AdGuard Home does not answer on 127.0.0.1:53 (service %1) — "
+                                 "using profile DNS").arg(m_adBlockState));
+            if (m_adGuard)
+                m_adGuard->diagnose([this](const QString &report) {
+                    logImportant(Logger::kLevelWarning, "ad blocking diagnostics: " + report);
+                });
+        }
+        if (m_afterAdBlockProbe) {
+            auto next = std::move(m_afterAdBlockProbe);
+            m_afterAdBlockProbe = nullptr;
+            if (m_booting && !m_shutdownDone) next();
+        }
+    });
+    };
+    (*attempt)(1);
+}
+
+void AndroidTVModule::downloadAdBlock()
+{
+    if (!m_adGuard || m_adBlockBusy || m_adBlockDownload >= 0) return;
+    m_adBlockDownload = 0.0;
+    emit adBlockChanged();
+    logImportant(Logger::kLevelInfo, QString("AdGuard Home: downloading %1").arg(AdGuardHome::kDownloadUrl));
+    m_adGuard->download(
+        [this](qreal p) {
+            if (p - m_adBlockDownload >= 0.02) { m_adBlockDownload = p; emit adBlockChanged(); }
+        },
+        [this](bool ok, const QString &msg) {
+            m_adBlockDownload = -1.0;
+            refreshAdBlockState();
+            emit adBlockChanged();
+            logImportant(ok ? Logger::kLevelInfo : Logger::kLevelWarning,
+                         "AdGuard Home download: " + (ok ? QStringLiteral("ok") : msg));
+            notifyUser(m_bus, ok ? QStringLiteral("AdGuard Home скачан — теперь «Установить службу»")
+                                 : QStringLiteral("AdGuard Home не скачан: ") + msg, !ok);
+        });
+}
+
+void AndroidTVModule::installAdBlock()
+{
+    if (!m_adGuard || m_adBlockBusy) return;
+    QString err;
+    if (!m_adGuard->writeDefaultConfig(blocklistPath(), &err)) {
+        logImportant(Logger::kLevelError, "AdGuard Home: cannot write config: " + err);
+        notifyUser(m_bus, QStringLiteral("AdGuard Home: не удалось записать настройки — ") + err, true);
+        return;
+    }
+    m_adBlockBusy = true;
+    emit adBlockChanged();
+    m_adGuard->installService([this](bool ok, const QString &msg) {
+        m_adBlockBusy = false;
+        refreshAdBlockState();
+        emit adBlockChanged();
+        logImportant(ok ? Logger::kLevelInfo : Logger::kLevelWarning,
+                     "AdGuard Home service install: " + (ok ? QStringLiteral("ok") : msg));
+        notifyUser(m_bus, ok ? QStringLiteral("Блокировка рекламы установлена — работает со следующего запуска ТВ")
+                  : QStringLiteral("AdGuard Home не установлен: ") + msg, !ok);
+    });
+}
+
+void AndroidTVModule::uninstallAdBlock()
+{
+    if (!m_adGuard || m_adBlockBusy) return;
+    m_adBlockBusy = true;
+    emit adBlockChanged();
+    m_adGuard->uninstallService([this](bool ok, const QString &msg) {
+        m_adBlockBusy = false;
+        refreshAdBlockState();
+        emit adBlockChanged();
+        logImportant(Logger::kLevelInfo, "AdGuard Home service uninstall: " + (ok ? QStringLiteral("ok") : msg));
+        if (!ok) notifyUser(m_bus, QStringLiteral("AdGuard Home: служба не удалена — ") + msg, true);
+    });
+}
+
+void AndroidTVModule::openAdBlockPanel()
+{
+    QDesktopServices::openUrl(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(AdGuardHome::kWebPort)));
 }

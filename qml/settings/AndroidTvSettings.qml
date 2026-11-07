@@ -52,6 +52,7 @@ Item {
 
     Component.onCompleted: {
         if (AndroidTV) AndroidTV.refreshQcow2Size()
+        if (AndroidTV) AndroidTV.refreshAdBlockState()
         if (AndroidTV && AndroidTV.profileManager)
             currentProfileId = AndroidTV.profileManager.activeProfileId
         refreshProfileData()
@@ -146,6 +147,79 @@ Item {
                         enabled: AndroidTV && (AndroidTV.running || AndroidTV.booting)
                         opacity: enabled ? 1.0 : 0.4
                         onClicked: if (enabled) AndroidTV.stop()
+                    }
+                }
+            }
+            SectionDivider {}
+
+            // ── Блокировка рекламы (AdGuard Home, CHANGES_2026-11-07_7) ─────
+            SettingsRow {
+                label: Settings.tr("atv_adblock")
+                Row {
+                    spacing: Settings.us(12)
+                    ToggleSwitch {
+                        anchors.verticalCenter: parent.verticalCenter
+                        checked: AndroidTV ? AndroidTV.adBlockEnabled : false
+                        onToggled: if (AndroidTV) AndroidTV.adBlockEnabled = !AndroidTV.adBlockEnabled
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                            if (!AndroidTV) return ""
+                            if (AndroidTV.adBlockBusy) return Settings.tr("atv_adblock_busy")
+                            return Settings.tr("atv_adblock_" + (AndroidTV.adBlockState || "unknown"))
+                        }
+                        color: AndroidTV && AndroidTV.adBlockState === "running" ? Settings.accent(1.0) : "#CCFFFFFF"
+                        font.pixelSize: Settings.fs(13)
+                        elide: Text.ElideRight
+                        width: Math.min(implicitWidth, Settings.us(300))
+                    }
+                }
+            }
+            SectionDivider {}
+
+            SettingsRow {
+                label: Settings.tr("atv_adblock_service")
+                visible: !!AndroidTV
+                Row {
+                    spacing: Settings.us(10)
+                    StyledButton {
+                        height: Settings.us(36)
+                        visible: AndroidTV && AndroidTV.adBlockState === "missing"
+                        text: AndroidTV && AndroidTV.adBlockDownload >= 0
+                              ? Settings.tr("atv_adblock_downloading") + " " + Math.round(AndroidTV.adBlockDownload * 100) + " %"
+                              : Settings.tr("atv_adblock_download")
+                        role: "primary"
+                        enabled: AndroidTV && AndroidTV.adBlockDownload < 0
+                        opacity: enabled ? 1.0 : 0.6
+                        onClicked: if (enabled) AndroidTV.downloadAdBlock()
+                    }
+                    StyledButton {
+                        height: Settings.us(36)
+                        visible: AndroidTV && (AndroidTV.adBlockState === "notInstalled"
+                                               || AndroidTV.adBlockState === "unknown")
+                        text: Settings.tr("atv_adblock_install")
+                        role: "primary"
+                        enabled: AndroidTV && !AndroidTV.adBlockBusy
+                        opacity: enabled ? 1.0 : 0.4
+                        onClicked: if (enabled) AndroidTV.installAdBlock()
+                    }
+                    StyledButton {
+                        height: Settings.us(36)
+                        visible: AndroidTV && AndroidTV.adBlockState === "running"
+                        text: Settings.tr("atv_adblock_panel")
+                        onClicked: AndroidTV.openAdBlockPanel()
+                    }
+                    StyledButton {
+                        height: Settings.us(36)
+                        visible: AndroidTV && (AndroidTV.adBlockState === "running"
+                                               || AndroidTV.adBlockState === "stopped"
+                                               || AndroidTV.adBlockState === "starting")
+                        text: Settings.tr("atv_adblock_uninstall")
+                        role: "danger"
+                        enabled: AndroidTV && !AndroidTV.adBlockBusy
+                        opacity: enabled ? 1.0 : 0.4
+                        onClicked: if (enabled) AndroidTV.uninstallAdBlock()
                     }
                 }
             }

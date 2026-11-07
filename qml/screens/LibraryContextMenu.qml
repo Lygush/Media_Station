@@ -33,6 +33,7 @@ Item {
     property bool   activeAvail:  true
     property int    tileCount:    0
     property bool   activeLegacy: false
+    property bool   activeCompressed: false
 
     signal tileActionRequested(string gameId, string gameName, int tileCount)
     signal extractRequested(string gameId, string gameName, int rowIndex)
@@ -41,6 +42,7 @@ Item {
     signal reassignRequested(string gameId)
     signal deleteRequested(string gameId, int rowIndex)
     signal regenerateMetadataRequested(string gameId)
+    signal compressRequested(string gameId, int rowIndex, bool compress)
 
     function openForRow(idx, gx, gy, entry) {
         activeIndex  = idx
@@ -50,6 +52,7 @@ Item {
         activeAvail  = entry.available
         tileCount    = entry.tileCount
         activeLegacy = entry.legacyNoMetadata
+        activeCompressed = entry.compressed || false
 
         // Размер меню зависит от видимых пунктов — считаем после их обновления
         var mw = menuBox.width
@@ -155,6 +158,19 @@ Item {
                 iconSource: "qrc:/assets/icons/ic_folder.png"
                 label: Settings.tr("lib_menu_archive")
                 onClicked: { root.close(); root.archiveRequested(root.activeGameId, root.activeIndex) }
+            }
+
+            // Сжатие Windows: игра остаётся рабочей (CHANGES_2026-11-07_6)
+            ContextMenuItem {
+                visible: root.activeType === "installed" && root.activeAvail
+                         && GameLibraryModule.compressAvailable
+                iconSource: "qrc:/assets/icons/ic_folder.png"
+                label: root.activeCompressed ? Settings.tr("lib_menu_decompress")
+                                             : Settings.tr("lib_menu_compress")
+                onClicked: {
+                    root.close()
+                    root.compressRequested(root.activeGameId, root.activeIndex, !root.activeCompressed)
+                }
             }
 
             ContextMenuItem {

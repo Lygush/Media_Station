@@ -19,6 +19,8 @@ class SettingsManager : public QObject
     Q_PROPERTY(bool    fullscreen       READ fullscreen       WRITE setFullscreen       NOTIFY fullscreenChanged)
     Q_PROPERTY(QString language         READ language         WRITE setLanguage         NOTIFY languageChanged)
     Q_PROPERTY(QString installPath      READ installPath      WRITE setInstallPath      NOTIFY installPathChanged)
+    // Папка архивов игр; пустая — архив внутри папки игры (<игра>/archive/)
+    Q_PROPERTY(QString archivePath      READ archivePath      WRITE setArchivePath      NOTIFY archivePathChanged)
     Q_PROPERTY(double  uiScale          READ uiScale          WRITE setUiScale          NOTIFY uiScaleChanged)
     Q_PROPERTY(int     fontOffset       READ fontOffset       WRITE setFontOffset       NOTIFY fontOffsetChanged)
     Q_PROPERTY(bool    enableFogShader  READ enableFogShader  WRITE setEnableFogShader  NOTIFY enableFogShaderChanged)
@@ -39,6 +41,7 @@ public:
     QString language()        const;
     QString installPath()     const;
     static QString defaultInstallPath();   ///< <appDir>/data/games
+    QString archivePath()     const;       ///< пусто = внутри папки игры
     double  uiScale()         const;
     int     fontOffset()      const;
     bool    enableFogShader() const;
@@ -49,6 +52,7 @@ public:
     void setFullscreen(bool fs);
     void setLanguage(const QString &lang);
     void setInstallPath(const QString &path);
+    void setArchivePath(const QString &path);
     void setUiScale(double scale);
     void setFontOffset(int offset);
     void setEnableFogShader(bool enable);
@@ -72,6 +76,7 @@ signals:
     void fullscreenChanged();
     void languageChanged();
     void installPathChanged();
+    void archivePathChanged();
     void uiScaleChanged();
     void fontOffsetChanged();
     void enableFogShaderChanged();

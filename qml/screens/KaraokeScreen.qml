@@ -388,29 +388,43 @@ Item {
     }
 
     // ── File picker ───────────────────────────────────────────────────────────
-    FileDialog {
-        id: filePicker
-        title:       "Выберите аудиофайл"
-        nameFilters: ["Аудио (*.mp3 *.flac *.wav *.ogg *.m4a *.aac)", "Все файлы (*)"]
-        onAccepted: {
-            var path = selectedFile.toString()
-            path = path.replace(/^file:\/\/\//, "").replace(/\//g, "\\")
-            root.currentFilePath = path
-            root.playerReady     = false
-            root.processing      = false
-            root.confirming      = false
-            root.analyzing       = true
-            root.errorText       = ""
-            root.analysisMsg     = "Читаю теги и имя файла…"
-            root.analysisStream  = ""
-            root.usedWhisper     = false
-            root.elapsedSec      = 0
-            root.progressPct     = 0
-            root.progressStage   = ""
-            root.lrcLines        = []
-            root.activeLine      = -1
-            stopBoth()
-            KaraokeModule.openSong(path)
+    // Создаётся при первом нажатии «Выбрать файл», а не при входе на экран:
+    // на Windows диалог — нативный (COM), его подготовка не должна попадать
+    // во время открытия экрана.
+    function openFilePicker() {
+        filePickerLoader.active = true
+        if (filePickerLoader.item) filePickerLoader.item.open()
+    }
+    Loader {
+        id: filePickerLoader
+        active: false
+        sourceComponent: filePickerComponent
+    }
+    Component {
+        id: filePickerComponent
+        FileDialog {
+            title:       "Выберите аудиофайл"
+            nameFilters: ["Аудио (*.mp3 *.flac *.wav *.ogg *.m4a *.aac)", "Все файлы (*)"]
+            onAccepted: {
+                var path = selectedFile.toString()
+                path = path.replace(/^file:\/\/\//, "").replace(/\//g, "\\")
+                root.currentFilePath = path
+                root.playerReady     = false
+                root.processing      = false
+                root.confirming      = false
+                root.analyzing       = true
+                root.errorText       = ""
+                root.analysisMsg     = "Читаю теги и имя файла…"
+                root.analysisStream  = ""
+                root.usedWhisper     = false
+                root.elapsedSec      = 0
+                root.progressPct     = 0
+                root.progressStage   = ""
+                root.lrcLines        = []
+                root.activeLine      = -1
+                stopBoth()
+                KaraokeModule.openSong(path)
+            }
         }
     }
 
@@ -457,7 +471,7 @@ Item {
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Выбрать файл"
             width: Math.max(Settings.us(300), naturalWidth)
-            onClicked: filePicker.open()
+            onClicked: root.openFilePicker()
         }
     }
 
@@ -603,7 +617,7 @@ Item {
                 spacing: Settings.us(24)
                 StyledButton {
                     text: "Другой файл"; width: Math.max(Settings.us(200), naturalWidth)
-                    onClicked: { root.confirming = false; filePicker.open() }
+                    onClicked: { root.confirming = false; root.openFilePicker() }
                 }
                 StyledButton {
                     text: "Продолжить"; width: Math.max(Settings.us(240), naturalWidth)
@@ -827,7 +841,7 @@ Item {
 
                     StyledButton {
                         text: "Другой трек"; width: Math.max(Settings.us(180), naturalWidth)
-                        onClicked: { stopBoth(); root.playerReady = false; filePicker.open() }
+                        onClicked: { stopBoth(); root.playerReady = false; root.openFilePicker() }
                     }
                     StyledButton {
                         text: root.vPlaying

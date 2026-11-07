@@ -1,4 +1,5 @@
 // modules/KaraokeModule/SongNameResolver.cpp
+#include "tools/LocalModelPaths.h"
 #include "SongNameResolver.h"
 
 #include <QCoreApplication>
@@ -27,13 +28,8 @@ SongNameResolver::~SongNameResolver()
 
 QString SongNameResolver::modelPath()
 {
-    // Общая настройка приложения; путь по умолчанию совпадает с остальными модулями
-    const QString fromSettings = QSettings("MediaStation", "MediaStation")
-                                     .value("llamaModelPath").toString();
-    return fromSettings.isEmpty()
-        ? QCoreApplication::applicationDirPath()
-              + "/tools/llama/models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
-        : fromSettings;
+    // Общая настройка приложения (та же ветка, куда пишет SettingsManager)
+    return LocalModels::llamaModelPath();
 }
 
 bool SongNameResolver::modelAvailable() { return QFile::exists(modelPath()); }

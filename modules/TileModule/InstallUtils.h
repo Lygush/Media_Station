@@ -98,6 +98,12 @@ QString createLaunchScript(const QString &gameRootPath,
                            const QString &exePathOrRelative,
                            const QString &kind);
 
+/// Что запускает launch.ps1, созданный createLaunchScript: путь к exe и
+/// рабочая папка. Нужен, чтобы запускать игру напрямую, без PowerShell
+/// (аудит §4 п.5). false — скрипт не наш или изменён вручную: тогда
+/// запускать сам скрипт, как раньше.
+bool parseLaunchScript(const QString &ps1Path, QString *exePath, QString *workDir);
+
 /// Детерминированный ID папки: первые 12 символов MD5 от нормализованного пути.
 /// Дублируется из GameLibraryModule — чтобы модули не зависели друг от друга.
 QString makeFolderGameId(const QString &folderPath);

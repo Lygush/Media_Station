@@ -82,6 +82,10 @@ Result extract(const QString          &archivePath,
                const std::atomic<bool> *cancelFlag  = nullptr,
                ProgressFn              onProgress   = nullptr);
 
+/// Суммарный размер файлов в архиве после распаковки (`7zr l -slt`), байты.
+/// -1 — не удалось узнать (нет 7zr, архив повреждён).
+qint64 unpackedSize(const QString &archivePath);
+
 /// Текстовое описание результата для логов.
 const char *resultToString(Result r);
 

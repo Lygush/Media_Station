@@ -2,6 +2,7 @@
 #pragma once
 
 #include "core/IModule.h"
+#include <QSet>
 #include <QObject>
 #include <QProcess>
 #include <QElapsedTimer>
@@ -33,6 +34,7 @@
 
 class SettingsManager;
 class AndroidTVProfileManager;
+class EmulatorGrpcClient;
 
 struct AndroidTVProfile {
     QString id;
@@ -97,7 +99,10 @@ public:
 
     Q_INVOKABLE QVariantMap getProfile(const QString &id) const;
     Q_INVOKABLE bool setActiveProfile(const QString &id);
-    Q_INVOKABLE bool removeProfile(const QString &id);
+    /// deleteData — удалить и данные профиля: папку <avdName>.avd (диск
+    /// Android, до нескольких ГБ) и <avdName>.ini. Раньше они оставались на
+    /// диске навсегда (аудит §18 п.16).
+    Q_INVOKABLE bool removeProfile(const QString &id, bool deleteData = false);
     Q_INVOKABLE QString addProfile(const QString &systemImagePath, const QString &baseName);
     Q_INVOKABLE QStringList scanSystemImages() const;
     Q_INVOKABLE qint64 profileSizeMb(const QString &id) const;
@@ -155,6 +160,13 @@ class AndroidTVModule : public QObject, public IModule
     Q_PROPERTY(bool    switching READ isSwitching NOTIFY switchingChanged)
     Q_PROPERTY(qint64  qcow2SizeMb READ qcow2SizeMb NOTIFY qcow2SizeMbChanged)
     Q_PROPERTY(AndroidTVProfileManager* profileManager READ profileManager CONSTANT)
+    // Блокировка рекламы (AdGuard Home, аудит §23)
+    Q_PROPERTY(bool    adBlockEnabled READ adBlockEnabled WRITE setAdBlockEnabled NOTIFY adBlockChanged)
+    /// missing | notInstalled | stopped | starting | running | unknown
+    Q_PROPERTY(QString adBlockState   READ adBlockState   NOTIFY adBlockChanged)
+    Q_PROPERTY(bool    adBlockBusy    READ adBlockBusy    NOTIFY adBlockChanged)
+    /// Загрузка AdGuard Home: -1 — не идёт, 0..1 — прогресс
+    Q_PROPERTY(qreal   adBlockDownload READ adBlockDownload NOTIFY adBlockChanged)
 
 public:
     explicit AndroidTVModule(QObject *parent = nullptr);
@@ -175,6 +187,13 @@ public:
     QString status()      const { return m_status;     }
     qint64  qcow2SizeMb() const { return m_qcow2SizeMb; }
     AndroidTVProfileManager* profileManager() const { return m_profileManager; }
+    bool    adBlockEnabled() const;
+    void    setAdBlockEnabled(bool on);
+    QString adBlockState()   const { return m_adBlockState; }
+    bool    adBlockBusy()    const { return m_adBlockBusy; }
+    qreal   adBlockDownload() const { return m_adBlockDownload; }
+    /// grpc.token из файла обнаружения эмулятора (открыто для тестов)
+    static QByteArray grpcTokenFromDiscovery(const QByteArray &ini, int port);
 
 #ifdef Q_OS_WIN
     void setMediaStationHwnd(HWND hwnd) { m_mediaStationHwnd = hwnd; }
@@ -188,6 +207,12 @@ public slots:
     Q_INVOKABLE void sendRemoteKey(const QString &key);
     Q_INVOKABLE bool resetQcow2();
     Q_INVOKABLE void refreshQcow2Size();
+    Q_INVOKABLE void refreshAdBlockState();
+    /// Поставить/удалить службу AdGuard Home (запрос прав администратора)
+    Q_INVOKABLE void downloadAdBlock();
+    Q_INVOKABLE void installAdBlock();
+    Q_INVOKABLE void uninstallAdBlock();
+    Q_INVOKABLE void openAdBlockPanel();
 
 signals:
     void bootingChanged();
@@ -200,12 +225,13 @@ signals:
     void emulatorReadyBehind();
     void emulatorRestoringMediaStation();
     void qcow2SizeMbChanged();
+    void adBlockChanged();
 
 private:
     // ── Жизненный цикл ───────────────────────────────────────────────────────
-    void startDnsProxy();
     void startEmulator();
-    void stopDnsProxy();
+    /// Проверка AdGuard Home перед запуском эмулятора → m_adBlockDns
+    void startAdBlockProbe();
     void startBootPolling();
     void stopBootPolling();
     void onBootCompleted();
@@ -225,7 +251,6 @@ private:
     int  pickFreeConsolePort() const;
 
     void restoreMediaStation();
-    void applyBlocklist();
 
     // ── AVD ──────────────────────────────────────────────────────────────────
     QString resolveAvdHome() const;
@@ -241,7 +266,25 @@ private:
     void scanEmulatorOutput(const QString &out);     // «Boot completed», ключ adb
 
     // ── Окна ─────────────────────────────────────────────────────────────────
-    void setMediaStationOpacity(int alpha);
+    void setMediaStationOpacity(int alpha);          // сразу, отменяет плавный переход
+    // Плавно (≈60 Гц) меняет прозрачность окна MediaStation от текущей до `to`
+    // за durationMs; done вызывается в конце (не вызывается, если переход отменён)
+    void fadeMediaStationOpacity(int to, int durationMs, std::function<void()> done = {});
+    void stopMediaStationFade();
+    void applyMediaStationAlpha(int alpha);
+    void bringMediaStationToForeground();
+    // ── Схема B (аудит §1.2 B): во время просмотра ТВ эмулятор — активное окно
+    // (повышенный квант планировщика, без EcoQoS, прямой вывод без композиции
+    // поверх), а MediaStation скрыт (SW_HIDE) и показывается только под
+    // оверлеем как полупрозрачное затемнение.
+    void hideMediaStationForTv();     // MediaStation → SW_HIDE, эмулятор активный
+    void showMediaStationOverTv();    // MediaStation снова над ТВ (alpha 0, без активации)
+    void focusEmulator();
+    // Наш хук клавиатуры — снова первым в цепочке (после активации эмулятора)
+    void requestKeyHookReinstall();
+    void parkCursor();                // курсор — к краю экрана на время ТВ
+    void restoreCursor();
+    void revealWhenEmulatorPainted();   // проявить ТВ, когда окно эмулятора перестало быть белым
     void forceMediaStationTopmost();
     void releaseMediaStationTopmost();   // HWND_NOTOPMOST: игры и другие окна снова могут быть сверху
     void startKeepTopmostTimer();
@@ -277,11 +320,63 @@ private:
     void onConsoleReadyRead();
     void failConsole(const QString &reason);
     static QByteArray readConsoleAuthToken();
+    /// Токен gRPC: эмулятор с -grpc-use-token пишет его в файл обнаружения
+    /// %TEMP%/avd/running/pid_<PID>.ini (grpc.token=…), а не в токен консоли
+    QByteArray readGrpcToken(QString *source = nullptr) const;
+    QString m_emuDiscoveryFile;     // «Advertising in: …» из вывода эмулятора
     void queueAdbKey(int androidKeyCode);   // старый путь: adb shell input keyevent
+
+    // ── Быстрый ввод через sendevent (аудит 7а) ──────────────────────────────
+    // `input keyevent` — запуск JVM в госте на каждую пачку нажатий (рывки
+    // звука при листании); консоль эмулятора 36.4 события не доставляет.
+    // sendevent — маленькая утилита без JVM: пишет событие прямо в устройство
+    // ввода клавиатуры (/dev/input/eventN). При показе ТВ одним вызовом
+    // `getevent -pl` + проверка прав записи находим подходящее устройство.
+    enum class EvdevState { Unknown, Probing, Ready, Unavailable };
+    void startEvdevProbe();
+    void onEvdevProbeOutput(const QString &out);
+    void queueEvdevKey(int linuxKey);
+    int  evdevLinuxKey(int androidKeyCode) const;   // -1 — этой клавишей не отправить
+    void resetEvdev();
+    /// Разбор вывода `getevent -pl` + строк «WRITABLE <путь>»: путь лучшего
+    /// устройства и коды его клавиш (из нужных нам). Пусто — не нашли.
+    /// SU_OK в выводе — доступен `su 0` (образы без Google Play — userdebug):
+    /// тогда годится любое устройство, а команды идут через `su 0 sh -c`.
+    static QString pickEvdevDevice(const QString &probeOutput, QSet<int> *keys, QString *name,
+                                   bool *viaSu = nullptr);
+    // ── gRPC эмулятора (EmulatorGrpcClient) — основной путь ввода ────────────
+    // Эмулятор запускается с `-grpc <порт> -grpc-use-token`. При показе ТВ —
+    // getStatus; на первом нажатии — проверка через getevent, как у консоли.
+    enum class GrpcState { Off, Checking, Ready, Failed };
+    void startGrpcCheck();
+    void startGrpcProbe(const QList<int> &androidKeys);
+    void finishGrpcProbe(bool sawKey);
+    void failGrpc(const QString &reason, const QList<int> &resend = {});
+    bool sendKeyViaGrpc(int androidKeyCode);
+    static int grpcEvdevKey(int androidKeyCode);     // -1 — не этим путём
+    int  pickFreeGrpcPort() const;
+    bool grpcDisabled() const;                       // флаги -grpc не поддерживаются этим эмулятором
+    bool grpcKnownBroken() const;
+    void rememberGrpcBroken();
+
+    // Консоль эмулятора не доставляет события — запоминаем для этой сборки
+    // эмулятора, чтобы не тратить 1,8 с на проверку при каждом запуске ТВ
+    QString emulatorBuildKey() const;
+    bool    consoleKnownBroken() const;
+    void    rememberConsoleBroken();
 
 #ifdef Q_OS_WIN
     void hideExtraEmulatorWindows(DWORD pid, HWND mainHwnd);
     void positionEmulatorBehindMediaStation(HWND hwnd);
+    // Окно эмулятора: без рамки, на месте MediaStation, сразу под ним
+    // (HWND_NOTOPMOST). show = показать (SW_SHOWNOACTIVATE) или скрыть.
+    void placeEmulatorUnderMediaStation(HWND hwnd, bool show);
+    // Активировать окно другого процесса (AttachThreadInput к текущему
+    // активному потоку — иначе Windows может отклонить SetForegroundWindow)
+    bool forceForeground(HWND hwnd);
+    // Снимок клиентской области окна эмулятора (PrintWindow) — доля белых и
+    // чёрных точек на сетке 32×18. false — снимок не получился.
+    bool sampleEmulatorContent(HWND hwnd, int *whitePct, int *blackPct) const;
     bool isEmulatorProcess(DWORD pid) const;
     bool isEmulatorMainWindow(HWND hwnd) const;
     HWND findEmulatorMainWindow(bool allowFallback) const;
@@ -305,7 +400,6 @@ private:
     QString m_avdHome;
     QString adbPath()          const;
     QString emulatorPath()     const;
-    QString dnsProxyPath()     const;
     QString avdHomePath()      const;
     QString avdDirPath(const QString &avdName) const;
     QString blocklistPath()    const;
@@ -340,8 +434,13 @@ private:
     qint64           m_qcow2SizeMb = -1;
 
     QProcess *m_emulatorProcess = nullptr;
-    QProcess *m_dnsProxyProcess = nullptr;
-    int       m_dnsProxyPort    = 0;
+    class AdGuardHome *m_adGuard = nullptr;
+    QString   m_adBlockState;
+    bool      m_adBlockBusy        = false;
+    qreal     m_adBlockDownload    = -1.0;
+    bool      m_adBlockProbePending = false;
+    QString   m_adBlockDns;               // "127.0.0.1", если AdGuard Home ответил
+    std::function<void()> m_afterAdBlockProbe;
     int       m_consolePort     = 5554;
     QString   m_launchAvdName;               // AVD, с которым запущен текущий эмулятор
     QTimer   *m_bootPollTimer   = nullptr;
@@ -373,6 +472,11 @@ private:
 
     QFile       m_emulatorLogFile;
     QTextStream m_emulatorLogStream;
+    // Android_TV.log сбрасывается на диск пачками раз в 250 мс, а не после
+    // каждой строки (при запуске эмулятор выдаёт сотни строк — сотни
+    // синхронных записей в GUI-потоке)
+    QTimer     *m_logFlushTimer = nullptr;
+    static constexpr int kLogFlushMs = 250;
 
     QFile       m_logcatLogFile;
     QTextStream m_logcatLogStream;
@@ -384,6 +488,14 @@ private:
     // одной командой; очередь ограничена, чтобы удержание кнопки не давало
     // «хвост» навигации после отпускания.
     QList<int>    m_pendingKeys;
+    QList<int>    m_pendingEvdev;          // коды клавиш Linux для sendevent
+    EvdevState    m_evdevState  = EvdevState::Unknown;
+    QString       m_evdevPath;
+    bool          m_evdevViaSu  = false;
+    QSet<int>     m_evdevKeys;
+    QList<int>    m_evdevWaiting;          // нажатия, пришедшие во время проверки
+    QProcess     *m_evdevProbe  = nullptr;
+    static constexpr int kEvdevProbeTimeoutMs = 4000;
     bool          m_keyBatchInFlight = false;
     QElapsedTimer m_keyBatchSent;
     QString       m_keyShellBuf;
@@ -399,6 +511,30 @@ private:
     bool          m_consoleAuthNeeded  = false;
     bool          m_consoleReadyLogged = false;
     int           m_consoleKoCount     = 0;
+    // Самопроверка консоли: команды `event send` эмулятор принимает с «OK»,
+    // но это не значит, что событие дошло до Android (06.11 так и было:
+    // консоль «работала», стрелки — нет). На первом нажатии слушаем
+    // `adb shell getevent`; не увидели событие — переключаемся на adb.
+    QProcess     *m_consoleProbe       = nullptr;
+    bool          m_consoleVerified    = false;
+
+    EmulatorGrpcClient *m_grpc        = nullptr;
+    GrpcState     m_grpcState         = GrpcState::Off;
+    int           m_grpcPort          = 0;       // 0 — эмулятор запущен без gRPC
+    bool          m_grpcVerified      = false;
+    QProcess     *m_grpcProbe         = nullptr;
+    bool          m_grpcProbeSawKey   = false;
+    QList<int>    m_grpcProbeKeys;               // отправлены во время проверки (коды Android)
+    QList<int>    m_grpcWaiting;                 // пришли, пока идёт getStatus
+    int           m_grpcStatusTries   = 0;
+    static constexpr int kGrpcProbeMs       = 1500;
+    static constexpr int kGrpcStatusRetries = 5;
+    bool          m_consoleProbeSawKey = false;
+    QList<int>    m_consoleProbeKeys;          // что отправили во время проверки (повтор через adb)
+    static constexpr int kConsoleProbeMs = 1500;
+    void startConsoleProbe(const QList<int> &keys);
+    void finishConsoleProbe(bool sawKey);
+    static QByteArray linuxKeyName(int linuxKey);
 
     bool m_overlayOpen        = false;
     bool m_overlayCooldown    = false;
@@ -407,6 +543,29 @@ private:
 
     bool m_exitRequested  = false;
     bool m_emulatorShown  = false;
+    bool m_msHiddenForTv  = false;   // MediaStation спрятан, на экране только эмулятор
+    bool m_cursorParked   = false;
+    int  m_savedCursorX   = 0;
+    int  m_savedCursorY   = 0;
+
+    // Плавная прозрачность MediaStation (показ ТВ, оверлей)
+    int           m_msAlpha        = 255;
+    QTimer       *m_fadeTimer      = nullptr;
+    QElapsedTimer m_fadeClock;
+    int           m_fadeFrom       = 255;
+    int           m_fadeTo         = 255;
+    int           m_fadeDurationMs = 0;
+    std::function<void()> m_fadeDone;
+    // Проявление ТВ: ждём, пока окно эмулятора перестанет быть белым
+    QTimer       *m_revealTimer = nullptr;
+    QElapsedTimer m_revealClock;
+    int           m_revealChecks = 0;
+    static constexpr int kRevealMinWaitMs  = 150;    // минимум после ShowWindow
+    static constexpr int kRevealPollMs     = 100;
+    static constexpr int kRevealMaxWaitMs  = 3000;   // дальше проявляем как есть
+    static constexpr int kRevealFadeMs     = 250;
+    static constexpr int kOverlayDimFadeMs      = 160;
+    static constexpr int kOverlaySettleMs       = 50;    // = задержка выезда панели в OverlayScreen.qml
 
     QTimer  *m_healthCheckTimer    = nullptr;
     static constexpr qint64 kMaxQcow2SizeMb = 3072;

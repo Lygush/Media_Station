@@ -74,6 +74,9 @@ private:
     /// pidFilePath — путь куда PS1 запишет PID игры.
     /// Возвращает PID процесса powershell или 0 при ошибке.
     static quint64 launchPs1(const QString &ps1Path, const QString &pidFilePath);
+    /// Запуск exe напрямую (ShellExecuteEx — как Start-Process, но без
+    /// PowerShell). PID игры; 0 — не удалось (*error — причина).
+    static quint32 launchDirect(const QString &exePath, const QString &workDir, QString *error);
 
     /// Читает PID из файла, ожидая его появления не более timeoutMs мс.
     /// Прерывается, как только running становится 0 (выход из программы).

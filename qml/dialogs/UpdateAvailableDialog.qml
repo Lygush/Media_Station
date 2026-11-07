@@ -14,7 +14,9 @@ Item {
     id: dialog
     anchors.fill: parent
     z: 700
-    visible: UpdateManager != null && (UpdateManager.updateReady || UpdateManager.preparing)
+    // Отложить показ (игра / Android TV на экране) — см. Main.qml
+    property bool deferred: false
+    visible: !deferred && UpdateManager != null && (UpdateManager.updateReady || UpdateManager.preparing)
 
     // ── Фон-затемнение ────────────────────────────────────────────────────────
     Rectangle {

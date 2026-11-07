@@ -134,15 +134,63 @@ Item {
     // Видим во всех активных фазах, включая finished (последний кадр)
     visible: _phase !== "idle"
 
-    Image {
+    // Два Image по очереди (двойная буферизация), оба asynchronous: PNG
+    // декодируется в потоке загрузки Qt, а не в GUI-потоке. Раньше один
+    // синхронный Image декодировал кадр 60 раз в секунду именно тогда, когда
+    // грузится эмулятор, — подвисания интерфейса и рывки самой анимации.
+    // Кадр показывается, когда он готов; если декодирование не успевает,
+    // промежуточные кадры пропускаются, а не копятся.
+    property int    _front:   0        // какой из двух Image сейчас на экране
+    property string _pending: ""       // кадр, который нужно загрузить следующим
+
+    on_SrcChanged: {
+        if (_src === "") {
+            _pending = ""
+            frameA.source = ""; frameB.source = ""
+            _front = 0
+            return
+        }
+        _pending = _src
+        _loadPending()
+    }
+
+    function _back()  { return _front === 0 ? frameB : frameA }
+
+    function _loadPending() {
+        var back = _back()
+        if (_pending === "" || back.status === Image.Loading) return   // дождёмся текущей загрузки
+        if (back.source.toString() === _pending) { _swapIfReady(); return }
+        back.source = _pending
+        _swapIfReady()        // кадр мог оказаться в кэше и быть готов сразу
+    }
+
+    function _swapIfReady() {
+        var back = _back()
+        if (back.status !== Image.Ready) return
+        if (back.source.toString() === _pending) _pending = ""
+        _front = 1 - _front
+        _loadPending()        // пока показывали — мог прийти следующий кадр
+    }
+
+    component Frame: Image {
         anchors.fill: parent
-        source:       root._src
         fillMode:     Image.PreserveAspectFit
         smooth:       false
-        asynchronous: false
+        asynchronous: true
         cache:        true
         // Исходный размер кадра из desc.txt – для корректного масштабирования
         sourceSize.width:  root.sourceWidth
         sourceSize.height: root.sourceHeight
+    }
+
+    Frame {
+        id: frameA
+        visible: root._front === 0 && status === Image.Ready
+        onStatusChanged: if (root._front !== 0) root._swapIfReady()
+    }
+    Frame {
+        id: frameB
+        visible: root._front === 1 && status === Image.Ready
+        onStatusChanged: if (root._front !== 1) root._swapIfReady()
     }
 }

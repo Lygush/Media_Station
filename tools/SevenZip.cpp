@@ -208,6 +208,41 @@ Result extract(const QString          &archivePath,
     return runProcess(binary, args, {}, cancelFlag, onProgress);
 }
 
+qint64 unpackedSize(const QString &archivePath)
+{
+    const QString binary = findBinary();
+    if (binary == QLatin1String("7zr") && !QFile::exists(binary)) return -1;
+    QProcess p;
+    p.setProcessChannelMode(QProcess::MergedChannels);
+    p.start(binary, { QStringLiteral("l"), QStringLiteral("-slt"), archivePath });
+    if (!p.waitForStarted(5000)) return -1;
+    // Список читаем по мере вывода — у игр бывают сотни тысяч файлов
+    qint64 total = 0;
+    bool any = false;
+    QByteArray tail;
+    auto consume = [&](const QByteArray &chunk) {
+        tail += chunk;
+        int nl;
+        while ((nl = tail.indexOf('\n')) >= 0) {
+            const QByteArray line = tail.left(nl).trimmed();
+            tail.remove(0, nl + 1);
+            // «Size = N» — только у файлов; у архива — «Physical Size», «Headers Size»
+            if (line.startsWith("Size = ")) {
+                bool ok = false;
+                const qint64 v = line.mid(7).toLongLong(&ok);
+                if (ok) { total += v; any = true; }
+            }
+        }
+    };
+    while (p.state() != QProcess::NotRunning) {
+        if (p.waitForReadyRead(60000)) consume(p.readAll());
+        else if (p.state() != QProcess::NotRunning) { p.kill(); p.waitForFinished(2000); return -1; }
+    }
+    consume(p.readAll() + '\n');
+    if (p.exitStatus() != QProcess::NormalExit || p.exitCode() != 0) return -1;
+    return any ? total : 0;
+}
+
 const char *resultToString(Result r)
 {
     switch (r) {

@@ -9,15 +9,25 @@
 //   • Публичный Q_INVOKABLE sendRemoteKey для QML
 
 #include "AndroidTVModule.h"
+#include "EmulatorGrpcClient.h"
 #include "LoggerModule.h"
 #include "G72KeysModule.h"
 #include "OverlayModule.h"
 #include "core/EventBus.h"
 
 #include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QSettings>
+#include "tools/LocalModelPaths.h"
 #include <QDir>
 #include <QHostAddress>
+#include <QTcpServer>
+#include <memory>
 #include <QTimer>
+#include <QHash>
+#include <QRegularExpression>
+#include <algorithm>
 
 // ── Таблица маппинга G72-ключей → Android keycodes ───────────────────────────
 
@@ -149,6 +159,17 @@ void AndroidTVModule::startKeyShell()
 
 void AndroidTVModule::stopKeyShell()
 {
+    resetEvdev();
+    if (m_grpcProbe) {
+        QProcess *proc = m_grpcProbe;
+        m_grpcProbe = nullptr;
+        proc->disconnect(this);
+        if (proc->state() != QProcess::NotRunning) proc->kill();
+    }
+    m_grpcState = GrpcState::Off;
+    m_grpcVerified = false;
+    m_grpcProbeKeys.clear();
+    m_grpcWaiting.clear();
     m_pendingKeys.clear();
     m_keyBatchInFlight = false;
     m_keyShellBuf.clear();
@@ -156,22 +177,411 @@ void AndroidTVModule::stopKeyShell()
     QProcess *proc = m_keyShell;
     m_keyShell = nullptr;
     proc->disconnect(this);
-    if (proc->state() != QProcess::NotRunning) {
-        proc->write("exit\n");
-        proc->closeWriteChannel();
+    if (proc->state() == QProcess::NotRunning) { proc->deleteLater(); return; }
+    proc->write("exit\n");
+    proc->closeWriteChannel();
+    if (m_shutdownDone) {
+        // Выход из программы — ждём здесь, событийного цикла дальше не будет
         if (!proc->waitForFinished(500)) {
             proc->kill();
             proc->waitForFinished(1000);
         }
+        proc->deleteLater();
+        return;
     }
-    proc->deleteLater();
+    // Выход из ТВ — без ожидания в GUI-потоке (раньше до 1,5 с «замирания»):
+    // процесс удалится сам по завершении, не завершится за 1 с — убьём
+    connect(proc, &QProcess::finished, proc, &QObject::deleteLater);
+    QTimer::singleShot(1000, proc, [proc]() {
+        if (proc->state() != QProcess::NotRunning) proc->kill();
+    });
 }
 
 void AndroidTVModule::sendAndroidKey(int keyCode)
 {
+    // 0. gRPC эмулятора
+    if (m_grpcState == GrpcState::Checking) {
+        if (m_grpcWaiting.size() < kMaxPendingKeys) m_grpcWaiting.append(keyCode);
+        return;
+    }
+    if (m_grpcState == GrpcState::Ready && sendKeyViaGrpc(keyCode))
+        return;
+
+    // Консоль уже проверялась с этой сборкой эмулятора и не работает — сразу adb
+    if (m_consoleInput && m_consoleState != ConsoleState::Failed && consoleKnownBroken()) {
+        m_consoleState = ConsoleState::Failed;
+        logToEmulatorFile("[Input] emulator console: known not to deliver events with this "
+                          "emulator build — using adb");
+    }
+    // 1. sendevent — если нашлось устройство клавиатуры с правом записи
+    if (m_evdevState == EvdevState::Unknown) startEvdevProbe();
+    if (m_evdevState == EvdevState::Probing) {
+        if (m_evdevWaiting.size() < kMaxPendingKeys) m_evdevWaiting.append(keyCode);
+        return;
+    }
+    if (m_evdevState == EvdevState::Ready) {
+        const int linuxKey = evdevLinuxKey(keyCode);
+        if (linuxKey > 0) { queueEvdevKey(linuxKey); return; }
+    }
+    // 2. консоль эмулятора (с самопроверкой), 3. adb input keyevent
     if (m_consoleInput && sendKeyViaConsole(keyCode))
         return;
     queueAdbKey(keyCode);
+}
+
+// ── gRPC эмулятора ───────────────────────────────────────────────────────────
+
+/*static*/ int AndroidTVModule::grpcEvdevKey(int androidKeyCode)
+{
+    // Коды evdev, которые эмулятор переводит в клавиши Android (Generic.kl).
+    // OK — KEY_ENTER: для Android это «подтверждение» наравне с DPAD_CENTER, а
+    // KEY_REPLY может отсутствовать в таблице перевода эмулятора.
+    switch (androidKeyCode) {
+    case 19: return 103;   // DPAD_UP    ← KEY_UP
+    case 20: return 108;   // DPAD_DOWN  ← KEY_DOWN
+    case 21: return 105;   // DPAD_LEFT  ← KEY_LEFT
+    case 22: return 106;   // DPAD_RIGHT ← KEY_RIGHT
+    case 23: return 28;    // DPAD_CENTER← KEY_ENTER
+    case 4:  return 158;   // BACK       ← KEY_BACK
+    case 3:  return 172;   // HOME       ← KEY_HOMEPAGE
+    default: return -1;    // Меню, Поиск… — старым путём
+    }
+}
+
+int AndroidTVModule::pickFreeGrpcPort() const
+{
+    // 8554 — порт gRPC эмулятора по умолчанию; со сдвигом как у консоли
+    for (int port = 8554 + (m_consolePort - 5554); port < 8654; ++port) {
+        QTcpServer t;
+        if (t.listen(QHostAddress::LocalHost, static_cast<quint16>(port))) return port;
+    }
+    return 0;
+}
+
+bool AndroidTVModule::grpcDisabled() const
+{
+    const QString key = emulatorBuildKey();
+    return !key.isEmpty()
+        && LocalModels::appSettings().value("androidtv/grpcUnsupportedFor").toString() == key;
+}
+
+bool AndroidTVModule::grpcKnownBroken() const
+{
+    const QString key = emulatorBuildKey();
+    return !key.isEmpty()
+        && LocalModels::appSettings().value("androidtv/grpcInputBrokenFor").toString() == key;
+}
+
+void AndroidTVModule::rememberGrpcBroken()
+{
+    const QString key = emulatorBuildKey();
+    if (key.isEmpty()) return;
+    QSettings st = LocalModels::appSettings();
+    st.setValue("androidtv/grpcInputBrokenFor", key);
+}
+
+void AndroidTVModule::startGrpcCheck()
+{
+    if (m_grpcPort <= 0 || m_grpcState != GrpcState::Off) return;
+    if (grpcKnownBroken()) {
+        m_grpcState = GrpcState::Failed;
+        logToEmulatorFile("[Input] gRPC: known not to deliver keys with this emulator build");
+        return;
+    }
+    if (!m_grpc) {
+        m_grpc = new EmulatorGrpcClient(this);
+        connect(m_grpc, &EmulatorGrpcClient::callFailed, this, [this](const QString &method, const QString &err) {
+            if (m_grpcState == GrpcState::Ready)
+                failGrpc(method + ": " + err);
+        });
+    }
+    QString tokenSource;
+    const QByteArray token = readGrpcToken(&tokenSource);
+    logToEmulatorFile("[Input] gRPC token: " + tokenSource);
+    m_grpc->configure(m_grpcPort, token);
+    m_grpcState = GrpcState::Checking;
+    m_grpcStatusTries = 0;
+
+    auto attempt = std::make_shared<std::function<void()>>();
+    *attempt = [this, attempt]() {
+        if (m_grpcState != GrpcState::Checking) return;
+        ++m_grpcStatusTries;
+        m_grpc->getStatus([this, attempt](const EmulatorGrpcClient::Status &st) {
+            if (m_grpcState != GrpcState::Checking) return;
+            if (st.ok) {
+                m_grpcState = GrpcState::Ready;
+                logToEmulatorFile(QString("[Input] gRPC :%1 ready (emulator %2, booted=%3)")
+                                      .arg(m_grpcPort).arg(st.version).arg(st.booted));
+            } else if (m_grpcStatusTries < kGrpcStatusRetries) {
+                QTimer::singleShot(400, this, [attempt]() { (*attempt)(); });
+                return;
+            } else {
+                m_grpcState = GrpcState::Failed;
+                logToEmulatorFile("[Input] gRPC unavailable (" + st.error + ") — using other input paths");
+            }
+            const QList<int> waiting = m_grpcWaiting;
+            m_grpcWaiting.clear();
+            for (int k : waiting) sendAndroidKey(k);
+        });
+    };
+    (*attempt)();
+}
+
+bool AndroidTVModule::sendKeyViaGrpc(int androidKeyCode)
+{
+    const int code = grpcEvdevKey(androidKeyCode);
+    if (code < 0 || !m_grpc) return false;
+    if (!m_grpcVerified && !m_grpcProbe) {
+        startGrpcProbe({androidKeyCode});
+        return true;
+    }
+    if (m_grpcProbe) m_grpcProbeKeys.append(androidKeyCode);
+    m_grpc->sendKeyPress(code);
+    return true;
+}
+
+// Как у консоли: «OK» от эмулятора ещё не значит, что нажатие дошло до
+// Android. Слушаем `getevent -lq`, отправляем, ждём EV_KEY.
+void AndroidTVModule::startGrpcProbe(const QList<int> &androidKeys)
+{
+    m_grpcProbeSawKey = false;
+    m_grpcProbeKeys.clear();
+    m_grpcProbe = new QProcess(this);
+    QProcess *proc = m_grpcProbe;
+    proc->setProgram(adbPath());
+    proc->setArguments({"-s", adbSerial(), "shell", "getevent", "-lq"});
+    proc->setProcessEnvironment(toolsEnvironment());
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+    connect(proc, &QProcess::readyRead, this, [this, proc]() {
+        if (m_grpcProbe != proc) return;
+        if (proc->readAll().contains("EV_KEY")) {
+            m_grpcProbeSawKey = true;
+            finishGrpcProbe(true);
+        }
+    });
+    connect(proc, &QProcess::finished, proc, &QObject::deleteLater);
+    proc->start();
+    logToEmulatorFile("[Input] gRPC probe: listening with getevent");
+
+    QTimer::singleShot(300, this, [this, androidKeys]() {
+        if (m_grpcState != GrpcState::Ready || !m_grpcProbe) return;
+        for (int k : androidKeys) sendKeyViaGrpc(k);
+    });
+    QTimer::singleShot(300 + kGrpcProbeMs, this, [this, proc]() {
+        if (m_grpcProbe == proc) finishGrpcProbe(m_grpcProbeSawKey);
+    });
+}
+
+void AndroidTVModule::finishGrpcProbe(bool sawKey)
+{
+    QProcess *proc = m_grpcProbe;
+    m_grpcProbe = nullptr;
+    if (proc && proc->state() != QProcess::NotRunning) proc->kill();
+    const QList<int> sent = m_grpcProbeKeys;
+    m_grpcProbeKeys.clear();
+    if (sawKey) {
+        m_grpcVerified = true;
+        logToEmulatorFile("[Input] gRPC probe: OK, keys reach Android — fast input (no JVM)");
+        return;
+    }
+    rememberGrpcBroken();
+    failGrpc(QStringLiteral("keys do not reach Android (getevent saw nothing)"), sent);
+}
+
+void AndroidTVModule::failGrpc(const QString &reason, const QList<int> &resend)
+{
+    if (m_grpcState == GrpcState::Failed) return;
+    m_grpcState = GrpcState::Failed;
+    logToEmulatorFile("[Input] gRPC input disabled (" + reason + ") — using other input paths");
+    for (int k : resend) sendAndroidKey(k);
+}
+
+// ── Память о неработающей консоли ────────────────────────────────────────────
+
+QString AndroidTVModule::emulatorBuildKey() const
+{
+    const QFileInfo fi(emulatorPath());
+    if (!fi.exists()) return {};
+    return QString::number(fi.size()) + "_" + QString::number(fi.lastModified().toSecsSinceEpoch());
+}
+
+bool AndroidTVModule::consoleKnownBroken() const
+{
+    const QString key = emulatorBuildKey();
+    return !key.isEmpty()
+        && LocalModels::appSettings().value("androidtv/consoleInputBrokenFor").toString() == key;
+}
+
+void AndroidTVModule::rememberConsoleBroken()
+{
+    const QString key = emulatorBuildKey();
+    if (key.isEmpty()) return;
+    QSettings st = LocalModels::appSettings();
+    st.setValue("androidtv/consoleInputBrokenFor", key);
+}
+
+// ── sendevent ────────────────────────────────────────────────────────────────
+
+int AndroidTVModule::evdevLinuxKey(int androidKeyCode) const
+{
+    auto has = [this](int k) { return m_evdevKeys.contains(k); };
+    switch (androidKeyCode) {
+    case 19: return has(103) ? 103 : -1;                  // DPAD_UP    ← KEY_UP
+    case 20: return has(108) ? 108 : -1;                  // DPAD_DOWN  ← KEY_DOWN
+    case 21: return has(105) ? 105 : -1;                  // DPAD_LEFT  ← KEY_LEFT
+    case 22: return has(106) ? 106 : -1;                  // DPAD_RIGHT ← KEY_RIGHT
+    case 23: return has(232) ? 232 : has(28) ? 28 : -1;   // DPAD_CENTER ← KEY_REPLY / ENTER
+    case 4:  return has(158) ? 158 : -1;                  // BACK       ← KEY_BACK
+    default: return -1;                                   // Home, Menu… — через input keyevent
+    }
+}
+
+/*static*/ QString AndroidTVModule::pickEvdevDevice(const QString &out, QSet<int> *keys, QString *name,
+                                                    bool *viaSu)
+{
+    bool suOk = false;
+    static const QHash<QString, int> kNeeded = {
+        { "KEY_UP", 103 }, { "KEY_DOWN", 108 }, { "KEY_LEFT", 105 }, { "KEY_RIGHT", 106 },
+        { "KEY_ENTER", 28 }, { "KEY_REPLY", 232 }, { "KEY_BACK", 158 },
+    };
+    struct Dev { QString path, name; QSet<int> keys; };
+    QList<Dev> devs;
+    QSet<QString> writable;
+    bool inKeys = false;
+    static const QRegularExpression rxAdd(QStringLiteral("^add device \\d+:\\s*(\\S+)"));
+    static const QRegularExpression rxSection(QStringLiteral("^\\s*[A-Z_]+ \\([0-9a-fA-F]{4}\\):"));
+    static const QRegularExpression rxName(QStringLiteral("^\\s*name:\\s*\"(.*)\""));
+
+    for (const QString &raw : out.split(QLatin1Char('\n'))) {
+        const QString line = QString(raw).remove(QLatin1Char('\r'));
+        if (line.startsWith(QLatin1String("WRITABLE "))) { writable.insert(line.mid(9).trimmed()); continue; }
+        if (line.trimmed() == QLatin1String("SU_OK")) { suOk = true; continue; }
+        const auto mAdd = rxAdd.match(line);
+        if (mAdd.hasMatch()) { devs.append({ mAdd.captured(1), {}, {} }); inKeys = false; continue; }
+        if (devs.isEmpty()) continue;
+        const auto mName = rxName.match(line);
+        if (mName.hasMatch()) { devs.last().name = mName.captured(1); continue; }
+        if (rxSection.match(line).hasMatch())
+            inKeys = line.trimmed().startsWith(QLatin1String("KEY ("));
+        else if (line.trimmed().startsWith(QLatin1String("input props")))
+            inKeys = false;
+        if (!inKeys) continue;
+        for (const QString &tok : line.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts)) {
+            const auto it = kNeeded.constFind(tok);
+            if (it != kNeeded.constEnd()) devs.last().keys.insert(it.value());
+        }
+    }
+
+    // Нужны стрелки и право записи (своё или через su); из подходящих — где
+    // больше нужных клавиш, при равенстве — доступное без su
+    const Dev *best = nullptr;
+    bool bestSu = false;
+    for (const Dev &d : devs) {
+        const bool direct = writable.contains(d.path);
+        if (!direct && !suOk) continue;
+        if (!d.keys.contains(103) || !d.keys.contains(108)) continue;
+        const bool better = !best || d.keys.size() > best->keys.size()
+                            || (d.keys.size() == best->keys.size() && direct && bestSu);
+        if (better) { best = &d; bestSu = !direct; }
+    }
+    if (!best) return {};
+    if (keys)  *keys  = best->keys;
+    if (name)  *name  = best->name;
+    if (viaSu) *viaSu = bestSu;
+    return best->path;
+}
+
+void AndroidTVModule::startEvdevProbe()
+{
+    if (m_evdevState != EvdevState::Unknown || !m_running) return;
+    if (!QFile::exists(adbPath())) { m_evdevState = EvdevState::Unavailable; return; }
+    m_evdevState = EvdevState::Probing;
+
+    auto *proc = new QProcess(this);
+    m_evdevProbe = proc;
+    proc->setProgram(adbPath());
+    // Доступен ли su (образы без Google Play), устройства с клавишами
+    // (через su — если без него getevent не видит устройства) и какие из них
+    // доступны на запись пользователю shell
+    proc->setArguments({"-s", adbSerial(), "shell",
+                        "if su 0 id -u 2>/dev/null | grep -qx 0; then echo SU_OK; "
+                        "su 0 getevent -pl 2>/dev/null; else getevent -pl 2>/dev/null; fi; "
+                        "for f in /dev/input/event*; do [ -w $f ] && echo WRITABLE $f; done"});
+    proc->setProcessEnvironment(toolsEnvironment());
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+    connect(proc, &QProcess::finished, this, [this, proc](int, QProcess::ExitStatus) {
+        if (m_evdevProbe != proc) { proc->deleteLater(); return; }
+        m_evdevProbe = nullptr;
+        onEvdevProbeOutput(QString::fromUtf8(proc->readAll()));
+        proc->deleteLater();
+    });
+    QTimer::singleShot(kEvdevProbeTimeoutMs, proc, [this, proc]() {
+        if (m_evdevProbe != proc) return;
+        m_evdevProbe = nullptr;
+        proc->disconnect(this);
+        proc->kill();
+        proc->deleteLater();
+        onEvdevProbeOutput(QString());
+    });
+    proc->start();
+    logToEmulatorFile("[Input] evdev: looking for a writable keyboard device");
+}
+
+void AndroidTVModule::onEvdevProbeOutput(const QString &out)
+{
+    QString name;
+    m_evdevViaSu = false;
+    m_evdevPath = pickEvdevDevice(out, &m_evdevKeys, &name, &m_evdevViaSu);
+    if (m_evdevPath.isEmpty()) {
+        m_evdevState = EvdevState::Unavailable;
+        m_evdevKeys.clear();
+        if (out.isEmpty()) {
+            logToEmulatorFile(QStringLiteral("[Input] evdev: probe timed out — using console/adb"));
+        } else {
+            // Подробности — чтобы по журналу было видно, чего не хватило
+            const int devices  = int(out.count(QLatin1String("add device")));
+            const int writable = int(out.count(QLatin1String("WRITABLE ")));
+            const bool su      = out.contains(QLatin1String("SU_OK"));
+            logToEmulatorFile(QString("[Input] evdev: no usable keyboard device (devices seen %1, "
+                                      "writable %2, su %3) — using console/adb")
+                                  .arg(devices).arg(writable).arg(su ? "yes" : "no"));
+        }
+    } else {
+        m_evdevState = EvdevState::Ready;
+        QStringList k;
+        for (int code : std::as_const(m_evdevKeys)) k << QString::number(code);
+        std::sort(k.begin(), k.end());
+        logToEmulatorFile(QString("[Input] evdev: %1 '%2', keys %3 — sendevent%4 (no JVM)")
+                              .arg(m_evdevPath, name, k.join(','),
+                                   m_evdevViaSu ? " via su" : ""));
+    }
+    const QList<int> waiting = m_evdevWaiting;
+    m_evdevWaiting.clear();
+    for (int key : waiting) sendAndroidKey(key);
+}
+
+void AndroidTVModule::queueEvdevKey(int linuxKey)
+{
+    if (m_pendingEvdev.size() >= kMaxPendingKeys) m_pendingEvdev.removeFirst();
+    m_pendingEvdev.append(linuxKey);
+    flushPendingKeys();
+}
+
+void AndroidTVModule::resetEvdev()
+{
+    if (m_evdevProbe) {
+        QProcess *proc = m_evdevProbe;
+        m_evdevProbe = nullptr;
+        proc->disconnect(this);
+        if (proc->state() != QProcess::NotRunning) proc->kill();
+        proc->deleteLater();
+    }
+    m_evdevState = EvdevState::Unknown;
+    m_evdevViaSu = false;
+    m_evdevPath.clear();
+    m_evdevKeys.clear();
+    m_evdevWaiting.clear();
+    m_pendingEvdev.clear();
 }
 
 void AndroidTVModule::queueAdbKey(int keyCode)
@@ -189,7 +599,7 @@ void AndroidTVModule::queueAdbKey(int keyCode)
 
 void AndroidTVModule::flushPendingKeys()
 {
-    if (m_pendingKeys.isEmpty()) return;
+    if (m_pendingKeys.isEmpty() && m_pendingEvdev.isEmpty()) return;
 
     if (m_keyBatchInFlight) {
         if (m_keyBatchSent.isValid() && m_keyBatchSent.elapsed() < kKeyBatchStuckMs)
@@ -203,20 +613,35 @@ void AndroidTVModule::flushPendingKeys()
         codes << QString::number(k);
     m_pendingKeys.clear();
 
+    // sendevent: нажатие + синхронизация, отпускание + синхронизация
+    QByteArray evdevCmd;
+    const QByteArray dev = m_evdevPath.toLatin1();
+    for (int k : std::as_const(m_pendingEvdev)) {
+        const QByteArray code = QByteArray::number(k);
+        evdevCmd += "sendevent " + dev + " 1 " + code + " 1;sendevent " + dev + " 0 0 0;"
+                    "sendevent " + dev + " 1 " + code + " 0;sendevent " + dev + " 0 0 0;";
+    }
+    m_pendingEvdev.clear();
+
+    // Через su — одна оболочка root на всю пачку (su — нативная утилита, не JVM)
+    QByteArray cmd = (!evdevCmd.isEmpty() && m_evdevViaSu)
+                         ? "su 0 sh -c '" + evdevCmd + "';"
+                         : evdevCmd;
+    if (!codes.isEmpty())
+        cmd += "input keyevent " + codes.join(QLatin1Char(' ')).toLatin1() + ";";
+
     if (!m_keyShell) startKeyShell();
     if (m_keyShell && m_keyShell->state() != QProcess::NotRunning) {
-        // Несколько кодов в одной команде — одна JVM на всю пачку; маркер
-        // сообщает, что команда выполнена и можно отправлять следующую.
-        m_keyShell->write("input keyevent " + codes.join(QLatin1Char(' ')).toLatin1()
-                          // кавычки разбивают маркер в тексте команды (на случай эха
-                          // терминала), а в выводе echo он склеивается целиком
-                          + "; echo __MS_KEYS_\"\"DONE__\n");
+        // Одна команда на пачку; маркер сообщает, что она выполнена и можно
+        // отправлять следующую. Кавычки разбивают маркер в тексте команды (на
+        // случай эха терминала), а в выводе echo он склеивается целиком.
+        m_keyShell->write(cmd + " echo __MS_KEYS_\"\"DONE__\n");
         m_keyBatchInFlight = true;
         m_keyBatchSent.start();
         return;
     }
     // Запасной путь — разовый вызов
-    adb(QStringList{"shell", "input", "keyevent"} + codes);
+    adb(QStringList{"shell", QString::fromLatin1(cmd)});
 }
 
 // ── Консоль эмулятора ────────────────────────────────────────────────────────
@@ -253,6 +678,48 @@ void AndroidTVModule::flushPendingKeys()
     return f.readAll().trimmed();
 }
 
+// pid_<PID>.ini: строки «ключ=значение»; берём grpc.token, если grpc.port
+// совпадает с нашим (port <= 0 — не сверять)
+/*static*/ QByteArray AndroidTVModule::grpcTokenFromDiscovery(const QByteArray &ini, int port)
+{
+    QByteArray token;
+    int filePort = -1;
+    for (QByteArray line : ini.split('\n')) {
+        line = line.trimmed();
+        const int eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        const QByteArray k = line.left(eq).trimmed(), v = line.mid(eq + 1).trimmed();
+        if (k == "grpc.token")     token = v;
+        else if (k == "grpc.port") filePort = v.toInt();
+    }
+    if (port > 0 && filePort > 0 && filePort != port) return {};
+    return token;
+}
+
+QByteArray AndroidTVModule::readGrpcToken(QString *source) const
+{
+    QStringList candidates;
+    if (!m_emuDiscoveryFile.isEmpty()) candidates << m_emuDiscoveryFile;
+    const QString runDir = QDir::tempPath() + QStringLiteral("/avd/running");
+    if (m_emulatorPid > 0) candidates << runDir + QString("/pid_%1.ini").arg(m_emulatorPid);
+    // Запасной путь: любой файл обнаружения с нашим портом gRPC
+    const QFileInfoList all = QDir(runDir).entryInfoList({ QStringLiteral("pid_*.ini") }, QDir::Files, QDir::Time);
+    for (const QFileInfo &fi : all) candidates << fi.absoluteFilePath();
+    candidates.removeDuplicates();
+
+    for (const QString &path : candidates) {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) continue;
+        const QByteArray tok = grpcTokenFromDiscovery(f.readAll(), m_grpcPort);
+        if (!tok.isEmpty()) {
+            if (source) *source = "grpc.token from " + QDir::toNativeSeparators(path);
+            return tok;
+        }
+    }
+    if (source) *source = QStringLiteral("no grpc.token in discovery files — using console auth token");
+    return readConsoleAuthToken();
+}
+
 bool AndroidTVModule::sendKeyViaConsole(int androidKeyCode)
 {
     if (m_consoleState == ConsoleState::Failed) return false;
@@ -267,14 +734,96 @@ bool AndroidTVModule::sendKeyViaConsole(int androidKeyCode)
         return true;
     }
 
-    const QByteArray code = QByteArray::number(linuxKey);
-    m_console->write("event send EV_KEY:" + code + ":1 EV_KEY:" + code + ":0\n");
+    // Первое нажатие в готовую, но не проверенную консоль — через проверку
+    // (startConsoleProbe сам отправит его, когда getevent будет слушать)
+    if (!m_consoleVerified && !m_consoleProbe) {
+        startConsoleProbe({androidKeyCode});
+        return true;
+    }
+
+    // Символьные имена клавиш. EV_SYN эта версия эмулятора не принимает
+    // («invalid event code» — журнал 07.11), синхронизацию добавляет сама.
+    const QByteArray name = linuxKeyName(linuxKey);
+    m_console->write("event send EV_KEY:" + name + ":1 EV_KEY:" + name + ":0\n");
+    if (m_consoleProbe) m_consoleProbeKeys.append(androidKeyCode);
     return true;
+}
+
+/*static*/ QByteArray AndroidTVModule::linuxKeyName(int linuxKey)
+{
+    switch (linuxKey) {
+    case 103: return "KEY_UP";
+    case 108: return "KEY_DOWN";
+    case 105: return "KEY_LEFT";
+    case 106: return "KEY_RIGHT";
+    case 232: return "KEY_REPLY";
+    case 158: return "KEY_BACK";
+    default:  return QByteArray::number(linuxKey);
+    }
+}
+
+// Проверка: `getevent -lq` в госте печатает события устройств ввода. Запускаем
+// его, через 300 мс (успеть открыть устройства) отправляем накопленные
+// нажатия через консоль и ждём строку с EV_KEY не дольше kConsoleProbeMs.
+void AndroidTVModule::startConsoleProbe(const QList<int> &keys)
+{
+    m_consoleProbeSawKey = false;
+    m_consoleProbeKeys.clear();
+    m_consoleProbe = new QProcess(this);
+    QProcess *proc = m_consoleProbe;
+    proc->setProgram(adbPath());
+    proc->setArguments({"-s", adbSerial(), "shell", "getevent", "-lq"});
+    proc->setProcessEnvironment(toolsEnvironment());
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+    connect(proc, &QProcess::readyRead, this, [this, proc]() {
+        if (m_consoleProbe != proc) return;
+        const QByteArray out = proc->readAll();
+        if (out.contains("EV_KEY")) {
+            m_consoleProbeSawKey = true;
+            finishConsoleProbe(true);
+        }
+    });
+    connect(proc, &QProcess::finished, proc, &QObject::deleteLater);
+    proc->start();
+    logToEmulatorFile("[Input] console probe: listening with getevent");
+
+    QTimer::singleShot(300, this, [this, keys]() {
+        if (m_consoleState != ConsoleState::Ready) return;
+        for (int k : keys) sendKeyViaConsole(k);
+    });
+    QTimer::singleShot(300 + kConsoleProbeMs, this, [this, proc]() {
+        if (m_consoleProbe == proc) finishConsoleProbe(m_consoleProbeSawKey);
+    });
+}
+
+void AndroidTVModule::finishConsoleProbe(bool sawKey)
+{
+    QProcess *proc = m_consoleProbe;
+    m_consoleProbe = nullptr;
+    if (proc && proc->state() != QProcess::NotRunning) proc->kill();
+    const QList<int> sent = m_consoleProbeKeys;
+    m_consoleProbeKeys.clear();
+
+    if (sawKey) {
+        m_consoleVerified = true;
+        logToEmulatorFile("[Input] console probe: OK, events reach Android");
+        return;
+    }
+    // Событий нет — консоль принимает команды, но они не доходят. Дальше —
+    // adb, отправленное во время проверки повторяем через него. Запоминаем
+    // для этой сборки эмулятора.
+    rememberConsoleBroken();
+    failConsole(QStringLiteral("events do not reach Android (getevent saw nothing)"));
+    for (int k : sent) queueAdbKey(k);
 }
 
 void AndroidTVModule::startConsole()
 {
+    // stopConsole() очищает очередь — а в ней уже лежит нажатие, ради
+    // которого консоль запускается. Раньше первое нажатие терялось всегда.
+    const QList<int> keep = m_consolePending;
     stopConsole();
+    m_consolePending = keep;
     m_consoleState = ConsoleState::Connecting;
     m_consoleBuf.clear();
     m_consoleAuthNeeded  = false;
@@ -380,6 +929,10 @@ void AndroidTVModule::onConsoleReadyRead()
         if (m_consoleState == ConsoleState::Ready && !m_consolePending.isEmpty()) {
             const QList<int> pending = m_consolePending;
             m_consolePending.clear();
+            if (!m_consoleVerified && !m_consoleProbe) {
+                startConsoleProbe(pending);     // первые нажатия — с проверкой
+                return;
+            }
             for (int k : pending) sendKeyViaConsole(k);
         }
     }
@@ -404,6 +957,14 @@ void AndroidTVModule::failConsole(const QString &reason)
 
 void AndroidTVModule::stopConsole()
 {
+    if (m_consoleProbe) {
+        QProcess *proc = m_consoleProbe;
+        m_consoleProbe = nullptr;
+        proc->disconnect(this);
+        if (proc->state() != QProcess::NotRunning) proc->kill();
+    }
+    m_consoleProbeKeys.clear();
+    m_consoleVerified = false;
     m_consolePending.clear();
     m_consoleBuf.clear();
     m_consoleState = ConsoleState::Off;
@@ -419,6 +980,9 @@ void AndroidTVModule::stopConsole()
 
 void AndroidTVModule::notifyKeyMode(bool emulatorActive)
 {
+    // Устройство для sendevent ищем сразу при показе ТВ — к первому нажатию
+    // всё готово
+    if (emulatorActive) { startGrpcCheck(); startEvdevProbe(); }
     if (!m_bus) return;
     emit m_bus->moduleEvent(
         QLatin1String(G72Keys::kModule),
@@ -427,6 +991,13 @@ void AndroidTVModule::notifyKeyMode(bool emulatorActive)
     logToEmulatorFile(
         QString("[Input] G72Keys mode → %1")
             .arg(emulatorActive ? "EmulatorMode" : "Normal"));
+}
+
+void AndroidTVModule::requestKeyHookReinstall()
+{
+    if (!m_bus) return;
+    emit m_bus->moduleEvent(QLatin1String(G72Keys::kModule),
+                            QLatin1String(G72Keys::kEventReinstallHook), QVariantMap{});
 }
 
 // ── Q_INVOKABLE для QML ───────────────────────────────────────────────────────

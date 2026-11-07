@@ -61,7 +61,10 @@ SOURCES += \
     tools/HttpClient.cpp                                    \
     tools/LlamaClient.cpp                                   \
     tools/SevenZip.cpp                                      \
+    tools/WofCompact.cpp                                    \
     modules/AndroidTVModule/AndroidTVInput.cpp              \
+    modules/AndroidTVModule/EmulatorGrpcClient.cpp          \
+    modules/AndroidTVModule/AdGuardHome.cpp                 \
     modules/AndroidTVModule/AndroidTVLifecycle.cpp          \
     modules/AndroidTVModule/AndroidTVLog.cpp                \
     modules/AndroidTVModule/AndroidTVModule.cpp             \
@@ -94,6 +97,7 @@ SOURCES += \
     modules/TileModule/TileManager.cpp                      \
     modules/UpdateManager/UpdateManager.cpp                 \
     modules/KaraokeModule/KaraokeModule.cpp                 \
+    modules/KaraokeModule/AudioTags.cpp                     \
     modules/KaraokeModule/KaraokeWorker.cpp                 \
     modules/KaraokeModule/DemucsWrapper.cpp                 \
     modules/KaraokeModule/LrcFetcher.cpp                    \
@@ -111,11 +115,15 @@ HEADERS += \
     core/IModule.h                                          \
     core/ModuleHost.h                                       \
     tools/AtomicFile.h                                      \
+    tools/LocalModelPaths.h                                 \
     tools/GameInfoStore.h                                   \
     tools/HttpClient.h                                      \
     tools/LlamaClient.h                                     \
     tools/SevenZip.h                                        \
+    tools/WofCompact.h                                      \
     modules/AndroidTVModule/AndroidTVModule.h               \
+    modules/AndroidTVModule/EmulatorGrpcClient.h            \
+    modules/AndroidTVModule/AdGuardHome.h                   \
     modules/AirMouseModule/G72BatteryModule.h               \
     modules/AirMouseModule/G72KeysModule.h                  \
     modules/AppModule/AppController.h                       \
@@ -141,6 +149,7 @@ HEADERS += \
     modules/TileModule/TileManager.h                        \
     modules/UpdateManager/UpdateManager.h                   \
     modules/KaraokeModule/KaraokeModule.h                   \
+    modules/KaraokeModule/AudioTags.h                       \
     modules/KaraokeModule/KaraokeWorker.h                   \
     modules/KaraokeModule/DemucsWrapper.h                   \
     modules/KaraokeModule/DemucsDsp.h                       \
@@ -178,6 +187,8 @@ win32: LIBS += -lWindowsApp
 win32: LIBS += -lwinmm
 win32: LIBS += -ladvapi32 -lpowrprof   # выключение/сон (AppController::powerAction)
 win32: LIBS += -ldwmapi   # DwmFlush (AndroidTVModule); #pragma comment работает только в MSVC
+win32: LIBS += -lgdi32    # снимок окна эмулятора перед показом ТВ (AndroidTVModule::sampleEmulatorContent)
+win32: LIBS += -lshell32 -lole32   # ShellExecuteEx: запуск игр без PowerShell (GameWatcher), служба AdGuard Home
 
 # ==================== Прочее ====================
 DISTFILES +=

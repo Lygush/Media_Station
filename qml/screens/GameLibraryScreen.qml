@@ -47,6 +47,8 @@ Item {
         font.pixelSize: Settings.fs(13)
         text: {
             var l = [Settings.tr("lib_status_archiving"), Settings.tr("lib_status_extracting"),
+                     Settings.tr("lib_status_compressing"), Settings.tr("lib_status_decompressing"),
+                     Settings.tr("lib_status_compressed"),
                      Settings.tr("lib_status_archive"), Settings.tr("lib_status_unavailable"),
                      Settings.tr("lib_status_no_tile"), Settings.tr("lib_status_external"),
                      Settings.tr("lib_status_installed")]
@@ -58,13 +60,16 @@ Item {
     readonly property int _colStatusW: Math.max(Settings.us(180), Math.ceil(statusMetrics.advanceWidth) + Settings.us(36))
     readonly property int _colSizeW:   Math.max(Settings.us(120), Math.ceil(sizeMetrics.advanceWidth) + Settings.us(16))
 
-    function statusInfo(type, available, tileCount, archiving, extracting) {
+    function statusInfo(type, available, tileCount, archiving, extracting, compressing, decompressing, compressed) {
         if (archiving)          return { key: "processing", label: Settings.tr("lib_status_archiving") }
         if (extracting)         return { key: "processing", label: Settings.tr("lib_status_extracting") }
+        if (compressing)        return { key: "processing", label: Settings.tr(decompressing ? "lib_status_decompressing"
+                                                                                          : "lib_status_compressing") }
         if (type === "archive") return { key: "archive",    label: Settings.tr("lib_status_archive") }
         if (!available)         return { key: "unavailable",label: Settings.tr("lib_status_unavailable") }
         if (tileCount === 0)    return { key: "no_tile",    label: Settings.tr("lib_status_no_tile") }
         if (type === "external")return { key: "external",   label: Settings.tr("lib_status_external") }
+        if (compressed)         return { key: "installed",  label: Settings.tr("lib_status_compressed") }
         return                         { key: "installed",  label: Settings.tr("lib_status_installed") }
     }
 
@@ -104,9 +109,11 @@ Item {
                 archiveProgress: e.archiveProgress || 0.0,
                 archiveCurrentFile: e.archiveCurrentFile || "",
                 extracting: e.extracting || false, extractProgress: e.extractProgress || 0.0,
+                compressing: e.compressing || false, decompressing: e.decompressing || false,
+                compressProgress: e.compressProgress || 0.0, compressed: e.compressed || false,
                 legacyNoMetadata: e.legacyNoMetadata || false
             })
-            if ((e.sizeCached === undefined || e.sizeCached < 0) && !e.archiving && !e.extracting) {
+            if ((e.sizeCached === undefined || e.sizeCached < 0) && !e.archiving && !e.extracting && !e.compressing) {
                 var targetPath = libScreen.sizeTargetPath(e)
                 if (targetPath && targetPath !== "") {
                     libraryModel.setProperty(i, "sizeLoading", true)
@@ -122,7 +129,7 @@ Item {
 
         for (var r = libraryModel.count - 1; r >= 0; r--) {
             var row0 = libraryModel.get(r)
-            if (!newMap[row0.gameId] && !row0.archiving && !row0.extracting)
+            if (!newMap[row0.gameId] && !row0.archiving && !row0.extracting && !row0.compressing)
                 libraryModel.remove(r)
         }
 
@@ -135,7 +142,7 @@ Item {
 
             if (found >= 0) {
                 var row = libraryModel.get(found)
-                var isActive = row.archiving || row.extracting
+                var isActive = row.archiving || row.extracting || row.compressing
                 if (!isActive) {
                     libraryModel.setProperty(found, "name",           ne.name          || row.name)
                     libraryModel.setProperty(found, "type",           ne.type          || row.type)
@@ -144,6 +151,7 @@ Item {
                     libraryModel.setProperty(found, "archivePath",    ne.archivePath   || "")
                     libraryModel.setProperty(found, "iconPath",       ne.iconPath      || "")
                     libraryModel.setProperty(found, "legacyNoMetadata", ne.legacyNoMetadata || false)
+                    libraryModel.setProperty(found, "compressed",     ne.compressed    || false)
                     if (row.sizeCached <= 0 && !row.sizeLoading) {
                         var tp = libScreen.sizeTargetPath(ne)
                         if (tp && tp !== "") {
@@ -161,6 +169,8 @@ Item {
                     tileCount: -1, sizeCached: ne.sizeCached !== undefined ? ne.sizeCached : -1,
                     sizeLoading: false, archiving: false, archiveProgress: 0.0,
                     archiveCurrentFile: "", extracting: false, extractProgress: 0.0,
+                    compressing: false, decompressing: false, compressProgress: 0.0,
+                    compressed: ne.compressed || false,
                     legacyNoMetadata: ne.legacyNoMetadata || false
                 })
                 var newIdx = libraryModel.count - 1
@@ -212,6 +222,24 @@ Item {
                         libraryModel.setProperty(i, "sizeCached", -1)
                         libraryModel.setProperty(i, "sizeLoading", false)
                     }
+                    break
+                }
+            }
+        }
+        function onCompressProgress(gameId, progress) {
+            for (var i = 0; i < libraryModel.count; i++) {
+                if (libraryModel.get(i).gameId === gameId) {
+                    libraryModel.setProperty(i, "compressProgress", progress); break
+                }
+            }
+        }
+        function onCompressFinished(gameId, success, compressed) {
+            for (var i = 0; i < libraryModel.count; i++) {
+                if (libraryModel.get(i).gameId === gameId) {
+                    libraryModel.setProperty(i, "compressing",      false)
+                    libraryModel.setProperty(i, "decompressing",    false)
+                    libraryModel.setProperty(i, "compressProgress", 0.0)
+                    libraryModel.setProperty(i, "compressed",       compressed)
                     break
                 }
             }
@@ -384,7 +412,7 @@ Item {
                         delegate: Item {
                             id: rowDelegate
                             width: gameListView.width
-                            height: (model.archiving || model.extracting) ? Settings.us(72) : Settings.us(56)
+                            height: (model.archiving || model.extracting || model.compressing) ? Settings.us(72) : Settings.us(56)
                             Behavior on height { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
 
                             property bool  _pressing:     false
@@ -402,11 +430,11 @@ Item {
                             Rectangle {
                                 anchors.fill: parent; radius: 8; color: Settings.accent(1.0)
                                 opacity: (rowDelegate._pressing && !model.archiving
-                                          && !model.extracting && !libScreen._menuOpen)
+                                          && !model.extracting && !model.compressing && !libScreen._menuOpen)
                                          ? rowDelegate._holdProgress * 0.22 : 0.0
                             }
                             Rectangle {
-                                visible: rowDelegate._pressing && !model.archiving && !model.extracting
+                                visible: rowDelegate._pressing && !model.archiving && !model.extracting && !model.compressing
                                 anchors.bottom: parent.bottom; anchors.left: parent.left
                                 height: Settings.us(3); radius: Settings.us(1)
                                 width: parent.width * rowDelegate._holdProgress
@@ -429,6 +457,7 @@ Item {
                                                 : "qrc:/assets/icons/ic_label.png"
                                         sourceSize.width: 100; sourceSize.height: 100
                                         fillMode: Image.PreserveAspectFit; smooth: true
+                                        asynchronous: true   // иконка с диска — не в GUI-потоке
                                         onStatusChanged: { if (status === Image.Error) source = "qrc:/assets/icons/ic_label.png" }
                                     }
                                 }
@@ -466,7 +495,8 @@ Item {
                                         anchors.verticalCenter: parent.verticalCenter
                                         readonly property var si: libScreen.statusInfo(
                                             model.type, model.available, model.tileCount,
-                                            model.archiving, model.extracting)
+                                            model.archiving, model.extracting,
+                                            model.compressing, model.decompressing, model.compressed)
                                         dotColor: libScreen.statusColors[si.key] || "#888"
                                         label:    si.label
                                     }
@@ -489,11 +519,11 @@ Item {
                                 anchors.leftMargin: Settings.us(64); anchors.rightMargin: Settings.us(8)
                                 anchors.bottomMargin: Settings.us(6)
                                 height: Settings.us(28)
-                                visible: model.archiving || model.extracting
+                                visible: model.archiving || model.extracting || model.compressing
 
                                 Item {
                                     id: cancelBtn
-                                    visible: model.archiving || model.extracting
+                                    visible: model.archiving || model.extracting || model.compressing
                                     anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                                     width: Settings.us(22); height: Settings.us(22)
                                     Rectangle {
@@ -505,8 +535,9 @@ Item {
                                     MouseArea {
                                         id: cancelBtnMA; anchors.fill: parent; hoverEnabled: true
                                         onClicked: {
-                                            if (model.archiving) GameLibraryModule.cancelArchive(model.gameId)
-                                            else                 GameLibraryModule.cancelExtract(model.gameId)
+                                            if (model.archiving)        GameLibraryModule.cancelArchive(model.gameId)
+                                            else if (model.compressing) GameLibraryModule.cancelCompress(model.gameId)
+                                            else                        GameLibraryModule.cancelExtract(model.gameId)
                                         }
                                     }
                                 }
@@ -520,7 +551,9 @@ Item {
                                         width: parent.width
                                         text: model.archiving
                                               ? (model.archiveCurrentFile !== "" ? model.archiveCurrentFile : Settings.tr("lib_status_archiving"))
-                                              : Settings.tr("lib_status_extracting")
+                                              : model.compressing
+                                                ? Settings.tr(model.decompressing ? "lib_status_decompressing" : "lib_status_compressing")
+                                                : Settings.tr("lib_status_extracting")
                                         color: Settings.accent(0.7); font.pixelSize: Settings.fs(11); elide: Text.ElideLeft
                                     }
                                     Rectangle {
@@ -529,7 +562,8 @@ Item {
                                         ProgressBar {
                                             anchors.fill: parent; radius: Settings.us(2)
                                             animated: true; trackColor: "transparent"; barColor: Settings.accent(0.9)
-                                            value: model.archiving ? model.archiveProgress : model.extractProgress
+                                            value: model.archiving ? model.archiveProgress
+                                                 : model.compressing ? model.compressProgress : model.extractProgress
                                         }
                                     }
                                 }
@@ -544,7 +578,7 @@ Item {
                                 Timer {
                                     id: holdTimer; interval: 500; repeat: false
                                     onTriggered: {
-                                        if (rowDelegate._pressing && !model.archiving && !model.extracting) {
+                                        if (rowDelegate._pressing && !model.archiving && !model.extracting && !model.compressing) {
                                             libScreen._menuOpen = true
                                             contextMenu.openForRow(
                                                 index,
@@ -615,6 +649,33 @@ Item {
                               }
                           }
                           GameLibraryModule.archiveGame(gameId)
+                      }
+                    }
+                ]
+            })
+        }
+        onCompressRequested: function(gameId, rowIndex, compress) {
+            var entry = libraryModel.get(rowIndex)
+            var pd = root.promptDialog
+            if (!pd) return
+            pd.show({
+                title:   Settings.tr(compress ? "lib_menu_compress" : "lib_menu_decompress"),
+                message: Settings.tr(compress ? "lib_compress_confirm" : "lib_decompress_confirm",
+                                     { name: entry.name }),
+                icon:    "qrc:/assets/icons/ic_folder.png",
+                buttons: [
+                    { label: Settings.tr("cancel"), role: "cancel", action: function(){} },
+                    { label: Settings.tr(compress ? "lib_compress_btn" : "lib_decompress_btn"), role: "primary",
+                      action: function() {
+                          for (var i = 0; i < libraryModel.count; i++) {
+                              if (libraryModel.get(i).gameId === gameId) {
+                                  libraryModel.setProperty(i, "compressing",      true)
+                                  libraryModel.setProperty(i, "decompressing",    !compress)
+                                  libraryModel.setProperty(i, "compressProgress", 0.0)
+                                  break
+                              }
+                          }
+                          GameLibraryModule.compressGame(gameId, compress)
                       }
                     }
                 ]

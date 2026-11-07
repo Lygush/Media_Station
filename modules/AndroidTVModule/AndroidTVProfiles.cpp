@@ -162,12 +162,31 @@ bool AndroidTVProfileManager::setActiveProfile(const QString &id)
     return true;
 }
 
-bool AndroidTVProfileManager::removeProfile(const QString &id)
+bool AndroidTVProfileManager::removeProfile(const QString &id, bool deleteData)
 {
     if (id == m_activeProfileId) return false;
     auto it = std::find_if(m_profiles.begin(), m_profiles.end(),
                            [&](const AndroidTVProfile &p){ return p.id == id; });
     if (it == m_profiles.end()) return false;
+
+    if (deleteData) {
+        const QString avdName = it->avdName;
+        // Только если имя AVD задано, без путей и не используется другим профилем
+        const bool shared = std::any_of(m_profiles.cbegin(), m_profiles.cend(),
+            [&](const AndroidTVProfile &p) { return p.id != id && p.avdName == avdName; });
+        const bool safeName = !avdName.isEmpty() && !avdName.contains(QLatin1Char('/'))
+                              && !avdName.contains(QLatin1Char('\\')) && !avdName.contains(QLatin1String(".."));
+        if (safeName && !shared) {
+            const QString base = avdHome() + "/" + avdName;
+            QDir avdDir(base + ".avd");
+            if (avdDir.exists() && !avdDir.removeRecursively())
+                qWarning() << "[AndroidTV] removeProfile: could not fully delete" << avdDir.path();
+            QFile::remove(base + ".ini");
+        } else {
+            qWarning() << "[AndroidTV] removeProfile: data kept, AVD name unsafe or shared:" << avdName;
+        }
+    }
+
     const int row = static_cast<int>(std::distance(m_profiles.begin(), it));
     beginRemoveRows(QModelIndex(), row, row);
     m_profiles.erase(it);

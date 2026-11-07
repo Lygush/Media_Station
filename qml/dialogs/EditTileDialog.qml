@@ -193,6 +193,12 @@ Item {
         }
 
         webForm.text   = data.path || ""
+        // Над шапкой экрана: диалог объявлен внутри экрана стека, а шапка
+        // (Main.qml, z: 10) — сосед стека и рисовалась ПОВЕРХ диалога.
+        // Поднимаемся в корень окна на время показа.
+        if (dialog.Window.window && dialog.parent !== dialog.Window.window.contentItem)
+            dialog.parent = dialog.Window.window.contentItem
+        bodyFlick.contentY = 0
         dialog.visible = true
         base.open()
     }
@@ -208,13 +214,30 @@ Item {
         dialogWidth:  Math.max(Settings.us(580),
                                3 * (Math.ceil(kindMetrics.advanceWidth) + Settings.us(20) + 6 + Settings.us(36))
                                + 2 * 8 + 2 * Settings.us(28))
-        dialogHeight: mainCol.implicitHeight + Settings.us(60)
+        // BaseDialog сам ограничит высоту окном; лишнее — прокручивается
+        dialogHeight: mainCol.implicitHeight + Settings.us(14) + buttonsRow.implicitHeight + Settings.us(60)
         closeOnClickOutside: false
         onVisibleChanged: if (!visible) dialog.visible = false
 
+        // Поля — в прокручиваемой области, кнопки «Отмена»/«Сохранить»
+        // закреплены внизу. Раньше на 1280×720 (масштаб 150 %) кнопки
+        // оказывались ниже края окна (y = 765) и были недоступны.
+        Flickable {
+            id: bodyFlick
+            anchors { top: parent.top; left: parent.left; right: parent.right
+                      bottom: buttonsRow.top; bottomMargin: Settings.us(14) }
+            contentWidth: width
+            contentHeight: mainCol.implicitHeight
+            clip: interactive
+            interactive: contentHeight > height + 1
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {
+                policy: bodyFlick.interactive ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+            }
+
         Column {
             id: mainCol
-            width: parent.width
+            width: bodyFlick.width - (bodyFlick.interactive ? Settings.us(14) : 0)
             spacing: Settings.us(14)
 
             // Заголовок
@@ -441,10 +464,14 @@ Item {
                     Image { anchors.fill: parent; anchors.margins: 4; source: iconField.text; fillMode: Image.PreserveAspectFit; sourceSize.width: 48; sourceSize.height: 48 }
                 }
             }
+        }   // mainCol
+        }   // bodyFlick
 
             // ── Кнопки «Отмена» / «Сохранить» ────────────────────────────────
             Row {
+                id: buttonsRow
                 anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
                 spacing: 16; bottomPadding: 4
 
                 Item {
@@ -532,7 +559,6 @@ Item {
                     }
                 }
             }
-        }
     }
 
     // ── Оверлей проверки зависимостей ─────────────────────────────────────────

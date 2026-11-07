@@ -12,12 +12,15 @@
 #include "tools/AtomicFile.h"
 #include "tools/GameInfoStore.h"
 #include "tools/SevenZip.h"
+#include "tools/WofCompact.h"
 #include "InstallUtils.h"
 
+#include <QStorageInfo>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
+#include <QHash>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -88,6 +91,16 @@ void GameLibraryModule::shutdown()
     for (auto &task : m_extractTasks)
         if (task.cancelFlag) task.cancelFlag->store(true);
     m_extractTasks.clear();
+
+    // compact.exe сжимает файл за файлом — прерывание безопасно, уже сжатые
+    // файлы остаются сжатыми и работают
+    for (auto &task : m_compressTasks) {
+        if (!task.process) continue;
+        task.process->disconnect(this);
+        task.process->kill();
+        task.process->waitForFinished(2000);
+    }
+    m_compressTasks.clear();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -106,6 +119,32 @@ QString GameLibraryModule::makeGameId(const QString &folderPath)
                ).left(12);
 }
 
+/*static*/ QString GameLibraryModule::sizeStamp(const QString &path)
+{
+    const QFileInfo fi(path);
+    if (!fi.exists()) return {};
+    if (fi.isFile())
+        return QString("f:%1:%2").arg(fi.size()).arg(fi.lastModified().toMSecsSinceEpoch());
+    // Время изменения каталога меняется при добавлении/удалении/переименовании
+    // в нём самом; подпапки первого уровня ловят большинство обновлений игр
+    qint64 h = fi.lastModified().toMSecsSinceEpoch();
+    const QFileInfoList subs = QDir(path).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden,
+                                                        QDir::Name);
+    for (const QFileInfo &d : subs)
+        h = h * 31 + d.lastModified().toMSecsSinceEpoch() + qHash(d.fileName());
+    return QString("d:%1:%2").arg(subs.size()).arg(h);
+}
+
+/*static*/ QString GameLibraryModule::sizeTargetFor(const QVariantMap &info)
+{
+    // Тот же путь, что считает экран библиотеки (GameLibraryScreen.sizeTargetPath)
+    const QString type = info.value("type").toString();
+    const QString ip   = QDir::fromNativeSeparators(info.value("installPath").toString());
+    if (type == QLatin1String("archive"))   return QDir::fromNativeSeparators(info.value("archivePath").toString());
+    if (type == QLatin1String("installed")) return ip.isEmpty() ? QString() : ip + "/game";
+    return ip;
+}
+
 qint64 GameLibraryModule::calcFolderSize(const QString &path)
 {
     // Если путь указывает на файл (например .7z архив) — берём размер файла напрямую.
@@ -120,7 +159,8 @@ qint64 GameLibraryModule::calcFolderSize(const QString &path)
                     QDirIterator::Subdirectories);
     while (it.hasNext()) {
         it.next();
-        total += it.fileInfo().size();
+        // Место на диске, а не логический размер: у сжатых (WOF) игр меньше
+        total += WofCompact::sizeOnDisk(it.fileInfo());
     }
     return total;
 }
@@ -147,7 +187,8 @@ bool GameLibraryModule::writeGameInfo(const QString &folderPath, const QVariantM
         QStringLiteral("installPath"),   QStringLiteral("iconPath"),
         QStringLiteral("tileLocations"), QStringLiteral("installDate"),
         QStringLiteral("archivePath"),   QStringLiteral("sizeCached"),
-        QStringLiteral("legacyNoMetadata")
+        QStringLiteral("sizeStamp"),     QStringLiteral("legacyNoMetadata"),
+        QStringLiteral("compressed"),    QStringLiteral("sizeBeforeCompress")
     };
 
     // В m_entries есть служебные поля времени выполнения (_archiveProgress,
@@ -157,6 +198,8 @@ bool GameLibraryModule::writeGameInfo(const QString &folderPath, const QVariantM
             || k == QLatin1String("tileCount") || k == QLatin1String("archiving")
             || k == QLatin1String("archiveProgress") || k == QLatin1String("archiveCurrentFile")
             || k == QLatin1String("extracting") || k == QLatin1String("extractProgress")
+            || k == QLatin1String("compressing") || k == QLatin1String("compressProgress")
+            || k == QLatin1String("decompressing")
             // отметку прерванной архивации ставят и снимают отдельно — не
             // возвращаем её в файл из устаревшей копии в памяти
             || k == QLatin1String("archivePending");
@@ -182,10 +225,29 @@ bool GameLibraryModule::writeGameInfo(const QString &folderPath, const QVariantM
 // Структура: <installPath>/archive/<gameName>.7z
 // Всё что относится к игре хранится внутри её папки.
 
-QString GameLibraryModule::archivePathForGame(const QString &installPath) const
+QString GameLibraryModule::legacyArchivePath(const QString &installPath)
 {
     const QString gameName = QDir(installPath).dirName();
     return installPath + "/archive/" + gameName + ".7z";
+}
+
+QString GameLibraryModule::archivePathForGame(const QString &installPath) const
+{
+    const QString dir = m_settings ? QDir::fromNativeSeparators(m_settings->archivePath()) : QString();
+    if (dir.isEmpty()) return legacyArchivePath(installPath);
+    // Общая папка архивов: к имени добавляем часть id (хэш пути) — игры с
+    // одинаковым именем папки из разных мест не перезапишут архивы друг друга
+    const QString gameName = QDir(installPath).dirName();
+    return QDir(dir).filePath(gameName + "_" + makeGameId(QDir::fromNativeSeparators(installPath)).left(6) + ".7z");
+}
+
+QString GameLibraryModule::findExistingArchive(const QString &installPath) const
+{
+    const QString configured = archivePathForGame(installPath);
+    if (QFile::exists(configured)) return configured;
+    const QString legacy = legacyArchivePath(installPath);
+    if (QFile::exists(legacy)) return legacy;
+    return {};
 }
 
 // ── Генерация метаданных для legacy-игры (через tile_id.txt) ───────────────
@@ -223,10 +285,10 @@ QVariantMap GameLibraryModule::generateMetadataForLegacy(const QString &folderPa
     if (!icons.isEmpty())
         iconPath = QDir::toNativeSeparators(launcherDir.absoluteFilePath(icons.first()));
 
-    const QString expectedArchive = archivePathForGame(folderPath);
+    const QString expectedArchive = findExistingArchive(folderPath);
     QString type;
     QString archivePath;
-    if (QFile::exists(expectedArchive)) {
+    if (!expectedArchive.isEmpty()) {
         type        = "archive";
         archivePath = QDir::toNativeSeparators(expectedArchive);
     } else if (QDir(folderPath + "/game").exists()) {
@@ -246,7 +308,7 @@ QVariantMap GameLibraryModule::generateMetadataForLegacy(const QString &folderPa
     generated["installDate"]      = "";
     generated["archivePath"]      = archivePath;
     generated["sizeCached"]       = -1;
-    generated["available"]        = type != "archive" || QFile::exists(expectedArchive);
+    generated["available"]        = type != "archive" || !expectedArchive.isEmpty();
     generated["legacyNoMetadata"] = false;   // после генерации метаданные есть
     generated["tileCount"]        = -1;
 
@@ -270,11 +332,11 @@ QVariantMap GameLibraryModule::scanFolder(const QString &folderPath) const
             const QString exePath = info.value("executablePath").toString();
             info["available"] = QFile::exists(exePath);
         } else if (type == "archive") {
-            // Архив всегда ищем внутри папки игры: <installPath>/archive/<name>.7z
-            const QString expectedArchive = archivePathForGame(folderPath);
-            // Поддержка старого формата: если archivePath указывает куда-то ещё — мигрируем
+            // Путь из game_info.json; если файла там нет — ищем в папке
+            // архивов из настроек и внутри папки игры (прежнее место)
+            const QString expectedArchive = findExistingArchive(folderPath);
             if (!QFile::exists(info.value("archivePath").toString())
-                && QFile::exists(expectedArchive)) {
+                && !expectedArchive.isEmpty()) {
                 info["archivePath"] = QDir::toNativeSeparators(expectedArchive);
             }
             info["available"] = QFile::exists(info.value("archivePath").toString());
@@ -289,6 +351,14 @@ QVariantMap GameLibraryModule::scanFolder(const QString &folderPath) const
         if (!info.contains("id"))
             info["id"] = makeGameId(QDir::fromNativeSeparators(folderPath));
         info["installPath"] = QDir::toNativeSeparators(folderPath);
+
+        // Кэш размера устарел (игру обновили, файлы добавили) — пересчитать.
+        // Отпечаток — одно чтение каталога, а не обход всех файлов.
+        if (info.value("sizeCached").toLongLong() >= 0) {
+            const QString target = sizeTargetFor(info);
+            if (!target.isEmpty() && info.value("sizeStamp").toString() != sizeStamp(target))
+                info["sizeCached"] = static_cast<qlonglong>(-1);
+        }
         if (!info.contains("tileCount"))
             info["tileCount"] = -1;
         // У legacy-игр, которые уже имеют JSON, флаг уже false
@@ -413,11 +483,14 @@ void GameLibraryModule::requestFolderSize(const QString &gameId, const QString &
 {
     const QPointer<GameLibraryModule> self(this);
     QThreadPool::globalInstance()->start([this, self, gameId, folderPath]() {
+        // Отпечаток — до подсчёта: изменения во время обхода дадут пересчёт в следующий раз
+        const QString stamp = sizeStamp(folderPath);
         const qint64 bytes = calcFolderSize(folderPath);
 
-        if (self) QMetaObject::invokeMethod(self.data(), [this, gameId, bytes]() {
+        if (self) QMetaObject::invokeMethod(self.data(), [this, gameId, bytes, stamp]() {
             if (m_entries.contains(gameId)) {
                 m_entries[gameId]["sizeCached"] = bytes;
+                m_entries[gameId]["sizeStamp"]  = stamp;
                 const QString ip = m_entries[gameId].value("installPath").toString();
                 if (!ip.isEmpty()) writeGameInfo(ip, m_entries[gameId]);
             }
@@ -447,6 +520,17 @@ QVariantList GameLibraryModule::currentEntries() const
             e["archiving"]        = false;
             e["archiveProgress"]  = 0.0;
             e["archiveCurrentFile"] = QString();
+        }
+
+        if (m_compressTasks.contains(gameId)) {
+            const CompressTask &ct = m_compressTasks[gameId];
+            e["compressing"]      = true;
+            e["decompressing"]    = !ct.compress;
+            e["compressProgress"] = ct.progress;
+        } else {
+            e["compressing"]      = false;
+            e["decompressing"]    = false;
+            e["compressProgress"] = 0.0;
         }
 
         if (m_extractTasks.contains(gameId)) {
@@ -554,7 +638,8 @@ void GameLibraryModule::archiveGame(const QString &gameId)
         emit archiveFinished(gameId, false);
         return;
     }
-    if (m_archiveTasks.contains(gameId) || m_extractTasks.contains(gameId)) return;
+    if (m_archiveTasks.contains(gameId) || m_extractTasks.contains(gameId)
+        || m_compressTasks.contains(gameId)) return;
 
     // Проверяем архиватор ДО удаления плиток — иначе при его отсутствии
     // плитки пропадали, а игра оставалась неархивированной.
@@ -573,10 +658,14 @@ void GameLibraryModule::archiveGame(const QString &gameId)
     const QString installPath = QDir::fromNativeSeparators(
         entry.value("installPath").toString());
 
-    // Новая структура: архив всегда внутри папки игры.
-    // <installPath>/archive/<gameName>.7z
-    const QString archiveDir   = installPath + "/archive";
+    // Архив — в папку архивов из настроек (можно на другом диске) или, если
+    // она не задана, внутрь папки игры: <installPath>/archive/<gameName>.7z
     const QString archiveFinal = archivePathForGame(installPath);
+    const QString archiveDir   = QFileInfo(archiveFinal).absolutePath();
+    // Пустую папку удаляем только свою (<игра>/archive), не общую папку архивов
+    const bool    ownArchiveDir = (archiveFinal == legacyArchivePath(installPath));
+    const qint64  knownSize     = entry.value("sizeCached").toLongLong();
+    auto failReason = std::make_shared<QString>();
 
     // Сохраняем tileLocations до удаления — для восстановления при отмене.
     QStringList savedTileLocs;
@@ -609,7 +698,8 @@ void GameLibraryModule::archiveGame(const QString &gameId)
     emit archivingChanged();
 
     connect(watcher, &QFutureWatcher<bool>::finished, this,
-            [this, watcher, gameId, installPath, archiveDir, archiveFinal, cancelFlag]()
+            [this, watcher, gameId, installPath, archiveDir, archiveFinal, cancelFlag,
+             ownArchiveDir, failReason]()
             {
                 const bool cancelled = cancelFlag->load();
                 const bool ok        = !cancelled && watcher->result();
@@ -619,7 +709,7 @@ void GameLibraryModule::archiveGame(const QString &gameId)
 
                 if (cancelled) {
                     QFile::remove(archiveFinal);
-                    QDir(archiveDir).rmdir(".");
+                    if (ownArchiveDir) QDir(archiveDir).rmdir(".");
                     restoreTilesAfterArchive(gameId);
                     qDebug() << "GameLibraryModule: archive cancelled, tiles restored:" << gameId;
                     if (m_bus) {
@@ -662,8 +752,9 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                     emit archiveFinished(gameId, true);
 
                 } else {
-                    QFile::remove(archiveFinal);
-                    QDir(archiveDir).rmdir(".");
+                    // Не хватило места — архива ещё нет, удалять нечего
+                    if (failReason->isEmpty()) QFile::remove(archiveFinal);
+                    if (ownArchiveDir) QDir(archiveDir).rmdir(".");
                     // Игра осталась на месте — возвращаем её плитки (раньше
                     // они восстанавливались только при отмене).
                     restoreTilesAfterArchive(gameId);
@@ -673,8 +764,10 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                         ? m_entries[gameId].value("name").toString() : gameId;
                         emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
                                                 Notifications::makeEvent(
-                                                    QString("Ошибка архивации «%1»").arg(name),
-                                                    NotificationLevel::Error, true, 5000));
+                                                    failReason->isEmpty()
+                                                        ? QString("Ошибка архивации «%1»").arg(name)
+                                                        : QString("«%1» не архивирована: %2").arg(name, *failReason),
+                                                    NotificationLevel::Error, true, 7000));
                     }
                     emit archiveFinished(gameId, false);
                 }
@@ -684,7 +777,8 @@ void GameLibraryModule::archiveGame(const QString &gameId)
 
     const QPointer<GameLibraryModule> self(this);
     QFuture<bool> future = QtConcurrent::run(
-        [this, self, gameId, installPath, archiveDir, archiveFinal, cancelFlag]() -> bool
+        [this, self, gameId, installPath, archiveDir, archiveFinal, cancelFlag,
+         knownSize, failReason]() -> bool
         {
             if (cancelFlag->load()) return false;
 
@@ -693,7 +787,36 @@ void GameLibraryModule::archiveGame(const QString &gameId)
                 return false;
             }
 
-            QDir().mkpath(archiveDir);
+            if (!QDir().mkpath(archiveDir)) {
+                *failReason = QString("не удалось создать папку %1").arg(QDir::toNativeSeparators(archiveDir));
+                return false;
+            }
+
+            // Проверка места ДО начала: раньше нехватка обнаруживалась через
+            // десятки минут сжатия. Сжатый архив не больше исходных файлов,
+            // поэтому с запасом требуем их размер + 1 ГБ.
+            qint64 needBytes = knownSize;
+            if (needBytes <= 0) {
+                needBytes = 0;
+                QDirIterator it(installPath + "/game", QDir::Files | QDir::Hidden | QDir::System,
+                                QDirIterator::Subdirectories);
+                while (it.hasNext()) {
+                    if (cancelFlag->load()) return false;
+                    it.next();
+                    needBytes += it.fileInfo().size();
+                }
+            }
+            needBytes += qint64(1) << 30;
+            const QStorageInfo storage(archiveDir);   // свежие данные — при создании
+            const qint64 freeBytes = storage.bytesAvailable();
+            if (freeBytes >= 0 && freeBytes < needBytes) {
+                auto gb = [](qint64 b) { return QString::number(double(b) / (1024.0 * 1024 * 1024), 'f', 1); };
+                *failReason = QString("мало места на диске %1 — нужно до %2 ГБ, свободно %3 ГБ")
+                                  .arg(storage.rootPath(), gb(needBytes), gb(freeBytes));
+                qWarning() << "GameLibraryModule: archive aborted:" << *failReason;
+                return false;
+            }
+
             QFile::remove(archiveFinal);
 
             const SevenZip::Result r = SevenZip::compress(
@@ -824,7 +947,8 @@ void GameLibraryModule::extractGame(const QString &gameId,
         emit extractFinished(gameId, false);
         return;
     }
-    if (m_extractTasks.contains(gameId) || m_archiveTasks.contains(gameId)) return;
+    if (m_extractTasks.contains(gameId) || m_archiveTasks.contains(gameId)
+        || m_compressTasks.contains(gameId)) return;
 
     const QString installPath = QDir::fromNativeSeparators(
         m_entries[gameId].value("installPath").toString());
@@ -833,8 +957,8 @@ void GameLibraryModule::extractGame(const QString &gameId,
     QString archivePath = QDir::fromNativeSeparators(
         m_entries[gameId].value("archivePath").toString());
     if (!QFile::exists(archivePath)) {
-        const QString expected = QDir::fromNativeSeparators(archivePathForGame(installPath));
-        if (QFile::exists(expected)) {
+        const QString expected = QDir::fromNativeSeparators(findExistingArchive(installPath));
+        if (!expected.isEmpty()) {
             archivePath = expected;
             m_entries[gameId]["archivePath"] = QDir::toNativeSeparators(expected);
         } else {
@@ -852,10 +976,27 @@ void GameLibraryModule::extractGame(const QString &gameId,
     m_extractTasks.insert(gameId, etask);
 
     const QPointer<GameLibraryModule> self(this);
+    auto failReason = std::make_shared<QString>();
     QThreadPool::globalInstance()->start([this, self, gameId, installPath, archivePath,
-                                          keepArchive, storageKey, isFolder, cancelFlag]() {
+                                          keepArchive, storageKey, isFolder, cancelFlag, failReason]() {
 
-        const SevenZip::Result r = SevenZip::extract(
+        // Место на диске установки — до распаковки (раньше нехватка была
+        // видна только по ошибке посреди распаковки). Размер — из списка
+        // файлов архива; не удалось узнать — распаковываем как раньше.
+        const qint64 need = SevenZip::unpackedSize(archivePath);
+        if (need > 0) {
+            const qint64 margin = qint64(512) << 20;
+            const QStorageInfo storage(installPath);
+            const qint64 freeBytes = storage.bytesAvailable();
+            if (freeBytes >= 0 && freeBytes < need + margin) {
+                auto gb = [](qint64 b) { return QString::number(double(b) / (1024.0 * 1024 * 1024), 'f', 1); };
+                *failReason = QString("мало места на диске %1 — нужно %2 ГБ, свободно %3 ГБ")
+                                  .arg(storage.rootPath(), gb(need + margin), gb(freeBytes));
+                qWarning() << "GameLibraryModule: extract aborted:" << *failReason;
+            }
+        }
+
+        const SevenZip::Result r = !failReason->isEmpty() ? SevenZip::ExitError : SevenZip::extract(
             archivePath,
             installPath,   // workDir: 7zr восстановит подпапку game/ на месте
             cancelFlag.get(),
@@ -873,12 +1014,13 @@ void GameLibraryModule::extractGame(const QString &gameId,
         // Недораспакованная game/ бесполезна, архив остаётся на месте.
         // Удаляем здесь, а не в GUI-потоке: при выходе из программы
         // обработчик ниже уже не вызывается, и мусор оставался на диске.
-        if (!ok)
+        // (если распаковка не начиналась из-за места — удалять нечего)
+        if (!ok && failReason->isEmpty())
             QDir(installPath + "/game").removeRecursively();
 
         if (self) QMetaObject::invokeMethod(self.data(),
                                   [this, gameId, ok, cancelled, installPath, archivePath,
-                                   keepArchive, storageKey, isFolder]()
+                                   keepArchive, storageKey, isFolder, failReason]()
                                   {
                                       m_extractTasks.remove(gameId);
                                       m_extractProgress.remove(gameId);
@@ -909,6 +1051,12 @@ void GameLibraryModule::extractGame(const QString &gameId,
 
                                           writeGameInfo(installPath, m_entries[gameId]);
 
+                                          // Из архива файлы выходят обычными (не сжатыми WOF)
+                                          if (m_entries[gameId].value("compressed").toBool()) {
+                                              m_entries[gameId]["compressed"] = false;
+                                              m_entries[gameId].remove("sizeBeforeCompress");
+                                              writeGameInfo(installPath, m_entries[gameId]);
+                                          }
                                           if (!storageKey.isEmpty())
                                               createTile(gameId, storageKey, isFolder);
 
@@ -929,8 +1077,10 @@ void GameLibraryModule::extractGame(const QString &gameId,
                                                   ? m_entries[gameId].value("name").toString() : gameId;
                                               emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
                                                                       Notifications::makeEvent(
-                                                                          QString("Ошибка распаковки «%1». Проверьте место на диске.").arg(name),
-                                                                          NotificationLevel::Error, true, 5000));
+                                                                          failReason->isEmpty()
+                                                                              ? QString("Ошибка распаковки «%1». Проверьте место на диске.").arg(name)
+                                                                              : QString("«%1» не распакована: %2").arg(name, *failReason),
+                                                                          NotificationLevel::Error, true, 7000));
                                           }
                                       }
                                       emit extractFinished(gameId, ok);
@@ -1062,4 +1212,197 @@ void GameLibraryModule::regenerateMetadata(const QString &gameId)
 
     // Уведомляем QML
     emit libraryEntryChanged(gameId, newInfo);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// compressGame — прозрачное сжатие Windows (WOF) папки game/
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool GameLibraryModule::compressAvailable() const
+{
+    return WofCompact::isAvailable();
+}
+
+QString GameLibraryModule::compressTargetDir(const QString &installPath)
+{
+    const QString game = QDir(installPath).filePath(QStringLiteral("game"));
+    return QFileInfo(game).isDir() ? game : installPath;
+}
+
+void GameLibraryModule::compressGame(const QString &gameId, bool compress)
+{
+    if (!m_entries.contains(gameId)) { emit compressFinished(gameId, false, false); return; }
+    if (m_compressTasks.contains(gameId) || m_archiveTasks.contains(gameId)
+        || m_extractTasks.contains(gameId)) return;
+
+    QVariantMap &entry = m_entries[gameId];
+    const bool wasCompressed  = entry.value("compressed").toBool();
+    const QString installPath = QDir::fromNativeSeparators(entry.value("installPath").toString());
+    const QString name        = entry.value("name").toString();
+    const QString dir         = compressTargetDir(installPath);
+
+    auto notify = [this](const QString &text, NotificationLevel level, int ms) {
+        if (m_bus)
+            emit m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
+                                    Notifications::makeEvent(text, level, true, ms));
+    };
+
+    if (entry.value("type").toString() != QLatin1String("installed") || !QFileInfo(dir).isDir()) {
+        emit compressFinished(gameId, false, wasCompressed);
+        return;
+    }
+    if (!WofCompact::isAvailable()) {
+        notify(QStringLiteral("Сжатие недоступно: не найден compact.exe"), NotificationLevel::Error, 5000);
+        emit compressFinished(gameId, false, wasCompressed);
+        return;
+    }
+
+    // Снятие сжатия возвращает файлам полный размер — нужно место
+    const qint64 sizeNow    = entry.value("sizeCached").toLongLong();
+    const qint64 sizeBefore = entry.value("sizeBeforeCompress").toLongLong();
+    if (!compress && sizeBefore > sizeNow && sizeNow > 0) {
+        const QStorageInfo st(dir);
+        const qint64 need = sizeBefore - sizeNow + (qint64(512) << 20);
+        if (st.isValid() && st.bytesAvailable() >= 0 && st.bytesAvailable() < need) {
+            notify(QString("«%1»: мало места на диске %2, чтобы снять сжатие — нужно %3 ГБ, свободно %4 ГБ")
+                       .arg(name, st.rootPath())
+                       .arg(double(need) / (1 << 30), 0, 'f', 1)
+                       .arg(double(st.bytesAvailable()) / (1 << 30), 0, 'f', 1),
+                   NotificationLevel::Error, 8000);
+            emit compressFinished(gameId, false, wasCompressed);
+            return;
+        }
+    }
+
+    auto *proc = new QProcess(this);
+    proc->setProgram(WofCompact::program());
+    proc->setArguments(WofCompact::arguments(compress));
+    proc->setWorkingDirectory(dir);
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+
+    CompressTask task;
+    task.process    = proc;
+    task.compress   = compress;
+    task.sizeBefore = compress ? sizeNow : sizeBefore;
+    m_compressTasks.insert(gameId, task);
+
+    // Сколько файлов — для прогресса (вывод compact — строка на файл)
+    QPointer<GameLibraryModule> self(this);
+    (void)QtConcurrent::run([self, gameId, dir, proc]() {
+        int n = 0;
+        QDirIterator it(dir, QDir::Files | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) { it.next(); ++n; }
+        if (self) QMetaObject::invokeMethod(self.data(), [self, gameId, proc, n]() {
+            auto it = self->m_compressTasks.find(gameId);
+            if (it != self->m_compressTasks.end() && it->process == proc) it->totalFiles = qMax(1, n);
+        }, Qt::QueuedConnection);
+    });
+
+    auto buffer = std::make_shared<QByteArray>();
+    connect(proc, &QProcess::readyRead, this, [this, gameId, proc, buffer]() {
+        buffer->append(proc->readAll());
+        auto it = m_compressTasks.find(gameId);
+        if (it == m_compressTasks.end()) return;
+        int nl;
+        while ((nl = buffer->indexOf('\n')) >= 0) {
+            // Вывод в кодировке консоли (OEM); для счёта строк кодировка не важна
+            const QString line = QString::fromLocal8Bit(buffer->left(nl));
+            buffer->remove(0, nl + 1);
+            if (WofCompact::isFileLine(line)) ++it->doneFiles;
+        }
+        if (it->totalFiles > 0) {
+            const qreal p = qMin<qreal>(0.99, qreal(it->doneFiles) / it->totalFiles);
+            if (p - it->progress >= 0.005) {
+                it->progress = p;
+                emit compressProgress(gameId, p);
+            }
+        }
+    });
+    connect(proc, &QProcess::finished, this, [this, gameId](int code, QProcess::ExitStatus st) {
+        finishCompress(gameId, st == QProcess::NormalExit && code == 0);
+    });
+    connect(proc, &QProcess::errorOccurred, this, [this, gameId](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) finishCompress(gameId, false);
+    });
+
+    qInfo() << "GameLibraryModule:" << (compress ? "compressing" : "decompressing") << gameId << dir;
+    proc->start();
+    emit compressProgress(gameId, 0.0);
+}
+
+void GameLibraryModule::cancelCompress(const QString &gameId)
+{
+    auto it = m_compressTasks.find(gameId);
+    if (it == m_compressTasks.end() || !it->process) return;
+    it->cancelled = true;
+    it->process->kill();
+}
+
+void GameLibraryModule::finishCompress(const QString &gameId, bool ok)
+{
+    auto it = m_compressTasks.find(gameId);
+    if (it == m_compressTasks.end()) return;
+    const CompressTask task = *it;
+    m_compressTasks.erase(it);
+    if (task.process) task.process->deleteLater();
+
+    if (!m_entries.contains(gameId)) return;
+    QVariantMap &entry = m_entries[gameId];
+    const QString installPath = QDir::fromNativeSeparators(entry.value("installPath").toString());
+    const QString name        = entry.value("name").toString();
+
+    // Прерванное сжатие — частичное: часть файлов уже сжата, поэтому считаем
+    // игру сжатой (можно снять сжатие). Прерванное снятие — тоже частичное.
+    const bool compressed = task.compress ? true : !(ok && !task.cancelled);
+    entry["compressed"] = compressed;
+    if (compressed) {
+        if (task.compress && task.sizeBefore > 0 && !entry.contains("sizeBeforeCompress"))
+            entry["sizeBeforeCompress"] = task.sizeBefore;
+    } else {
+        entry.remove("sizeBeforeCompress");
+    }
+    // Время изменения папок от сжатия не меняется — размер пересчитываем явно
+    entry["sizeCached"] = -1;
+    writeGameInfo(installPath, entry);
+
+    QPointer<GameLibraryModule> self(this);
+    const bool compress = task.compress, cancelled = task.cancelled;
+    const qint64 before = task.sizeBefore;
+    const QString sizePath = sizeTargetFor(entry);
+    (void)QtConcurrent::run([self, gameId, sizePath, name, ok, compress, cancelled, before, compressed]() {
+        const qint64 bytes = calcFolderSize(sizePath);
+        const QString stamp = sizeStamp(sizePath);
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, gameId, bytes, stamp, name, ok, compress,
+                                                cancelled, before, compressed]() {
+            if (!self->m_entries.contains(gameId)) return;
+            QVariantMap &e = self->m_entries[gameId];
+            e["sizeCached"] = bytes;
+            e["sizeStamp"]  = stamp;
+            self->writeGameInfo(QDir::fromNativeSeparators(e.value("installPath").toString()), e);
+            emit self->folderSizeReady(gameId, bytes);
+
+            const auto gb = [](qint64 b) { return QString::number(double(b) / (1 << 30), 'f', 1); };
+            QString text;
+            NotificationLevel level = NotificationLevel::Info;
+            if (cancelled)
+                text = compress ? QString("Сжатие «%1» остановлено — уже сжатые файлы работают").arg(name)
+                                : QString("Снятие сжатия «%1» остановлено").arg(name);
+            else if (!ok) {
+                text  = QString("«%1»: %2 с ошибками — часть файлов могла быть занята")
+                            .arg(name, compress ? QStringLiteral("сжатие завершилось")
+                                                : QStringLiteral("снятие сжатия завершилось"));
+                level = NotificationLevel::Warning;
+            } else if (compress && before > 0)
+                text = QString("«%1» сжата: %2 → %3 ГБ").arg(name, gb(before), gb(bytes));
+            else
+                text = compress ? QString("«%1» сжата").arg(name)
+                                : QString("«%1»: сжатие снято").arg(name);
+            if (self->m_bus)
+                emit self->m_bus->moduleEvent(Notifications::kModule, Notifications::kEventShow,
+                                              Notifications::makeEvent(text, level, true, 6000));
+            emit self->compressFinished(gameId, ok && !cancelled, compressed);
+        }, Qt::QueuedConnection);
+    });
 }

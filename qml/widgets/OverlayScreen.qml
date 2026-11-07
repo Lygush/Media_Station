@@ -60,12 +60,48 @@ Item {
         }
     }
 
+    // Появление/скрытие панели. Раньше окно панели показывалось в тот же
+    // момент, когда запускалась анимация «выезда» y: height+20 → 0, а при
+    // закрытии пряталось сразу, оставив в буфере последний кадр с ПОЛНОСТЬЮ
+    // выехавшей панелью. При следующем открытии Windows сначала показывал
+    // этот старый кадр, потом Qt рисовал пустую панель внизу и анимацию —
+    // панель «выезжала несколько раз». Теперь окно прячется только после
+    // того, как панель полностью растворилась, а показ всегда начинается с
+    // прозрачного состояния — старый кадр совпадает с новым.
+    property real reveal: 0
+
+    // Над Android TV выезд начинается через пару кадров (как и затемнение в
+    // AndroidTVModule, kOverlaySettleMs): сперва Windows переключает активное
+    // окно и режим вывода эмулятора, потом анимация — без рывка.
+    SequentialAnimation {
+        id: showAnim
+        PauseAnimation { duration: OverlayModule?.context === "androidtv" ? 50 : 0 }
+        NumberAnimation {
+            target: root; property: "reveal"; to: 1
+            duration: 220; easing.type: Easing.OutCubic
+        }
+    }
+    SequentialAnimation {
+        id: hideAnim
+        NumberAnimation { target: root; property: "reveal"; to: 0; duration: 150; easing.type: Easing.InQuad }
+        // Ещё пара кадров, чтобы прозрачный кадр точно ушёл на экран
+        PauseAnimation { duration: 40 }
+        ScriptAction { script: if (!root.visible) panelWindow.visible = false }
+    }
+
     onVisibleChanged: {
         if (visible) {
             focusIndex = 0
-            panelWindow.visible = true
+            hideAnim.stop()
+            if (!panelWindow.visible) {
+                reveal = 0
+                panelWindow._updatePos()
+                panelWindow.visible = true
+            }
+            showAnim.restart()
         } else {
-            panelWindow.visible = false
+            showAnim.stop()
+            hideAnim.restart()
             Qt.callLater(function() { _actionPending = false })
         }
     }
@@ -85,7 +121,8 @@ Item {
         width: panel.width
         height: panel.height
 
-        readonly property int bottomMargin: Settings.us(120)
+        // Панель у нижнего края экрана (раньше висела на 120 px выше)
+        readonly property int bottomMargin: Settings.us(36)
 
         function _updatePos() {
             if (!mainWindow) return
@@ -131,11 +168,9 @@ Item {
                 border.width: 3
             }
 
-            // Анимация выезда снизу
-            y: root.visible ? 0 : height + 20
-            Behavior on y {
-                NumberAnimation { duration: 280; easing.type: Easing.OutCubic }
-            }
+            // Появление: растворение + небольшой подъём (см. root.reveal)
+            opacity: root.reveal
+            transform: Translate { y: (1 - root.reveal) * Settings.us(28) }
 
             Column {
                 id: panelColumn

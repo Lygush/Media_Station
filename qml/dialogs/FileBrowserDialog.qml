@@ -19,6 +19,27 @@ Item {
     property string selectedFile: ""
     property var    _caller:      null
     property bool   drivesMode:   false
+    property string _listRequest: ""     // id последнего запроса чтения папки
+    property bool   listing:      false  // идёт чтение папки в фоне
+
+    // Чтение папки — в фоне (TileManager.listDirAsync): на сетевом или
+    // «уснувшем» диске синхронный listDir замораживал весь интерфейс.
+    // Ответы на устаревшие запросы (быстрые переходы) отбрасываются.
+    Connections {
+        target: TileManager
+        function onDirListReady(requestId, entries) {
+            if (requestId !== dialog._listRequest) return
+            dialog.listing = false
+            dialog._loadModel(entries)
+        }
+    }
+
+    function _requestList(path) {
+        _listRequest = Date.now().toString() + Math.random().toString().substring(2, 8)
+        listing = true
+        dirModel.clear()
+        TileManager.listDirAsync(_listRequest, path, path === "" ? "" : filterExt)
+    }
 
     function openFor(caller, startPath, ext) {
         _caller      = caller
@@ -39,7 +60,7 @@ Item {
         pathField.text = path
         selectedFile   = ""
         selectedPathText.text = ""
-        _loadModel(TileManager.listDir(path, filterExt))
+        _requestList(path)
     }
 
     function _showDrives() {
@@ -47,7 +68,7 @@ Item {
         selectedFile  = ""
         selectedPathText.text = ""
         pathField.text = Settings.tr("drives")
-        _loadModel(TileManager.listDrives())
+        _requestList("")
     }
 
     function _goUp() {
@@ -128,6 +149,13 @@ Item {
                 border.color: Settings.accent(0.2); border.width: 1; clip: true
 
                 ListModel { id: dirModel }
+
+                // Чтение папки идёт в фоне — крутилка вместо замершего интерфейса
+                Spinner {
+                    anchors.centerIn: parent
+                    running: dialog.listing; visible: dialog.listing
+                    size: 28
+                }
 
                 ListView {
                     id: dirList

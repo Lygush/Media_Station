@@ -61,6 +61,11 @@ public:
     // ── Файловая система ──────────────────────────────────────────────────────
     Q_INVOKABLE QVariantList listDir(const QString &path, const QString &filterExts = {});
     Q_INVOKABLE QVariantList listDrives();
+    // То же в фоновом потоке, результат — сигнал dirListReady. Синхронные
+    // версии на сетевом или «уснувшем» диске замораживали интерфейс на секунды.
+    // path пустой → список дисков.
+    Q_INVOKABLE void listDirAsync(const QString &requestId, const QString &path,
+                                  const QString &filterExts = {});
 
     // ── Список экранов и папок ────────────────────────────────────────────────
     Q_INVOKABLE QVariantList listScreens() const;
@@ -137,12 +142,16 @@ signals:
                               const QString &installFolder);
     void installationCancelled(const QString &tileId);
     void exeScanReady(const QString &requestId, const QVariantList &exeFiles);
+    void dirListReady(const QString &requestId, const QVariantList &entries);
     void exeDescriptionReady(const QString &requestId, const QString &description);
     void dependencyCheckReady(const QString &requestId, const QStringList &missingDeps);
     void launchExeUpdated(const QString &tileId, bool success,
                           const QString &newPs1Path, const QString &newExeRelative);
 
 private:
+    static QVariantList listDirImpl(const QString &path, const QString &filterExts);
+    static QVariantList listDrivesImpl();
+
     QDir        dataDir;
     QString     m_structurePath;
     QJsonObject m_structure;

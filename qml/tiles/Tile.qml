@@ -190,6 +190,7 @@ Item {
                 }
                 sourceSize.width: 100; sourceSize.height: 100
                 fillMode: Image.PreserveAspectFit
+                asynchronous: true   // файл с диска — не в GUI-потоке
                 visible: false
                 onStatusChanged: {
                     if      (status === Image.Ready) { iconContainer.imageError = false; visible = true  }

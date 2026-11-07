@@ -79,8 +79,9 @@ Item {
             var lowest   = parent.height - height - _edge
             return Math.max(_edge, Math.min(Math.max(centered, _headerBottom), lowest))
         }
-        width:  root.dialogWidth
-        height: root.dialogHeight
+        width:  Math.min(root.dialogWidth,  parent.width  - 2 * _edge)
+        // Не выше окна: диалоги с длинным содержимым прокручивают его сами
+        height: Math.min(root.dialogHeight, parent.height - 2 * _edge)
 
         Behavior on height {
             enabled: root.animateResize

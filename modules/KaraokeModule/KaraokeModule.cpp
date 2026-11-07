@@ -16,8 +16,9 @@
 #include <QSettings>
 #include <QMetaObject>
 
-// Для чтения ID3-тегов используем TagLib — если недоступен,
-// fallback на имя файла. Подключается опционально через DEFINES += USE_TAGLIB.
+// Теги: свой читатель AudioTags (ID3, FLAC); TagLib — по желанию через
+// DEFINES += USE_TAGLIB. Нет тегов — разбор имени файла.
+#include "AudioTags.h"
 #ifdef USE_TAGLIB
 #  include <taglib/fileref.h>
 #  include <taglib/tag.h>
@@ -447,6 +448,14 @@ SongMeta KaraokeModule::readMetaRaw(const QString &filePath, QString *source) co
     }
     if (!f.isNull() && f.audioProperties())
         meta.durationSec = f.audioProperties()->lengthInSeconds();
+#else
+    // Без TagLib — свой читатель ID3 (mp3) и Vorbis-комментариев (FLAC).
+    // Читает несколько КБ в начале/конце файла, без внешних процессов.
+    const AudioTags::Tags tags = AudioTags::read(filePath);
+    meta.artist = tags.artist;
+    meta.title  = tags.title;
+    meta.album  = tags.album;
+    if (tags.durationSec > 0) meta.durationSec = tags.durationSec;
 #endif
 
     const bool fromTags = !meta.artist.isEmpty() && !meta.title.isEmpty();

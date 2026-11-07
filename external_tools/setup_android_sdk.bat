@@ -150,24 +150,28 @@ echo [5/5] Creating android-tv config files...
 mkdir "!CONFIG_DIR!" 2>nul
 mkdir "!BLOCKLIST_DIR!" 2>nul
 
-if exist "!CONFIG_DIR!\dnsproxy.yml" (
-    echo [SKIP] dnsproxy.yml already exists
+:: Ad blocking: AdGuard Home (replaces dnsproxy, which the emulator never used).
+:: MediaStation writes AdGuardHome.yaml and installs the Windows service from
+:: Settings - Android TV - "Install service" (one UAC prompt).
+set "AGH_DIR=!DEPLOY_ROOT!\tools\adguardhome"
+if exist "!AGH_DIR!\AdGuardHome.exe" (
+    echo [SKIP] AdGuard Home already present
 ) else (
-    (
-        echo listen-addrs:
-        echo   - 127.0.0.1
-        echo listen-ports:
-        echo   - 53
-        echo upstreams:
-        echo   - https://dns.google/dns-query
-        echo   - https://cloudflare-dns.com/dns-query
-        echo bootstrap:
-        echo   - 8.8.8.8
-        echo   - 1.1.1.1
-        echo blocklist-files:
-        echo   - tools/android-tv/blocklists/default.txt
-    ) > "!CONFIG_DIR!\dnsproxy.yml"
-    echo [OK] tools\android-tv\config\dnsproxy.yml created
+    echo Downloading AdGuard Home...
+    curl.exe -L --fail -o "%TEMP%\AdGuardHome_windows_amd64.zip" https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_windows_amd64.zip
+    if !errorlevel! neq 0 (
+        echo [WARN] AdGuard Home download failed - ad blocking will be unavailable.
+        echo        Put AdGuardHome.exe into tools\adguardhome\ manually.
+    ) else (
+        mkdir "!DEPLOY_ROOT!\tools" 2>nul
+        tar -xf "%TEMP%\AdGuardHome_windows_amd64.zip" -C "!DEPLOY_ROOT!\tools"
+        del "%TEMP%\AdGuardHome_windows_amd64.zip" 2>nul
+        if exist "!AGH_DIR!\AdGuardHome.exe" (
+            echo [OK] tools\adguardhome\AdGuardHome.exe
+        ) else (
+            echo [WARN] AdGuard Home archive unpacked, but AdGuardHome.exe not found
+        )
+    )
 )
 
 if exist "!BLOCKLIST_DIR!\default.txt" (

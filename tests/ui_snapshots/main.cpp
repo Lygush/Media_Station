@@ -346,6 +346,19 @@ int main(int argc, char *argv[])
                     if (QQuickItem *m = findMenu(win->contentItem())) {
                         js(m, "openForRow(0, width * 0.45, height * 0.3, {gameId:'g1', name:'The Elder Scrolls V: Skyrim Special Edition', "
                               "type:'installed', available:true, tileCount:1, legacyNoMetadata:true})");
+                        if (qEnvironmentVariableIsSet("SNAP_DEBUG"))
+                            std::fprintf(stderr, "menu visible=%d opacity=%f w=%f parent=%s pvis=%d\n", m->isVisible(),
+                                         m->opacity(), m->width(), m->parentItem()->metaObject()->className(),
+                                         m->parentItem()->isVisible());
+                        if (qEnvironmentVariableIsSet("SNAP_DEBUG")) {
+                            std::function<void(QQuickItem *)> dump = [&](QQuickItem *it) {
+                                if (!it->isVisible()) return;
+                                const QVariant l = it->property("label");
+                                if (l.isValid()) std::fprintf(stderr, "  item: %s\n", qPrintable(l.toString()));
+                                for (QQuickItem *c : it->childItems()) dump(c);
+                            };
+                            dump(m);
+                        }
                     } else {
                         std::fprintf(stderr, "LibraryContextMenu not found\n");
                     }

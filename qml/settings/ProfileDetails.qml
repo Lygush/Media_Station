@@ -366,8 +366,28 @@ Column {
                             && AndroidTV.profileManager.count > 1
                             && root.currentProfileId !== AndroidTV.profileManager.activeProfileId)
                 onClicked: {
-                    if (AndroidTV.profileManager.removeProfile(root.currentProfileId))
-                        root.currentProfileId = AndroidTV.profileManager.activeProfileId
+                    // Спрашиваем про данные профиля (диск Android — до нескольких ГБ)
+                    var pm  = AndroidTV.profileManager
+                    var id  = root.currentProfileId
+                    var gb  = (pm.profileSizeMb(id) / 1024).toFixed(1)
+                    var del = function(withData) {
+                        if (pm.removeProfile(id, withData))
+                            root.currentProfileId = pm.activeProfileId
+                    }
+                    var pd = Window.window ? Window.window.promptDialog : null
+                    if (!pd) { del(false); return }
+                    pd.show({
+                        title:   Settings.safeTr("delete_profile"),
+                        message: Settings.safeTr("confirm_delete_profile_data", { size: gb }),
+                        buttons: [
+                            { label: Settings.safeTr("delete_with_data"), role: "danger",
+                              action: function() { del(true) } },
+                            { label: Settings.safeTr("delete_keep_data"), role: "secondary",
+                              action: function() { del(false) } },
+                            { label: Settings.safeTr("cancel"), role: "primary",
+                              action: function() {} }
+                        ]
+                    })
                 }
             }
         }

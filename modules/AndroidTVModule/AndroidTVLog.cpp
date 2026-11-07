@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QDebug>
 #include <QRegularExpression>
+#include <QTimer>
 
 QString AndroidTVModule::emulatorLogPath() const
 {
@@ -58,6 +59,7 @@ void AndroidTVModule::openEmulatorLogFile()
 
 void AndroidTVModule::closeEmulatorLogFile()
 {
+    if (m_logFlushTimer) m_logFlushTimer->stop();
     if (m_emulatorLogFile.isOpen()) {
         m_emulatorLogStream << "=== Android TV emulator log ended ===\n\n";
         m_emulatorLogStream.flush();
@@ -76,7 +78,20 @@ void AndroidTVModule::logToEmulatorFile(const QString &msg, bool fromEmulator)
                                    : QString();
     m_emulatorLogStream << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")
                         << " " << prefix << profileStr << msg << "\n";
-    m_emulatorLogStream.flush();
+
+    // Сброс на диск — отложенный, одной пачкой
+    if (!m_logFlushTimer) {
+        m_logFlushTimer = new QTimer(this);
+        m_logFlushTimer->setSingleShot(true);
+        m_logFlushTimer->setInterval(kLogFlushMs);
+        connect(m_logFlushTimer, &QTimer::timeout, this, [this]() {
+            if (m_emulatorLogFile.isOpen()) {
+                m_emulatorLogStream.flush();
+                m_emulatorLogFile.flush();
+            }
+        });
+    }
+    if (!m_logFlushTimer->isActive()) m_logFlushTimer->start();
 
     // Ошибки самого эмулятора дублируем в основной журнал (с ограничением),
     // чтобы причину неудачного запуска было видно без Android_TV.log.

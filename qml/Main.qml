@@ -30,6 +30,8 @@ Window {
     // иначе стандартная навигация назад.
     Shortcut {
         sequence: "Escape"
+        // Удержание Esc не должно открывать и закрывать оверлей по кругу
+        autoRepeat: false
         onActivated: {
             if (!OverlayModule) { root.goBack(); return }
             if (OverlayModule.visible) {
@@ -74,6 +76,10 @@ Window {
         anchors.fill: parent
         source: Settings.backgroundImage
         fillMode: Image.PreserveAspectCrop
+        // Обои бывают 6000×4000: без sourceSize это ~96 МБ текстуры и синхронное
+        // декодирование на старте. Фон всё равно размыт — хватает размера экрана.
+        sourceSize: Qt.size(Screen.width, Screen.height)
+        asynchronous: true
     }
 
     FastBlur {
@@ -554,6 +560,16 @@ Window {
         if (item) _ownedScreens.push(item)
         return item
     }
+    // Создание экрана с замером: долгие (>80 мс) пишутся в журнал — вместе со
+    // строками «interface was unresponsive» это показывает, что тормозит
+    function _createScreen(component, props) {
+        var t0 = Date.now()
+        var item = props ? component.createObject(stack, props) : component.createObject(stack)
+        var ms = Date.now() - t0
+        if (ms > 80)
+            console.info("[UI] screen created in", ms, "ms:", item ? (item.screenTitle || "?") : "failed")
+        return _own(item)
+    }
     function _destroyRemovedScreens() {
         if (stack.busy) return
         var inStack = []
@@ -602,7 +618,7 @@ Window {
     function openLibraryScreen() {
         if (root.libraryOpen) return
         root.libraryOpen = true
-        stack.push(_own(libraryScreenComponent.createObject(stack, {})))
+        stack.push(_createScreen(libraryScreenComponent, {}))
     }
 
     function goBack() {
@@ -730,29 +746,40 @@ Window {
             screenItem.saveAll()
         }
 
-        var cur = stack.currentItem
-        if (cur && cur.storageKey === targetStorageKey && cur.isFolder === targetIsFolder) {
-            addTile(cur)
-            NetworkListener.acceptInstall(socket, tileId)
-        } else {
-            root.openScreen(targetTitle, targetStorageKey, targetIsFolder)
-            var wait = function() {
-                var c = stack.currentItem
-                if (c && c.storageKey === targetStorageKey && c.isFolder === targetIsFolder) {
-                    stack.currentItemChanged.disconnect(wait)
-                    addTile(c)
-                    NetworkListener.acceptInstall(socket, tileId)
-                }
+        // Раньше принятие установки открывало целевой экран — пользователя
+        // «выкидывало» из настроек или со страницы игры. Теперь плитка
+        // добавляется туда, где она должна быть, а экран не переключается.
+        // Путь после установки C++ сохранит сам (TileManager::persistInstallResult),
+        // прогресс подхватит экран, когда его откроют (DynamicScreen.loadData).
+        for (var d = stack.depth - 1; d >= 0; d--) {
+            var live = stack.get(d)
+            if (live && live.hasOwnProperty("tilesModel")
+                    && live.storageKey === targetStorageKey && live.isFolder === targetIsFolder) {
+                addTile(live)
+                NetworkListener.acceptInstall(socket, tileId)
+                return
             }
-            stack.currentItemChanged.connect(wait)
-            Qt.callLater(wait)
         }
+
+        // Экран не открыт — пишем плитку прямо в хранилище
+        var tiles = targetIsFolder ? TileManager.loadFolder(targetStorageKey)
+                                   : TileManager.loadScreen(targetStorageKey)
+        tiles.push({
+            type: "shortcut", kind: kind, title: title, icon: iconPath, path: "",
+            id: tileId, installFolder: "", installing: true,
+            installProgress: 0.0, installPhase: "packing"
+        })
+        if (targetIsFolder) TileManager.saveFolder(targetStorageKey, tiles)
+        else                TileManager.saveScreen(targetStorageKey, tiles)
+        NetworkListener.acceptInstall(socket, tileId)
+        NotificationModule.post(Settings.tr("install_started_bg", { title: title, screen: targetTitle }),
+                                "info", true, 6000)
     }
 
     function openKaraokeScreen() {
         if (stack.currentItem && stack.currentItem.screenTitle === Settings.tr("karaoke"))
             return
-        stack.push(_own(karaokeScreenComponent.createObject(stack)))
+        stack.push(_createScreen(karaokeScreenComponent))
     }
 
     Connections {
@@ -822,5 +849,12 @@ Window {
         MouseArea { id: ibMA; anchors.fill: parent; hoverEnabled: true; onClicked: parent.clicked() }
     }
 
-    UpdateAvailableDialog {}
+    // Не во время игры и Android TV: диалог появлялся в окне MediaStation
+    // (под игрой или в прозрачном окне поверх ТВ) и перехватывал ввод.
+    // Покажется сам после возврата в меню.
+    UpdateAvailableDialog {
+        deferred: root.gameRunning || root.gameLaunching
+                  || (typeof AndroidTV !== "undefined" && !!AndroidTV
+                      && !!(AndroidTV.active || AndroidTV.booting || AndroidTV.switching))
+    }
 }

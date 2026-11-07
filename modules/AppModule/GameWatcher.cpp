@@ -4,6 +4,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "GameWatcher.h"
+#include "InstallUtils.h"
 
 #include <QThread>
 #include <QDebug>
@@ -19,6 +20,8 @@
 
 #ifdef Q_OS_WIN
 #  include <windows.h>
+#  include <shellapi.h>
+#  include <objbase.h>
 #  include <tlhelp32.h>
 #  include <psapi.h>
 #endif
@@ -197,23 +200,44 @@ void GameWatcher::monitorGame(const QString &ps1Path, const QString &tileId)
     const QStringList inputTypes = readInputTypesFromPs1(ps1Path);
     emit gameInputTypeDetected(tileId, inputTypes);
 
-    // ── 1. Подготовка PID-файла ────────────────────────────────────────────────
-    const QString tempDir  = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
-    const QString pidToken = QString::number(QDateTime::currentMSecsSinceEpoch());
-    const QString pidFile  = QDir(tempDir).filePath("mc_pid_" + pidToken + ".txt");
-
-    // ── 2. Запуск PowerShell со скриптом ──────────────────────────────────────
-    const quint64 psPid = launchPs1(ps1Path, pidFile);
-    if (psPid == 0) {
-        m_running.storeRelease(0);
-        emit launchFailed(tileId, "Failed to start PowerShell");
-        QThread::currentThread()->quit();
-        return;
+    // ── 1–3. Запуск ───────────────────────────────────────────────────────────
+    // Свой launch.ps1 без ручных правок — exe запускается напрямую: PowerShell
+    // стартует 0,5–2 с, а антивирусы не любят скрипты с -ExecutionPolicy
+    // Bypass (аудит §4 п.5). Скрипт изменён вручную или не наш — как раньше.
+    quint32 gamePid = 0;
+    QString exeDirect, workDirect;
+    if (InstallUtils::parseLaunchScript(ps1Path, &exeDirect, &workDirect)) {
+        if (!QFileInfo::exists(exeDirect)) {
+            qWarning().noquote() << "[GameWatcher] exe not found:" << exeDirect;
+            m_running.storeRelease(0);
+            emit launchFailed(tileId, "Game executable not found: " + QDir::toNativeSeparators(exeDirect));
+            QThread::currentThread()->quit();
+            return;
+        }
+        QString err;
+        gamePid = launchDirect(exeDirect, workDirect, &err);
+        if (gamePid != 0)
+            qInfo().noquote() << "[GameWatcher] started directly:" << QDir::toNativeSeparators(exeDirect)
+                              << "pid" << gamePid;
+        else
+            qWarning().noquote() << "[GameWatcher] direct start failed (" << err << "), using launch.ps1";
     }
 
-    // ── 3. Чтение PID игрового процесса ───────────────────────────────────────
-    quint32 gamePid = readPidFile(pidFile, kPidFileWaitMs, m_running);
-    QFile::remove(pidFile);
+    if (gamePid == 0) {
+        const QString tempDir  = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+        const QString pidToken = QString::number(QDateTime::currentMSecsSinceEpoch());
+        const QString pidFile  = QDir(tempDir).filePath("mc_pid_" + pidToken + ".txt");
+
+        const quint64 psPid = launchPs1(ps1Path, pidFile);
+        if (psPid == 0) {
+            m_running.storeRelease(0);
+            emit launchFailed(tileId, "Failed to start PowerShell");
+            QThread::currentThread()->quit();
+            return;
+        }
+        gamePid = readPidFile(pidFile, kPidFileWaitMs, m_running);
+        QFile::remove(pidFile);
+    }
 
     if (m_running.loadAcquire() == 0) {   // программа закрывается
         QThread::currentThread()->quit();
@@ -415,6 +439,46 @@ quint64 GameWatcher::launchPs1(const QString &ps1Path, const QString &pidFilePat
 #else
     Q_UNUSED(ps1Path)
     Q_UNUSED(pidFilePath)
+    return 0;
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// launchDirect
+// ─────────────────────────────────────────────────────────────────────────────
+quint32 GameWatcher::launchDirect(const QString &exePath, const QString &workDir, QString *error)
+{
+#ifdef Q_OS_WIN
+    // ShellExecuteEx, а не CreateProcess: как и Start-Process, учитывает
+    // манифест exe (игре нужны права администратора — Windows спросит), а не
+    // падает с ERROR_ELEVATION_REQUIRED
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    const std::wstring file = QDir::toNativeSeparators(exePath).toStdWString();
+    const std::wstring dir  = QDir::toNativeSeparators(workDir).toStdWString();
+
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+    sei.lpVerb       = nullptr;
+    sei.lpFile       = file.c_str();
+    sei.lpDirectory  = dir.c_str();
+    sei.nShow        = SW_SHOWNORMAL;
+
+    quint32 pid = 0;
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        pid = static_cast<quint32>(GetProcessId(sei.hProcess));
+        CloseHandle(sei.hProcess);
+        if (pid == 0 && error) *error = QStringLiteral("no process id");
+    } else if (error) {
+        *error = QStringLiteral("ShellExecuteEx error %1").arg(GetLastError());
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return pid;
+#else
+    Q_UNUSED(exePath)
+    Q_UNUSED(workDir)
+    if (error) *error = QStringLiteral("Windows only");
     return 0;
 #endif
 }

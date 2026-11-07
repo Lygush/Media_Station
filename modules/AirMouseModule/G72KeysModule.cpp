@@ -15,7 +15,7 @@
 HHOOK G72KeysModule::s_keyboardHook = nullptr;
 HHOOK G72KeysModule::s_mouseHook    = nullptr;
 #endif
-G72KeysModule *G72KeysModule::s_instance = nullptr;
+std::atomic<G72KeysModule *> G72KeysModule::s_instance { nullptr };
 
 static constexpr struct { int vk; const char *name; } kVkMap[] = {
     { VK_UP,     G72Keys::kUp        },
@@ -59,9 +59,22 @@ void G72KeysModule::initialize(EventBus *bus, SettingsManager *)
                     const bool active = data.value(QStringLiteral("emulator"), false).toBool();
                     if (m_emulatorMode == active) return;
                     m_emulatorMode = active;
+#ifdef Q_OS_WIN
+                    m_loggedTvKey = false;
+                    if (active) requestHookReinstall();
+#endif
                     emit emulatorModeChanged(active);
                     applyCursorState();
                     qDebug() << "[G72Keys] EmulatorMode:" << (active ? "ON" : "OFF");
+                    return;
+                }
+
+                if (mod == QLatin1String(G72Keys::kModule) &&
+                    ev  == QLatin1String(G72Keys::kEventReinstallHook))
+                {
+#ifdef Q_OS_WIN
+                    requestHookReinstall();
+#endif
                     return;
                 }
 
@@ -107,20 +120,98 @@ void G72KeysModule::initialize(EventBus *bus, SettingsManager *)
 
 #ifdef Q_OS_WIN
     s_instance = this;
+    startHookThread();
+#endif
+}
 
-    s_keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboardHookProc, nullptr, 0);
+#ifdef Q_OS_WIN
+void G72KeysModule::startHookThread()
+{
+    if (m_hookThread.joinable()) return;
+    m_hookThread = std::thread([this]() { hookThreadMain(); });
+}
+
+void G72KeysModule::stopHookThread()
+{
+    if (!m_hookThread.joinable()) return;
+    // Поток мог ещё не успеть создать очередь сообщений — ждём его id
+    for (int i = 0; i < 200 && m_hookThreadId.load() == 0; ++i)
+        Sleep(5);
+    if (const DWORD id = m_hookThreadId.load())
+        PostThreadMessageW(id, WM_QUIT, 0, 0);
+    m_hookThread.join();
+    m_hookThreadId = 0;
+}
+
+void G72KeysModule::hookThreadMain()
+{
+    // Создаём очередь сообщений потока до публикации id (иначе
+    // PostThreadMessage из stopHookThread может уйти в пустоту)
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    m_hookThreadId = GetCurrentThreadId();
+
+    // Обработчик хука — несколько сравнений и PostMessage; высокий приоритет
+    // гарантирует, что Windows не посчитает хук «зависшим» даже при полной
+    // загрузке процессора эмулятором.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    const HINSTANCE hInst = GetModuleHandleW(nullptr);
+    s_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardHookProc, hInst, 0);
     if (!s_keyboardHook)
         qWarning() << "[G72Keys] WH_KEYBOARD_LL failed, error:" << GetLastError();
     else
-        qDebug() << "[G72Keys] Keyboard hook installed";
+        qDebug() << "[G72Keys] Keyboard hook installed (own thread)";
 
-    s_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseHookProc, nullptr, 0);
+    s_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, mouseHookProc, hInst, 0);
     if (!s_mouseHook)
         qWarning() << "[G72Keys] WH_MOUSE_LL failed, error:" << GetLastError();
     else
-        qDebug() << "[G72Keys] Mouse hook installed";
-#endif
+        qDebug() << "[G72Keys] Mouse hook installed (own thread)";
+
+    // Таймер потока (hwnd = nullptr) — WM_TIMER приходит в эту очередь
+    SetTimer(nullptr, 0, kHookRefreshMs, nullptr);
+
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.hwnd == nullptr && msg.message == kMsgReinstallHook) {
+            reinstallKeyboardHook();
+            qDebug() << "[G72Keys] Keyboard hook reinstalled on request";
+            continue;
+        }
+        if (msg.hwnd == nullptr && msg.message == WM_TIMER) {
+            G72KeysModule *self = s_instance.load();
+            if (self && self->m_emulatorMode.load()) reinstallKeyboardHook();
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (s_keyboardHook) { UnhookWindowsHookEx(s_keyboardHook); s_keyboardHook = nullptr; }
+    if (s_mouseHook)    { UnhookWindowsHookEx(s_mouseHook);    s_mouseHook    = nullptr; }
+    qDebug() << "[G72Keys] Hook thread finished";
 }
+
+void G72KeysModule::requestHookReinstall()
+{
+    if (const DWORD id = m_hookThreadId.load())
+        PostThreadMessageW(id, kMsgReinstallHook, 0, 0);
+}
+
+// Новый хук ставится ДО снятия старого — без «дыры», в которой клавиши
+// прошли бы мимо. Последний установленный LL-хук вызывается первым.
+void G72KeysModule::reinstallKeyboardHook()
+{
+    HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardHookProc, GetModuleHandleW(nullptr), 0);
+    if (!fresh) {
+        qWarning() << "[G72Keys] keyboard hook reinstall failed, error:" << GetLastError();
+        return;
+    }
+    HHOOK old = s_keyboardHook;
+    s_keyboardHook = fresh;
+    if (old) UnhookWindowsHookEx(old);
+}
+#endif
 
 void G72KeysModule::shutdown()
 {
@@ -140,14 +231,7 @@ void G72KeysModule::shutdown()
     }
 
 #ifdef Q_OS_WIN
-    if (s_keyboardHook) {
-        UnhookWindowsHookEx(s_keyboardHook);
-        s_keyboardHook = nullptr;
-    }
-    if (s_mouseHook) {
-        UnhookWindowsHookEx(s_mouseHook);
-        s_mouseHook = nullptr;
-    }
+    stopHookThread();
     s_instance = nullptr;
 #endif
 }
@@ -185,24 +269,49 @@ void G72KeysModule::applyCursorState()
 /*static*/ LRESULT CALLBACK G72KeysModule::keyboardHookProc(
     int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode < 0 || !s_instance)
+    G72KeysModule *self = s_instance.load();
+    if (nCode < 0 || !self)
         return CallNextHookEx(s_keyboardHook, nCode, wParam, lParam);
 
     const KBDLLHOOKSTRUCT *kb = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
     const int  vk     = static_cast<int>(kb->vkCode);
     const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
 
+    // Автоповтор: Windows шлёт WM_KEYDOWN, пока клавиша удержана. Стрелкам
+    // повтор нужен (листание), а «Меню»/Esc, OK, «Назад», «Домой» от повтора
+    // срабатывали по нескольку раз: оверлей открывался-закрывался подряд
+    // («выезжает несколько раз»). Вызывается только из потока хуков.
+    static bool s_down[256] = {};
+    bool isRepeat = false;
+    if (vk >= 0 && vk < 256) {
+        isRepeat  = isDown && s_down[vk];
+        s_down[vk] = isDown;
+    }
+    const bool repeatAllowed = (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT);
+
     // Esc с обычной клавиатуры в режиме ТВ = кнопка «Меню» пульта (оверлей с
     // выходом из Android TV). Раньше Esc ловила только горячая клавиша в QML —
     // она срабатывает, лишь когда фокус у окна MediaStation, а при показе ТВ
     // фокус может оказаться у эмулятора. Вне режима ТВ Esc не трогаем.
-    const bool escAsMenu = (vk == VK_ESCAPE) && s_instance->m_emulatorMode;
+    const bool escAsMenu = (vk == VK_ESCAPE) && self->m_emulatorMode.load();
     const char *keyName = escAsMenu ? G72Keys::kMenu : vkToKeyName(vk);
     if (!keyName)
         return CallNextHookEx(s_keyboardHook, nCode, wParam, lParam);
 
-    if (isDown) {
-        QMetaObject::invokeMethod(s_instance, "processKey",
+    // Диагностика для журнала: доходят ли клавиши до хука в режиме ТВ
+    if (isDown && self->m_emulatorMode.load() && !self->m_loggedTvKey.exchange(true)) {
+        HWND fg = GetForegroundWindow();
+        wchar_t cls[64] = {};
+        if (fg) GetClassNameW(fg, cls, 63);
+        const QString info = QString("vk=0x%1, foreground class='%2'")
+                                 .arg(vk, 2, 16, QLatin1Char('0')).arg(QString::fromWCharArray(cls));
+        QMetaObject::invokeMethod(self, [info]() {
+            qDebug().noquote() << "[G72Keys] First key in TV mode reached the hook:" << info;
+        }, Qt::QueuedConnection);
+    }
+
+    if (isDown && (!isRepeat || repeatAllowed)) {
+        QMetaObject::invokeMethod(self, "processKey",
                                   Qt::QueuedConnection,
                                   Q_ARG(int, vk),
                                   Q_ARG(bool, true));
@@ -213,10 +322,10 @@ void G72KeysModule::applyCursorState()
     if (vk == VK_VOLUME_UP || vk == VK_VOLUME_DOWN || vk == VK_VOLUME_MUTE)
         return CallNextHookEx(s_keyboardHook, nCode, wParam, lParam);
 
-    if (s_instance->isInputBlocked())
+    if (self->isInputBlocked())
         return 1;
 
-    if (s_instance->m_emulatorMode || vk == 0xAC || vk == 0xAA)
+    if (self->m_emulatorMode.load() || vk == 0xAC || vk == 0xAA)
         return 1;
 
     return CallNextHookEx(s_keyboardHook, nCode, wParam, lParam);
@@ -225,11 +334,18 @@ void G72KeysModule::applyCursorState()
 /*static*/ LRESULT CALLBACK G72KeysModule::mouseHookProc(
     int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode < 0 || !s_instance)
+    G72KeysModule *self = s_instance.load();
+    // Вне режима ТВ — сразу дальше: этот путь вызывается на каждое движение мыши
+    if (nCode < 0 || !self || !self->m_emulatorMode.load())
         return CallNextHookEx(s_mouseHook, nCode, wParam, lParam);
 
-    if (s_instance->m_emulatorMode) {
+    {
         switch (wParam) {
+        // Курсор в режиме ТВ не двигается: он над окном эмулятора и был бы
+        // виден (схема B — MediaStation спрятан). AndroidTVModule убирает его
+        // к краю экрана при показе ТВ и возвращает на выходе.
+        case WM_MOUSEMOVE:
+            return 1;
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP:
         case WM_LBUTTONDBLCLK:
@@ -245,8 +361,8 @@ void G72KeysModule::applyCursorState()
                 // Передаём как select даже когда оверлей открыт —
                 // иначе клик на кнопках оверлея не проходит через dispatchKey.
                 // Только m_overlayClosing (cooldown) исключаем: там ввод не нужен.
-                if (!s_instance->m_overlayClosing) {
-                    QMetaObject::invokeMethod(s_instance, "processMouseAsSelect",
+                if (!self->m_overlayClosing.load()) {
+                    QMetaObject::invokeMethod(self, "processMouseAsSelect",
                                               Qt::QueuedConnection);
                 }
             }

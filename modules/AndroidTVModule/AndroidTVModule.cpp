@@ -1,6 +1,7 @@
 // modules/AndroidTVModule/AndroidTVModule.cpp
 
 #include "AndroidTVModule.h"
+#include "AdGuardHome.h"
 #include "LoggerModule.h"
 #include "G72KeysModule.h"
 #include "OverlayModule.h"
@@ -34,6 +35,54 @@ AndroidTVModule::~AndroidTVModule()
 
 void AndroidTVModule::setMediaStationOpacity(int alpha)
 {
+    stopMediaStationFade();
+    applyMediaStationAlpha(alpha);
+}
+
+void AndroidTVModule::stopMediaStationFade()
+{
+    if (m_fadeTimer) m_fadeTimer->stop();
+    m_fadeDone = nullptr;
+}
+
+void AndroidTVModule::fadeMediaStationOpacity(int to, int durationMs, std::function<void()> done)
+{
+    stopMediaStationFade();
+    to = qBound(0, to, 255);
+    if (durationMs <= 0 || to == m_msAlpha) {
+        applyMediaStationAlpha(to);
+        if (done) done();
+        return;
+    }
+    if (!m_fadeTimer) {
+        m_fadeTimer = new QTimer(this);
+        m_fadeTimer->setTimerType(Qt::PreciseTimer);
+        m_fadeTimer->setInterval(15);
+        connect(m_fadeTimer, &QTimer::timeout, this, [this]() {
+            const double t = qMin(1.0, double(m_fadeClock.elapsed()) / double(qMax(1, m_fadeDurationMs)));
+            const double e = 1.0 - (1.0 - t) * (1.0 - t);          // OutQuad
+            applyMediaStationAlpha(qRound(m_fadeFrom + (m_fadeTo - m_fadeFrom) * e));
+            if (t >= 1.0) {
+                m_fadeTimer->stop();
+                auto cb = std::move(m_fadeDone);
+                m_fadeDone = nullptr;
+                if (cb) cb();
+            }
+        });
+    }
+    m_fadeFrom       = m_msAlpha;
+    m_fadeTo         = to;
+    m_fadeDurationMs = durationMs;
+    m_fadeDone       = std::move(done);
+    m_fadeClock.start();
+    m_fadeTimer->start();
+}
+
+void AndroidTVModule::applyMediaStationAlpha(int alpha)
+{
+    alpha = qBound(0, alpha, 255);
+    const bool sameAlpha = (alpha == m_msAlpha);
+    m_msAlpha = alpha;
 #ifdef Q_OS_WIN
     if (!m_mediaStationHwnd || !IsWindow(m_mediaStationHwnd)) {
         m_mediaStationHwnd = findMediaStationWindow();
@@ -62,10 +111,10 @@ void AndroidTVModule::setMediaStationOpacity(int alpha)
     if (!SetLayeredWindowAttributes(m_mediaStationHwnd, 0, static_cast<BYTE>(alpha), LWA_ALPHA))
         logToEmulatorFile(QString("WARNING: SetLayeredWindowAttributes(%1) failed, error=%2")
                               .arg(alpha).arg(GetLastError()));
-    else
+    else if (!sameAlpha && (alpha == 0 || alpha == 128))   // промежуточные шаги перехода не пишем
         logToEmulatorFile(QString("MediaStation opacity set to %1").arg(alpha));
 #else
-    Q_UNUSED(alpha)
+    Q_UNUSED(sameAlpha)
 #endif
 }
 
@@ -84,6 +133,9 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
     m_profileManager = new AndroidTVProfileManager(this);
     m_profileManager->setAvdHome(m_avdHome);
     m_profileManager->load(m_appDir);
+
+    m_adGuard = new AdGuardHome(m_appDir, this);
+    refreshAdBlockState();
     logImportant(Logger::kLevelInfo, QString("Profiles loaded, active: %1").arg(m_profileManager->activeProfileId()));
 
     // Клавиши пульта (обработчик handleRemoteKey находится в AndroidTVInput.cpp)
@@ -118,7 +170,16 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
                         m_overlayCooldownTimer = nullptr;
                     }
                     m_overlayCooldown = false;
-                    setMediaStationOpacity(128);
+                    // Схема B: MediaStation спрятан — показываем его прозрачным
+                    // поверх ТВ, затемнение — плавно, а не скачком
+                    showMediaStationOverTv();
+                    // Затемнение — через пару кадров: смена активного окна
+                    // переключает режим вывода полноэкранного эмулятора, и
+                    // анимация, начатая одновременно с этим, шла рывками.
+                    QTimer::singleShot(kOverlaySettleMs, this, [this]() {
+                        if (m_overlayOpen && m_emulatorShown)
+                            fadeMediaStationOpacity(128, kOverlayDimFadeMs);
+                    });
                     logToEmulatorFile("[Overlay] MediaStation semi-transparent (alpha=128)");
                     return;
                 }
@@ -142,7 +203,11 @@ void AndroidTVModule::initialize(EventBus *bus, SettingsManager *settings)
                 if (m_exitRequested) {
                     logToEmulatorFile("[Overlay] Exit requested, skip opacity change");
                 } else if (m_running) {
-                    setMediaStationOpacity(0);
+                    fadeMediaStationOpacity(0, kOverlayDimFadeMs, [this]() {
+                        // Оверлей закрыт, ТВ на экране — MediaStation снова прячем
+                        if (m_emulatorShown && !m_overlayOpen && !m_exitRequested)
+                            hideMediaStationForTv();
+                    });
                     logToEmulatorFile("[Overlay] MediaStation transparent (emulator active)");
                 } else {
                     setMediaStationOpacity(255);
@@ -198,6 +263,7 @@ void AndroidTVModule::shutdown()
                               m_lastBootPollOut.isEmpty() ? QStringLiteral("-") : m_lastBootPollOut.simplified()));
 
     // 1. Таймеры — они могут запускать новые операции
+    stopMediaStationFade();
     stopKeepTopmostTimer();
     stopBootPolling();
     stopWindowPolling();
@@ -240,8 +306,6 @@ void AndroidTVModule::shutdown()
 #endif
     killEmulatorTree();
 
-    // 4. DNS-прокси
-    stopDnsProxy();
 
     // 5. adb kill-server — без ожидания (startDetached не блокирует GUI)
     if (QFile::exists(adbPath()))

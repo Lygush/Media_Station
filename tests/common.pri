@@ -39,6 +39,7 @@ SOURCES += \
     $$PROJECT_ROOT/core/IModule.cpp \
     $$PROJECT_ROOT/tools/AtomicFile.cpp \
     $$PROJECT_ROOT/tools/GameInfoStore.cpp \
-    $$PROJECT_ROOT/tools/SevenZip.cpp
+    $$PROJECT_ROOT/tools/SevenZip.cpp \
+    $$PROJECT_ROOT/tools/WofCompact.cpp
 HEADERS += \
     $$PROJECT_ROOT/core/EventBus.h
